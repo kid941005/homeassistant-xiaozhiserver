@@ -116,6 +116,10 @@ def verify_case(index, name, args, r, expected):
     if "dangerous_domains_contains" in expected:
         check(expected["dangerous_domains_contains"] in (d.get("dangerous_domains") or []),
               label + " dangerous_domains", d.get("dangerous_domains"))
+    if "domains_not_contains" in expected:
+        domains = d.get("domains") or {}
+        check(all(k not in domains for k in expected["domains_not_contains"]),
+              label + " hidden domains", [k for k in expected["domains_not_contains"] if k in domains])
     if "dangerous_entities_contains" in expected:
         ids = [e.get("entity_id") for e in (d.get("dangerous_entities") or [])]
         check(expected["dangerous_entities_contains"] in ids,
@@ -146,31 +150,37 @@ async def main():
 
         cases = [
             # 列表 / 过滤 / 分页 / 聚合
-            # 无过滤条件：默认只返回可控制设备且每页 DEFAULT_LIST_LIMIT 条（7 个实体中 6 个可控）
-            ("list_devices", {}, {"ok": True, "total": 6, "count": 6,
+            # 无过滤条件：默认只返回可控制设备且每页 DEFAULT_LIST_LIMIT 条（可见 6 个实体中 5 个可控）
+            ("list_devices", {}, {"ok": True, "total": 5, "count": 5,
                                    "grouped_by": "entity",
                                    "applied_limit_gt": 20}),
             ("list_devices", {"domain": "light"}, {"ok": True, "total": 1}),
             ("list_devices", {"keyword": "客厅"}, {"ok": True, "total": 3}),
-            ("list_devices", {"area": "客厅"}, {"ok": True, "total": 6,
+            ("list_devices", {"area": "客厅"}, {"ok": True, "total": 5,
                                                 "first_area_name": "客厅"}),
             ("list_devices", {"area": "玄关"}, {"ok": True, "total": 1}),
             ("list_devices", {"area": "客厅", "group_by": "device"},
-             {"ok": True, "total": 5, "grouped_by": "device"}),
+             {"ok": True, "total": 4, "grouped_by": "device"}),
             ("list_devices", {"area": "客厅", "domain": "light"},
              {"ok": True, "total": 1, "first_domain": "light"}),
             ("list_devices", {"area": "客厅", "domain": "switch"},
              {"ok": True, "total": 1, "first_domain": "switch"}),
+            # 用户指定隐藏：门铃/自动化/热水壶/中枢网关/媒体
+            ("list_devices", {"keyword": "门铃"}, {"ok": True, "total": 0}),
+            ("list_devices", {"keyword": "水壶"}, {"ok": True, "total": 0}),
+            ("list_devices", {"keyword": "中枢网关"}, {"ok": True, "total": 0}),
+            ("list_devices", {"domain": "automation"}, {"ok": True, "total": 0}),
+            ("list_devices", {"domain": "media_player"}, {"ok": True, "total": 0}),
             ("list_devices", {"area": "不存在"}, {"ok": True, "total": 0}),
-            ("list_devices", {"controllable_only": True}, {"ok": True, "total": 6}),
-            ("list_devices", {"controllable_only": False}, {"ok": True, "total": 7, "count": 7}),
-            ("list_devices", {"limit": 0}, {"ok": True, "total": 6, "count": 6}),
-            ("list_devices", {"offset": -3}, {"ok": True, "total": 6, "count": 6}),
+            ("list_devices", {"controllable_only": True}, {"ok": True, "total": 5}),
+            ("list_devices", {"controllable_only": False}, {"ok": True, "total": 6, "count": 6}),
+            ("list_devices", {"limit": 0}, {"ok": True, "total": 5, "count": 5}),
+            ("list_devices", {"offset": -3}, {"ok": True, "total": 5, "count": 5}),
             # 分页上限/续拉：limit 超上限被截断，offset 第二页，非法值显式报错
-            ("list_devices", {"limit": 10000}, {"ok": True, "limit": 500, "count": 6}),
+            ("list_devices", {"limit": 10000}, {"ok": True, "limit": 500, "count": 5}),
             ("list_devices", {"limit": 3}, {"ok": True, "count": 3, "has_more": True,
                                "next_offset": 3}),
-            ("list_devices", {"offset": 5}, {"ok": True, "count": 1, "has_more": False}),
+            ("list_devices", {"offset": 4}, {"ok": True, "count": 1, "has_more": False}),
             # 关键字别名 query/q/search/name 等价于 keyword
             ("list_devices", {"query": "客厅"}, {"ok": True, "total": 3}),
             ("list_devices", {"q": "客厅"}, {"ok": True, "total": 3}),
@@ -180,17 +190,19 @@ async def main():
             ("list_devices", {"bogus": 1}, {"ok": False, "code": "invalid_argument"}),
             ("list_devices", {"query": "客厅", "keyword": "灯"},
              {"ok": False, "code": "invalid_argument"}),
-            ("list_devices", {"group_by": "device"}, {"ok": True, "total": 6,
+            ("list_devices", {"group_by": "device"}, {"ok": True, "total": 5,
                                                        "grouped_by": "device"}),
             ("list_devices", {"keyword": "客厅", "group_by": "device"},
              {"ok": True, "total": 2, "grouped_by": "device"}),
             ("list_devices", {"group_by": "bogus"},
              {"ok": False, "code": "invalid_group_by"}),
             ("list_domains", {}, {"ok": True, "dangerous_domains_contains": "lock",
-                                   "dangerous_entities_contains": "lock.front_door"}),
+                                   "dangerous_entities_contains": "lock.front_door",
+                                   "domains_not_contains": ["automation", "media_player"]}),
             # 能力自描述
-            ("list_services", {}, {"ok": True, "domain_count": 6, "service_count": 20}),
+            ("list_services", {}, {"ok": True, "domain_count": 5, "service_count": 15}),
             ("list_services", {"domain": "light"}, {"ok": True, "domain": "light"}),
+            ("list_services", {"domain": "media_player"}, {"ok": False, "code": "no_services"}),
             # 状态查询
             ("get_device_state", {"entity": "客厅灯"},
              {"ok": True, "entity_state": "off", "entity_area_id": "living_room",
@@ -199,10 +211,12 @@ async def main():
              {"ok": True, "entity_state": "24.5"}),
             ("get_device_state", {"entity": "大门门锁"},
              {"ok": True, "entity_dangerous": True}),
-            ("get_device_state", {"entity": "电视"},
+            ("get_device_state", {"entity": "sensor.living_temp"},
              {"ok": True, "attributes_truncated": True}),
-            ("get_device_state", {"entity": "电视", "include_all_attributes": True},
+            ("get_device_state", {"entity": "sensor.living_temp", "include_all_attributes": True},
              {"ok": True, "attributes_truncated": False}),
+            ("get_device_state", {"entity": "电视"}, {"ok": False, "code": "unsupported_device"}),
+            ("get_device_state", {"entity": "智能门铃"}, {"ok": False, "code": "unsupported_device"}),
             # 常用控制
             ("control_device", {"entity": "客厅灯", "action": "set_brightness", "value": 50},
              {"ok": True, "status": "confirmed", "after_brightness": 127,
@@ -223,9 +237,9 @@ async def main():
             ("control_device", {"entity": "窗帘", "action": "stop"},
              {"ok": True, "service": "cover.stop_cover"}),
             ("control_device", {"entity": "电视", "action": "set_volume", "value": 30},
-             {"ok": True, "after_volume": 0.3}),
-            ("control_device", {"entity": "电视", "action": "resume"},
-             {"ok": True, "status": "confirmed", "after_state": "playing"}),
+             {"ok": False, "code": "unsupported_device"}),
+            ("control_device", {"entity": "智能门铃", "action": "turn_on"},
+             {"ok": False, "code": "unsupported_device"}),
             # 边界与错误
             ("control_device", {"entity": "sensor.living_temp", "action": "turn_on"},
              {"ok": False, "code": "not_controllable"}),

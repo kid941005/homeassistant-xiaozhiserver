@@ -103,6 +103,11 @@ if DEFAULT_LIST_LIMIT > MAX_LIST_LIMIT:
     log.warning("DEFAULT_LIST_LIMIT=%s 大于 MAX_LIST_LIMIT=%s，按上限使用", DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT)
     DEFAULT_LIST_LIMIT = MAX_LIST_LIMIT
 
+# 不向 MCP 暴露的设备类型/设备名称关键字（默认隐藏：门铃、自动化、热水壶、中枢网关、媒体）
+# 设备名称关键字会同时匹配实体名、entity_id 与设备注册表名称。
+EXCLUDED_DOMAINS = env_set("EXCLUDED_DOMAINS", "automation,media_player")
+EXCLUDED_DEVICE_KEYWORDS = env_set("EXCLUDED_DEVICE_KEYWORDS", "门铃,水壶,中枢网关")
+
 # 控制后回读
 SERVICE_CONFIRM_DELAY = env_float("SERVICE_CONFIRM_DELAY", 0.6, 0.0, 30.0)
 SERVICE_CONFIRM_RETRIES = env_int("SERVICE_CONFIRM_RETRIES", 1, 0, 20)

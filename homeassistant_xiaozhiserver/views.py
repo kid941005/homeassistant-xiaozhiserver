@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from .config import EXCLUDED_DEVICE_KEYWORDS, EXCLUDED_DOMAINS
 from .danger import _danger_info
 from .service import DOMAIN_ACTIONS, _domain_of, _friendly_name
 
@@ -73,6 +74,29 @@ def _device_label(d: Optional[dict]) -> Optional[str]:
     if not d:
         return None
     return d.get("name_by_user") or d.get("name") or d.get("id")
+
+
+def is_excluded_entity(st: dict, devices: Optional[dict] = None, ents: Optional[dict] = None) -> bool:
+    """判断实体是否属于本 MCP 服务不对外暴露的类型或设备。
+
+    domain 命中 EXCLUDED_DOMAINS，或实体名/entity_id/设备名包含
+    EXCLUDED_DEVICE_KEYWORDS 中任一关键字时返回 True。
+    """
+    eid = str(st.get("entity_id", ""))
+    if _domain_of(eid) in EXCLUDED_DOMAINS:
+        return True
+    if not EXCLUDED_DEVICE_KEYWORDS:
+        return False
+    texts = [eid, _friendly_name(st)]
+    re = (ents or {}).get(eid) or {}
+    did = re.get("device_id")
+    d = (devices or {}).get(did) if did else None
+    label = _device_label(d)
+    if label:
+        texts.append(str(label))
+    hay = " ".join(texts).lower()
+    return any(k in hay for k in EXCLUDED_DEVICE_KEYWORDS)
+
 
 def _entity_view(st: dict, devices: dict, ents: dict, areas: Optional[dict] = None) -> dict:
     """在实体摘要基础上补充 controllable 标记、所属设备与区域信息。"""

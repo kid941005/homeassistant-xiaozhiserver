@@ -599,7 +599,7 @@ def _render_index(status: dict[str, Any], devices: dict[str, Any],
         "<table class='device-table'><thead><tr>"
         "<th>区域</th><th>设备</th><th>类型</th><th>实体</th><th>状态</th><th>可执行动作</th>"
         "</tr></thead><tbody id='device-body'>" + _render_device_rows(devices) + "</tbody></table>"
-        "<p><small>仅列出可控制实体；危险设备（门锁、安防、车库门等）操作仍需二次确认。</small></p></section>"
+        "<p><small>仅列出可控制实体；默认不展示门铃、自动化、热水壶、中枢网关与媒体。危险设备（门锁、安防、车库门等）操作仍需二次确认。</small></p></section>"
         "<section><div class='section-head'><h2>服务日志<span class='ver'>v" + html.escape(__version__) + "</span></h2>"
         "<span class='muted'>WebUI 与 bridge 共享日志，最近 200 条</span></div>"
         "<div class='toolbar'>"

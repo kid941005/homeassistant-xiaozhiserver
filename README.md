@@ -3,7 +3,7 @@
 > 把 **Home Assistant** 的智能家居设备封装成标准 **MCP（Model Context Protocol）** 工具，
 > 供**小智（xiaozhi-server）**通过 **MCP 接入点**用自然语言查询与控制，支持 Docker 一键部署。
 
-当前版本：**v1.13.3** · Python 3.12 · 传输：**stdio**（由 `mcp_pipe.py` 桥接小智 MCP 接入点 WebSocket）
+当前版本：**v1.13.4** · Python 3.12 · 传输：**stdio**（由 `mcp_pipe.py` 桥接小智 MCP 接入点 WebSocket）
 
 ---
 
@@ -39,6 +39,7 @@
 | 危险设备二次确认 | 门锁、安防面板、车库门/门窗类 cover 首次调用只返回一次性 `confirm_token`，用户确认后再次调用才执行 |
 | 可控与危险标记 | 每个实体带 `controllable`、`actions`、`dangerous`、`danger_reason`；`list_domains` 汇总危险实体 |
 | 按物理设备聚合 | `group_by="device"` 通过 HA WebSocket 注册表把同一设备的多个实体合并展示；注册表不可用时自动降级为按实体展示 |
+| 设备范围收敛 | 默认隐藏门铃、自动化、热水壶、中枢网关、媒体五类设备；隐藏设备不出现在列表、状态、控制、服务与类型汇总中，可通过 `EXCLUDED_DOMAINS` / `EXCLUDED_DEVICE_KEYWORDS` 调整 |
 | 健壮错误处理 | 所有工具返回结构化 JSON；失败给 `code` / `message` / `hint`，不抛异常堆栈、不使服务崩溃 |
 | 配置安全 | `HA_URL` / `HA_TOKEN` / `MCP_ENDPOINT` 只从环境变量读取，不写入镜像或代码 |
 | 离线可测 | 自带 fake HA 模拟器与 stdio 端到端测试，无需真实 Home Assistant 即可验证全部工具 |
@@ -148,6 +149,8 @@ homeassistant-xiaozhiserver/
 | `DANGEROUS_DOMAINS` | | `lock,alarm_control_panel` | 视为危险设备的 domain（逗号分隔） |
 | `DANGEROUS_COVER_CLASSES` | | `garage,door,gate,window` | 视为危险 cover 的 device_class（逗号分隔） |
 | `DANGEROUS_SERVICE_DOMAINS` | | `lock,alarm_control_panel,script,shell_command,python_script` | 即使目标实体不危险，这些服务域也要求二次确认（逗号分隔） |
+| `EXCLUDED_DOMAINS` | | `automation,media_player` | 不向 MCP 暴露的设备 domain（逗号分隔）；命中后 `list_devices` / `get_device_state` / `control_device` / `call_service` / `list_domains` / `list_services` 均不可见 |
+| `EXCLUDED_DEVICE_KEYWORDS` | | `门铃,水壶,中枢网关` | 不向 MCP 暴露的设备名称关键字（逗号分隔），匹配实体名、`entity_id` 与设备注册表名称 |
 > WebUI 随服务启动，固定监听 `0.0.0.0:8099`，无独立密码，直接复用 `HA_URL` / `HA_TOKEN`；不需要任何 `WEBUI_*` 环境变量。
 
 > 数值类环境变量写错不会导致启动崩溃：`config.py` 会记录 warning 并回退默认值或边界值。
@@ -242,7 +245,7 @@ docker compose logs -f homeassistant-xiaozhiserver
 WebUI 与 MCP bridge 在**同一个容器**内启动：WebUI 后台运行，bridge 前台运行。页面按四块组织，避免重复展示：
 
 - **运行状态**：版本、启动时间、运行时长、HA 连通性、MCP 接入点、运行形态；页头同时显示版本徽标，配置类信息不再单独重复一张表。
-- **可调用设备**：按区域汇总，逐行显示设备、实体、类型（灯具/开关/空调/窗帘/门锁/媒体/风扇/扫地机/传感器等）、当前状态与可执行动作；危险设备带标记，支持关键字过滤和刷新。数据来自 `list_devices(group_by="device", controllable_only=true)`。
+- **可调用设备**：按区域汇总，逐行显示设备、实体、类型（灯具/开关/空调/窗帘/门锁/风扇/扫地机/传感器等；门铃、自动化、热水壶、中枢网关、媒体默认隐藏）、当前状态与可执行动作；危险设备带标记，支持关键字过滤和刷新。数据来自 `list_devices(group_by="device", controllable_only=true)`。
 - **服务日志**：读取 WebUI 与 bridge 共用的日志文件，展示最近 200 条，支持级别筛选、手动刷新与 5 秒自动刷新；面板标题与每条日志均标注版本号，页面底部显示日志文件路径。
 - **高级**：工具调试台与运行参数默认折叠在页面底部，需要时再展开。
 
@@ -280,7 +283,7 @@ python -m homeassistant_xiaozhiserver.webui
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `keyword` | string | 否 | 名称、entity_id 或所属设备名关键字，模糊匹配（如「客厅」「灯」）；也可用等价别名 `query` / `q` / `search` / `name`（只传一个，传不同值会报 `invalid_argument`） |
-| `domain` | string | 否 | 设备类型过滤：`light` / `switch` / `sensor` / `climate` / `cover` / `media_player` / `fan` / `vacuum` / `scene` 等 |
+| `domain` | string | 否 | 设备类型过滤：`light` / `switch` / `sensor` / `climate` / `cover` / `fan` / `vacuum` / `scene` 等（`automation`、`media_player` 默认隐藏） |
 | `area` | string | 否 | 区域过滤：区域名称或 `area_id`，模糊匹配（如「客厅」「living_room」）；依赖 HA 区域注册表返回 `area_name`，按 `area_id` 过滤始终可用 |
 | `controllable_only` | bool | 否 | 只返回可控制设备（自动排除 sensor 等只读实体）；**不传且无其他过滤条件时默认 true** |
 | `group_by` | string | 否 | `entity`（默认，逐实体）或 `device`（按物理设备聚合） |
@@ -289,7 +292,7 @@ python -m homeassistant_xiaozhiserver.webui
 
 > `keyword`、`domain`、`area` 可任意组合，例如 `{"area":"客厅","domain":"light"}` 只返回客厅的灯。
 >
-> **默认收敛**：不传任何过滤条件时，默认只返回可控制设备且每页 `DEFAULT_LIST_LIMIT` 条（通常 50，响应里 `applied_defaults` 标示），避免一次把上百个实体塞给模型；需要全量时显式传 `controllable_only=false` 并配合 `limit`/`offset`。若 `has_more=true`，目标设备可能不在当前页，应先按 `keyword`/`area` 精确过滤。
+> **默认收敛**：不传任何过滤条件时，默认只返回可控制设备且每页 `DEFAULT_LIST_LIMIT` 条（通常 50，响应里 `applied_defaults` 标示），避免一次把上百个实体塞给模型；需要全量时显式传 `controllable_only=false` 并配合 `limit`/`offset`。门铃、自动化、热水壶、中枢网关、媒体五类设备默认隐藏，不会出现在任何工具结果中。若 `has_more=true`，目标设备可能不在当前页，应先按 `keyword`/`area` 精确过滤。
 >
 > **未知参数不再静默忽略**：传入本工具不支持的参数会返回 `{"ok":false,"code":"invalid_argument","message":"不支持的参数：...；可用参数：..."}`，避免参数名写错却拿到全量数据。
 
@@ -711,6 +714,7 @@ python tests/e2e_mcp_client.py
 
 | 版本 | 主要变化 |
 |---|---|
+| v1.13.4 | 默认隐藏门铃、自动化、热水壶、中枢网关、媒体五类设备：新增 `EXCLUDED_DOMAINS` / `EXCLUDED_DEVICE_KEYWORDS`，隐藏设备不出现在 `list_devices` / `get_device_state` / `control_device` / `call_service` / `list_services` / `list_domains` 及 WebUI 设备总览中 |
 | v1.13.3 | 全面审计修复：输入校验（entity_id/服务名/HA 响应类型）、脚本与系统级服务纳入二次确认、回读字段与重试逻辑修正、区域优先级修正、日志递归脱敏与尾部读取、WebUI 同源校验与危险操作拦截、bridge 重连退避/WS 大小限制/SIGTERM、容器健康检查与双进程守护、CI 增加测试与版本一致性校验 |
 | v1.13.2 | WebUI 页头、服务日志面板与每条日志显示版本号；日志格式改为 `时间 级别 v版本 logger [call_id] 消息`，`/api/logs` 返回 `version`；bridge 启动日志记录自身版本 |
 | v1.13.1 | 控制结果改为 `action=RESPONSE` + 中文 `response`，修复小智把 `turn_off` 当 `Action` 枚举导致播报“turn off”的问题，并省掉控制后的一次 LLM 往返；`call_service` 常见控制服务同样直接播报；WebUI 去重运行状态/配置、新增按区域与类型展示的可调用设备列表、新增 WebUI+bridge 共享日志面板 |

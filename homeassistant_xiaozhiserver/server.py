@@ -23,7 +23,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from mcp.server.mcpserver import MCPServer
 
-from .config import DEFAULT_LIST_LIMIT, LOG_LEVEL, MAX_LIST_LIMIT
+from .config import DEFAULT_LIST_LIMIT, EXCLUDED_DOMAINS, LOG_LEVEL, MAX_LIST_LIMIT
 from .client import HAError, HAClient
 from .danger import _danger_block, _danger_flags
 from .service import (
@@ -42,6 +42,7 @@ from .views import (
     _entity_view,
     _group_by_device,
     _registry_maps,
+    is_excluded_entity,
 )
 from .logging_setup import reset_call_id, set_call_id, setup_logging
 
@@ -251,10 +252,27 @@ def _log_tool(name: str):
     return deco
 
 
+async def _excluded_entity_error(ha: HAClient, st: dict) -> Optional[dict]:
+    """实体属于隐藏类型/设备时返回错误结构，否则返回 None。"""
+    try:
+        reg = await ha.get_registries()
+    except HAError:
+        reg = None
+    devices_map, ents_map, _ = _registry_maps(reg)
+    if not is_excluded_entity(st, devices_map, ents_map):
+        return None
+    return {"ok": False, "code": "unsupported_device",
+            "message": "该设备不在本 MCP 服务开放范围内，已隐藏。",
+            "entity_id": str(st.get("entity_id") or "")}
+
+
 async def _resolve_entity_or_error(ha: HAClient, entity: str, verb: str) -> tuple:
     """统一实体解析失败结构，避免四处复制歧义/未找到分支。"""
     st, cands = await ha.resolve_entity(entity)
     if st is not None:
+        blocked = await _excluded_entity_error(ha, st)
+        if blocked is not None:
+            return None, blocked
         return st, None
     if cands:
         return None, {
@@ -352,6 +370,7 @@ async def list_devices(
         except HAError:
             reg = None
         devices_map, ents_map, areas_map = _registry_maps(reg)
+        states = [s for s in states if not is_excluded_entity(s, devices_map, ents_map)]
         views = [_entity_view(s, devices_map, ents_map, areas_map) for s in states]
         if domain:
             d = domain.strip().lower()
@@ -583,6 +602,10 @@ async def list_services(entity: Optional[str] = None, domain: Optional[str] = No
         elif domain:
             target = domain.strip().lower()
 
+        if target and target in EXCLUDED_DOMAINS:
+            return {"ok": False, "code": "no_services",
+                    "message": "设备类型『" + str(target) + "』不在本 MCP 服务开放范围内。"}
+
         kw = (keyword or "").strip().lower()
         detailed = _as_bool(detailed, default=bool(target))
 
@@ -601,7 +624,7 @@ async def list_services(entity: Optional[str] = None, domain: Optional[str] = No
             if not isinstance(entry, dict):
                 continue
             d = str(entry.get("domain", ""))
-            if not d:
+            if not d or d in EXCLUDED_DOMAINS:
                 continue
             if target and d != target:
                 continue
@@ -737,9 +760,16 @@ async def list_domains() -> dict:
     try:
         ha = get_ha()
         states = await ha.get_states()
+        try:
+            reg = await ha.get_registries()
+        except HAError:
+            reg = None
+        devices_map, ents_map, _ = _registry_maps(reg)
         counts: dict = {}
         dangerous_entities: list = []
         for s in states:
+            if is_excluded_entity(s, devices_map, ents_map):
+                continue
             eid = str(s.get("entity_id", ""))
             d = _domain_of(eid)
             if d:
