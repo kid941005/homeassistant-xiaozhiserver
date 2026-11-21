@@ -40,9 +40,11 @@ from .views import (
     _brief_attributes,
     _controllability,
     _entity_view,
+    _drop_redundant_switches,
     _group_by_device,
     _registry_maps,
     is_excluded_entity,
+    redundant_switch_map,
 )
 from .logging_setup import reset_call_id, set_call_id, setup_logging
 
@@ -266,15 +268,64 @@ async def _excluded_entity_error(ha: HAClient, st: dict) -> Optional[dict]:
             "entity_id": str(st.get("entity_id") or "")}
 
 
+async def _redundant_switch_context(ha: HAClient) -> tuple:
+    """惰性加载实体状态与注册表，返回 (hidden_switch_map, ambiguous_groups)。"""
+    try:
+        states = await ha.get_states()
+    except HAError:
+        return {}, []
+    try:
+        reg = await ha.get_registries()
+    except HAError:
+        reg = None
+    devices_map, ents_map, _ = _registry_maps(reg)
+    return redundant_switch_map(states, devices_map, ents_map)
+
+
+def _duplicate_switch_error(st: dict, light_id: str) -> dict:
+    eid = str(st.get("entity_id") or "")
+    return {
+        "ok": False, "code": "duplicate_switch",
+        "message": "『" + _friendly_name(st) + "』是与灯具重复的开关，已由灯具 " + light_id + " 替代；请直接使用该灯具实体。",
+        "entity_id": eid, "suggested_entity_id": light_id,
+    }
+
+
 async def _resolve_entity_or_error(ha: HAClient, entity: str, verb: str) -> tuple:
     """统一实体解析失败结构，避免四处复制歧义/未找到分支。"""
     st, cands = await ha.resolve_entity(entity)
+    switch_ids = []
     if st is not None:
+        switch_ids = [str(st.get("entity_id") or "")]
+    elif cands:
+        switch_ids = [str(c.get("entity_id") or "") for c in cands]
+    hidden = {}
+    if any(_domain_of(eid) == "switch" for eid in switch_ids):
+        hidden, _ = await _redundant_switch_context(ha)
+    if st is not None:
+        eid = str(st.get("entity_id") or "")
+        light_id = hidden.get(eid)
+        if light_id:
+            return None, _duplicate_switch_error(st, light_id)
         blocked = await _excluded_entity_error(ha, st)
         if blocked is not None:
             return None, blocked
         return st, None
     if cands:
+        visible = [c for c in cands if str(c.get("entity_id") or "") not in hidden]
+        if len(visible) == 1:
+            st = visible[0]
+            blocked = await _excluded_entity_error(ha, st)
+            if blocked is not None:
+                return None, blocked
+            return st, None
+        if len(visible) > 1:
+            cands = visible
+        elif hidden:
+            switch = next((c for c in cands if str(c.get("entity_id") or "") in hidden), None)
+            if switch is not None:
+                return None, _duplicate_switch_error(
+                    switch, hidden[str(switch.get("entity_id") or "")])
         return None, {
             "ok": False, "code": "ambiguous",
             "message": "『" + str(entity) + "』匹配到多个设备，请指定更精确的名称或 entity_id。",
@@ -371,6 +422,12 @@ async def list_devices(
             reg = None
         devices_map, ents_map, areas_map = _registry_maps(reg)
         states = [s for s in states if not is_excluded_entity(s, devices_map, ents_map)]
+        states, hidden_switches, ambiguous_switch_groups = _drop_redundant_switches(
+            states, devices_map, ents_map)
+        if hidden_switches:
+            log.info("list_devices hidden redundant switches=%d", len(hidden_switches))
+        if ambiguous_switch_groups:
+            log.warning("list_devices ambiguous switch/light groups=%s", ambiguous_switch_groups)
         views = [_entity_view(s, devices_map, ents_map, areas_map) for s in states]
         if domain:
             d = domain.strip().lower()
@@ -427,6 +484,8 @@ async def list_devices(
             msg = "未指定过滤条件，" + "、".join(notes) + tail + msg
         if has_more and not has_filter:
             msg += " 目标设备可能不在当前页，请用 keyword/area 精确过滤后再控制。"
+        if hidden_switches:
+            msg += "（已自动隐藏 " + str(len(hidden_switches)) + " 个与灯具重复的开关）"
         return {
             "ok": True, "grouped_by": grouped_by, "registry_available": reg is not None,
             "area": (area.strip() if area else None),
@@ -434,6 +493,8 @@ async def list_devices(
             "limit": lim, "has_more": has_more,
             "next_offset": next_off if has_more else None,
             "applied_defaults": applied_defaults or None,
+            "deduplicated_switch_count": len(hidden_switches),
+            "ambiguous_switch_groups": ambiguous_switch_groups or None,
             "devices": page, "message": msg,
         }
     except HAError as e:
@@ -765,11 +826,11 @@ async def list_domains() -> dict:
         except HAError:
             reg = None
         devices_map, ents_map, _ = _registry_maps(reg)
+        states = [s for s in states if not is_excluded_entity(s, devices_map, ents_map)]
+        states, hidden_switches, _ = _drop_redundant_switches(states, devices_map, ents_map)
         counts: dict = {}
         dangerous_entities: list = []
         for s in states:
-            if is_excluded_entity(s, devices_map, ents_map):
-                continue
             eid = str(s.get("entity_id", ""))
             d = _domain_of(eid)
             if d:
@@ -793,10 +854,13 @@ async def list_domains() -> dict:
             msg += "；需二次确认的危险类型：" + ", ".join(danger)
         if dangerous_entities:
             msg += "（共 " + str(len(dangerous_entities)) + " 个危险实体）"
+        if hidden_switches:
+            msg += "；已自动隐藏 " + str(len(hidden_switches)) + " 个与灯具重复的开关"
         return {"ok": True, "domains": counts, "controllable_domains": ctrl,
                 "dangerous_domains": danger,
                 "dangerous_entities": dangerous_entities[:50],
                 "dangerous_entity_count": len(dangerous_entities),
+                "deduplicated_switch_count": len(hidden_switches),
                 "message": msg}
     except HAError as e:
         return {"ok": False, **e.to_dict(), "hint": _hint()}

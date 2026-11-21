@@ -36,6 +36,11 @@ STATES = {
         "attributes": {"friendly_name": "电风扇"},
         "last_changed": "2026-01-01T00:00:00+00:00", "last_updated": "2026-01-01T00:00:00+00:00",
     },
+    "switch.living_room_duplicate": {
+        "entity_id": "switch.living_room_duplicate", "state": "off",
+        "attributes": {"friendly_name": "客厅灯"},
+        "last_changed": "2026-01-01T00:00:00+00:00", "last_updated": "2026-01-01T00:00:00+00:00",
+    },
     "sensor.living_temp": {
         "entity_id": "sensor.living_temp", "state": "24.5",
         "attributes": {"friendly_name": "客厅温度", "unit_of_measurement": "°C", "device_class": "temperature", "extra_debug": {"a": 1}},
@@ -165,6 +170,8 @@ ENTITY_REGISTRY = [
     {"entity_id": "light.living_room", "device_id": "dev_living", "area_id": None,
      "disabled_by": None, "hidden_by": None},
     {"entity_id": "sensor.living_temp", "device_id": "dev_living", "area_id": None,
+     "disabled_by": None, "hidden_by": None},
+    {"entity_id": "switch.living_room_duplicate", "device_id": "dev_living", "area_id": None,
      "disabled_by": None, "hidden_by": None},
     {"entity_id": "climate.ac", "device_id": "dev_climate", "area_id": None,
      "disabled_by": None, "hidden_by": None},

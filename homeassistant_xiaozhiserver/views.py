@@ -98,6 +98,74 @@ def is_excluded_entity(st: dict, devices: Optional[dict] = None, ents: Optional[
     return any(k in hay for k in EXCLUDED_DEVICE_KEYWORDS)
 
 
+def _normalize_label(value: Any) -> str:
+    """归一化名称：折叠连续空白并忽略大小写。"""
+    return " ".join(str(value or "").split()).casefold()
+
+
+def redundant_switch_map(
+    states: list,
+    devices: Optional[dict] = None,
+    ents: Optional[dict] = None,
+) -> tuple[dict, list]:
+    """找出与灯具重复的开关实体。
+
+    判据：同一非空 device_id 下恰好 1 个 light 与 1 个 switch，且两者
+    friendly_name 归一化后完全相等。此时 switch 视为同一被控对象的重复
+    入口，返回 {switch_entity_id: light_entity_id}。
+    其余 light+switch 混合组无法唯一确定，返回在 ambiguous 列表中而不隐藏。
+    """
+    groups: dict = {}
+    for st in states or []:
+        if not isinstance(st, dict):
+            continue
+        eid = str(st.get("entity_id") or "")
+        domain = _domain_of(eid)
+        if domain not in ("light", "switch"):
+            continue
+        re_ent = (ents or {}).get(eid) or {}
+        did = re_ent.get("device_id")
+        if not did:
+            continue
+        g = groups.setdefault(str(did), {"lights": [], "switches": []})
+        g["lights" if domain == "light" else "switches"].append(st)
+
+    hidden: dict = {}
+    ambiguous: list = []
+    for did, g in groups.items():
+        lights = g["lights"]
+        switches = g["switches"]
+        if not lights or not switches:
+            continue
+        d = (devices or {}).get(did) or {}
+        info = {
+            "device_id": did,
+            "device_name": _device_label(d),
+            "lights": [str(x.get("entity_id") or "") for x in lights],
+            "switches": [str(x.get("entity_id") or "") for x in switches],
+        }
+        if len(lights) == 1 and len(switches) == 1:
+            light_label = _normalize_label(_friendly_name(lights[0]))
+            switch_label = _normalize_label(_friendly_name(switches[0]))
+            if light_label and light_label == switch_label:
+                hidden[str(switches[0].get("entity_id") or "")] = str(lights[0].get("entity_id") or "")
+                continue
+            info["reason"] = "同一设备下开关与灯具名称不同，无法确认是重复项，未自动隐藏"
+        else:
+            info["reason"] = "同一设备下存在多个灯具或多个开关，无法唯一确定重复项，未自动隐藏"
+        ambiguous.append(info)
+    return hidden, ambiguous
+
+
+def _drop_redundant_switches(states: list, devices: Optional[dict] = None, ents: Optional[dict] = None) -> tuple[list, dict, list]:
+    """过滤掉与灯具重复的开关，返回 (过滤后 states, hidden, ambiguous)。"""
+    hidden, ambiguous = redundant_switch_map(states, devices, ents)
+    if not hidden:
+        return states, hidden, ambiguous
+    filtered = [s for s in states if str((s or {}).get("entity_id") or "") not in hidden]
+    return filtered, hidden, ambiguous
+
+
 def _entity_view(st: dict, devices: dict, ents: dict, areas: Optional[dict] = None) -> dict:
     """在实体摘要基础上补充 controllable 标记、所属设备与区域信息。"""
     v = summarize(st)

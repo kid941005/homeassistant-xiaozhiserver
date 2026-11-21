@@ -62,9 +62,15 @@ def verify_case(index, name, args, r, expected):
               label + " applied_defaults.limit > " + str(expected["applied_limit_gt"]),
               applied_limit)
     for key in ("status", "code", "total", "count", "grouped_by", "domain",
-                "domain_count", "service_count", "limit", "has_more", "next_offset"):
+                "domain_count", "service_count", "limit", "has_more", "next_offset",
+                "deduplicated_switch_count"):
         if key in expected:
             check(d.get(key) == expected[key], label + " " + key, d.get(key))
+    if "suggested_entity_id" in expected:
+        check(d.get("suggested_entity_id") == expected["suggested_entity_id"],
+              label + " suggested_entity_id", d.get("suggested_entity_id"))
+    if "entity_id" in expected:
+        check(d.get("entity_id") == expected["entity_id"], label + " entity_id", d.get("entity_id"))
     if "status_in" in expected:
         check(d.get("status") in expected["status_in"], label + " status_in",
               d.get("status"))
@@ -156,6 +162,9 @@ async def main():
                                    "applied_limit_gt": 20}),
             ("list_devices", {"domain": "light"}, {"ok": True, "total": 1}),
             ("list_devices", {"keyword": "客厅"}, {"ok": True, "total": 3}),
+            ("list_devices", {"keyword": "客厅灯"},
+             {"ok": True, "total": 1, "first_domain": "light",
+              "deduplicated_switch_count": 1}),
             ("list_devices", {"area": "客厅"}, {"ok": True, "total": 5,
                                                 "first_area_name": "客厅"}),
             ("list_devices", {"area": "玄关"}, {"ok": True, "total": 1}),
@@ -198,6 +207,7 @@ async def main():
              {"ok": False, "code": "invalid_group_by"}),
             ("list_domains", {}, {"ok": True, "dangerous_domains_contains": "lock",
                                    "dangerous_entities_contains": "lock.front_door",
+                                   "deduplicated_switch_count": 1,
                                    "domains_not_contains": ["automation", "media_player"]}),
             # 能力自描述
             ("list_services", {}, {"ok": True, "domain_count": 5, "service_count": 15}),
@@ -217,6 +227,10 @@ async def main():
              {"ok": True, "attributes_truncated": False}),
             ("get_device_state", {"entity": "电视"}, {"ok": False, "code": "unsupported_device"}),
             ("get_device_state", {"entity": "智能门铃"}, {"ok": False, "code": "unsupported_device"}),
+            ("get_device_state", {"entity": "switch.living_room_duplicate"},
+             {"ok": False, "code": "duplicate_switch",
+              "entity_id": "switch.living_room_duplicate",
+              "suggested_entity_id": "light.living_room"}),
             # 常用控制
             ("control_device", {"entity": "客厅灯", "action": "set_brightness", "value": 50},
              {"ok": True, "status": "confirmed", "after_brightness": 127,
@@ -240,6 +254,9 @@ async def main():
              {"ok": False, "code": "unsupported_device"}),
             ("control_device", {"entity": "智能门铃", "action": "turn_on"},
              {"ok": False, "code": "unsupported_device"}),
+            ("control_device", {"entity": "switch.living_room_duplicate", "action": "turn_on"},
+             {"ok": False, "code": "duplicate_switch",
+              "suggested_entity_id": "light.living_room"}),
             # 边界与错误
             ("control_device", {"entity": "sensor.living_temp", "action": "turn_on"},
              {"ok": False, "code": "not_controllable"}),

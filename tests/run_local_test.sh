@@ -48,5 +48,8 @@ fi
 echo "===== e2e (stdio) ====="
 "$PY" tests/e2e_mcp_client.py
 
+echo "===== dedupe unit ====="
+"$PY" tests/dedupe_switch_light.py
+
 echo "===== webui smoke ====="
 "$PY" tests/webui_smoke.py
