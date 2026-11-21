@@ -3,7 +3,7 @@
 > 把 **Home Assistant** 的智能家居设备封装成标准 **MCP（Model Context Protocol）** 工具，
 > 供**小智（xiaozhi-server）**通过 **MCP 接入点**用自然语言查询与控制，支持 Docker 一键部署。
 
-当前版本：**v1.13.2** · Python 3.12 · 传输：**stdio**（由 `mcp_pipe.py` 桥接小智 MCP 接入点 WebSocket）
+当前版本：**v1.13.3** · Python 3.12 · 传输：**stdio**（由 `mcp_pipe.py` 桥接小智 MCP 接入点 WebSocket）
 
 ---
 
@@ -185,8 +185,8 @@ docker compose logs -f homeassistant-xiaozhiserver
 容器内会同时启动两个进程：WebUI（后台）和 MCP bridge（前台）。看到以下日志即表示桥接成功：
 
 ```text
-2026-01-01 12:00:00 INFO  v1.13.2 MCP_PIPE [-] MCP接入点连接成功
-2026-01-01 12:00:00 INFO  v1.13.2 MCP_PIPE [-] 已启动 MCP server：...
+2026-01-01 12:00:00 INFO  v1.13.3 MCP_PIPE [-] MCP接入点连接成功
+2026-01-01 12:00:00 INFO  v1.13.3 MCP_PIPE [-] 已启动 MCP server：...
 ```
 
 > **MCP bridge 本身不监听端口**，它主动连出到 `MCP_ENDPOINT`，不需要做入站映射。容器暴露的 `8099` 只给 WebUI 用：浏览器打开 `http://<宿主机IP>:8099/` 即可，无需登录。
@@ -711,10 +711,10 @@ python tests/e2e_mcp_client.py
 
 | 版本 | 主要变化 |
 |---|---|
-| 未发布（审计修复） | 输入校验（entity_id/服务名/HA 响应类型）、脚本与系统级服务纳入二次确认、回读字段与重试逻辑修正、区域优先级修正、日志递归脱敏与尾部读取、WebUI 同源校验与危险操作拦截、bridge 重连退避/WS 大小限制/SIGTERM、容器健康检查与双进程守护、CI 增加测试与版本一致性校验 |
-| v1.13.0 | 简化部署：WebUI 与 MCP bridge 合并为单容器（`docker-entrypoint.sh` 同时启动两进程）；WebUI 去掉独立密码与全部 `WEBUI_*` 环境变量，固定监听 `0.0.0.0:8099`，直接复用 `HA_URL` / `HA_TOKEN`；compose 收敛为单服务；冒烟测试改为无需登录 |
+| v1.13.3 | 全面审计修复：输入校验（entity_id/服务名/HA 响应类型）、脚本与系统级服务纳入二次确认、回读字段与重试逻辑修正、区域优先级修正、日志递归脱敏与尾部读取、WebUI 同源校验与危险操作拦截、bridge 重连退避/WS 大小限制/SIGTERM、容器健康检查与双进程守护、CI 增加测试与版本一致性校验 |
 | v1.13.2 | WebUI 页头、服务日志面板与每条日志显示版本号；日志格式改为 `时间 级别 v版本 logger [call_id] 消息`，`/api/logs` 返回 `version`；bridge 启动日志记录自身版本 |
 | v1.13.1 | 控制结果改为 `action=RESPONSE` + 中文 `response`，修复小智把 `turn_off` 当 `Action` 枚举导致播报“turn off”的问题，并省掉控制后的一次 LLM 往返；`call_service` 常见控制服务同样直接播报；WebUI 去重运行状态/配置、新增按区域与类型展示的可调用设备列表、新增 WebUI+bridge 共享日志面板 |
+| v1.13.0 | 简化部署：WebUI 与 MCP bridge 合并为单容器（`docker-entrypoint.sh` 同时启动两进程）；WebUI 去掉独立密码与全部 `WEBUI_*` 环境变量，固定监听 `0.0.0.0:8099`，直接复用 `HA_URL` / `HA_TOKEN`；compose 收敛为单服务；冒烟测试改为无需登录 |
 | v1.12.0 | 新增可选 WebUI（默认关闭）：状态页、六工具调试台、配置只读；FastAPI + 服务端渲染，无前端构建；独立 compose profile，不改变 bridge 出站拓扑；新增 `tests/webui_smoke.py` |
 | v1.11.1 | 修复 `list_devices` 无过滤时忽略 `DEFAULT_LIST_LIMIT`、固定按 20 条分页的问题（现按配置通常 50 条）；默认提示动态显示条数，`has_more=true` 时提示用 `keyword`/`area` 精确过滤；回归测试增加 `applied_limit_gt: 20` 断言，防止再次退化 |
 | v1.11.0 | `list_devices` 易用性与防误用：支持 `query`/`q`/`search`/`name` 关键字别名；未知参数返回 `invalid_argument` 并列出可用参数（不再静默忽略）；无过滤条件时默认 `controllable_only=true` 且每页 20 条；工具描述内置「点名设备直接 control_device」硬约束 |
