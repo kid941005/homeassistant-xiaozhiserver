@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from fastapi.testclient import TestClient  # noqa: E402
 
 from homeassistant_xiaozhiserver import __version__  # noqa: E402
-from homeassistant_xiaozhiserver.webui import create_app  # noqa: E402
+from homeassistant_xiaozhiserver.webui import _TOOLS, create_app  # noqa: E402
 
 client = TestClient(create_app())
 
@@ -79,7 +79,16 @@ check("HA_TOKEN 掩码展示", keys.get("HA_TOKEN") in ("已设置（掩码）",
 check("配置无 WebUI 密码项", not any("WEBUI" in key.upper() or "PASSWORD" in key.upper() for key in keys), str(sorted(keys)))
 mcp_raw = os.environ.get("MCP_ENDPOINT", "")
 if mcp_raw:
-    check("MCP_ENDPOINT 不回传 token", "token=" not in str(keys.get("MCP_ENDPOINT", "")).lower())
+    from urllib.parse import parse_qsl, urlsplit
+    token_value = dict(parse_qsl(urlsplit(mcp_raw).query)).get("token", "")
+    masked_endpoint = str(keys.get("MCP_ENDPOINT", ""))
+    check("MCP_ENDPOINT 不回传 token",
+          bool(token_value) and token_value not in masked_endpoint,
+          masked_endpoint)
+
+r = client.post("/api/tool/list_devices", json={"limit": "abc"})
+check("非法分页参数返回 invalid_pagination",
+      r.status_code == 200 and r.json().get("code") == "invalid_pagination", r.text[:200])
 
 r = client.post("/api/tool/not_a_tool", json={})
 check("未知工具返回 404", r.status_code == 404, str(r.status_code))
@@ -93,11 +102,25 @@ check("非对象参数返回 400", r.status_code == 400, str(r.status_code))
 check("非对象参数错误码", r.json().get("code") == "invalid_argument", str(r.json()))
 
 r = client.post("/tool", data={"name": "list_domains", "params": "[1,2]"})
-check("表单非对象参数返回失败页", r.status_code == 200 and "HTTP 400" in r.text, str(r.status_code))
+check("表单非对象参数返回失败页", r.status_code == 400 and "失败" in r.text, str(r.status_code))
+
+r = client.post("/api/tool/list_domains", json={}, headers={"Origin": "http://evil.example"})
+check("跨站写请求被拒绝", r.status_code == 403 and r.json().get("code") == "cross_origin_blocked",
+      str(r.status_code) + " " + r.text[:200])
 
 if os.environ.get("HA_URL") and os.environ.get("HA_TOKEN"):
     r = client.post("/api/tool/list_domains", json={})
     check("list_domains 调用成功", r.status_code == 200 and r.json().get("ok") is True, str(r.status_code) + " " + r.text[:200])
+
+    r = client.post("/api/tool/control_device", json={"entity": "大门门锁", "action": "unlock"})
+    check("WebUI 拦截危险设备操作", r.status_code == 403 and r.json().get("code") == "dangerous_operation_blocked",
+          str(r.status_code) + " " + r.text[:200])
+    check("WebUI 不回传 confirm_token", "confirm_token" not in r.text, r.text[:200])
+
+    examples = {name: example for name, _, example in _TOOLS}
+    r = client.post("/api/tool/call_service", json=json.loads(examples["call_service"]))
+    check("工具调试台示例可执行", r.status_code == 200 and r.json().get("ok") is True,
+          str(r.status_code) + " " + r.text[:200])
 else:
     print("[skip] 未配置 HA_URL/HA_TOKEN，跳过真实工具调用")
 

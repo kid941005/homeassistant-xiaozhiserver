@@ -48,6 +48,7 @@ DOMAIN_ACTIONS = {
 SNAP_KEYS = [
     "brightness", "color_temp_kelvin", "rgb_color", "volume_level", "is_volume_muted",
     "temperature", "fan_mode", "percentage", "current_position", "hvac_mode",
+    "preset_mode", "swing_mode", "source", "current_tilt_position", "direction", "effect",
 ]
 
 def _domain_of(entity_id: str) -> str:
@@ -55,7 +56,9 @@ def _domain_of(entity_id: str) -> str:
 
 
 def _friendly_name(st: dict) -> str:
-    return str((st.get("attributes") or {}).get("friendly_name") or st.get("entity_id"))
+    attrs = st.get("attributes")
+    name = attrs.get("friendly_name") if isinstance(attrs, dict) else None
+    return str(name or st.get("entity_id"))
 
 
 # 对外播报用的中文标签：不要把 turn_off / light.turn_on / off 这类协议词暴露给语音助手。
@@ -75,7 +78,7 @@ _ACTION_LABELS = {
 }
 
 # 这些服务名可以直接生成中文播报；call_service 只对可控 domain 使用，避免把脚本/场景说成设备动作。
-DIRECT_RESPONSE_SERVICES = frozenset(_ACTION_LABELS) | {"set_hvac_mode"}
+DIRECT_RESPONSE_SERVICES = frozenset(_ACTION_LABELS)
 
 _STATE_LABELS = {
     "on": "打开", "off": "关闭", "open": "打开", "closed": "关闭",
@@ -246,8 +249,6 @@ def _expected_state(service: str, before_state: Optional[str],
         if dom in _NON_BINARY_TURN_DOMAINS:
             return None
         return "on" if svc == "turn_on" else "off"
-    if svc in ("start", "stop") and dom in ("vacuum", "homeassistant"):
-        return None
     return _EXPECTED_STATE.get(svc)
 
 
@@ -328,6 +329,15 @@ def _expected_attributes(payload: dict) -> dict:
         exp["is_volume_muted"] = {"expected": bool(payload.get("is_volume_muted")), "tolerance": 0}
     if "hvac_mode" in payload:
         exp["hvac_mode"] = {"expected": payload.get("hvac_mode"), "tolerance": 0}
+    for field in ("preset_mode", "swing_mode", "source", "effect", "direction"):
+        if field in payload:
+            exp[field] = {"expected": payload.get(field), "tolerance": 0}
+    if "percentage" in payload:
+        exp["percentage"] = {"expected": _num(payload.get("percentage")), "tolerance": 1}
+    if "position" in payload:
+        exp["current_position"] = {"expected": _num(payload.get("position")), "tolerance": 1}
+    if "tilt_position" in payload:
+        exp["current_tilt_position"] = {"expected": _num(payload.get("tilt_position")), "tolerance": 1}
     return exp
 
 
@@ -397,8 +407,9 @@ async def _apply_and_confirm(ha: "HAClient", st: dict, service_domain: str,
         if attempts == 0:
             if SERVICE_CONFIRM_DELAY > 0:
                 await asyncio.sleep(SERVICE_CONFIRM_DELAY)
-        elif interval > 0:
-            await asyncio.sleep(interval)
+        else:
+            # 即使配置为 0 也让出事件循环，避免在超时窗口内忙等轰击 HA。
+            await asyncio.sleep(max(0.05, interval))
         attempts += 1
         try:
             after_st = await ha.get_state(eid)
@@ -415,7 +426,10 @@ async def _apply_and_confirm(ha: "HAClient", st: dict, service_domain: str,
                 break
         elif changed:
             break
-        if attempts >= min_attempts and (time.monotonic() - started) >= SERVICE_CONFIRM_TIMEOUT:
+        # 次数与时间任一到达上限即退出；旧写法要求两者同时成立，导致 RETRIES 实际失效。
+        if attempts >= min_attempts:
+            break
+        if (time.monotonic() - started) >= SERVICE_CONFIRM_TIMEOUT:
             break
 
     verified = bool(check["verified"]) if has_expectation else bool(changed)
@@ -478,9 +492,9 @@ def _clamp_pct(value: Any) -> int:
     try:
         v = float(value)
     except (TypeError, ValueError):
-        raise HAError("invalid_value", "value 必须是 1-100 的数字，收到：" + str(value))
-    if v < 1 or v > 100:
-        raise HAError("invalid_value", "value 必须在 1-100 之间，收到：" + str(value))
+        raise HAError("invalid_value", "value 必须是 0-100 的数字，收到：" + str(value))
+    if v < 0 or v > 100:
+        raise HAError("invalid_value", "value 必须在 0-100 之间，收到：" + str(value))
     return int(round(v))
 
 

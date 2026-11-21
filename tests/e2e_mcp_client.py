@@ -62,7 +62,7 @@ def verify_case(index, name, args, r, expected):
               label + " applied_defaults.limit > " + str(expected["applied_limit_gt"]),
               applied_limit)
     for key in ("status", "code", "total", "count", "grouped_by", "domain",
-                "domain_count", "service_count"):
+                "domain_count", "service_count", "limit", "has_more", "next_offset"):
         if key in expected:
             check(d.get(key) == expected[key], label + " " + key, d.get(key))
     if "status_in" in expected:
@@ -166,6 +166,11 @@ async def main():
             ("list_devices", {"controllable_only": False}, {"ok": True, "total": 7, "count": 7}),
             ("list_devices", {"limit": 0}, {"ok": True, "total": 6, "count": 6}),
             ("list_devices", {"offset": -3}, {"ok": True, "total": 6, "count": 6}),
+            # 分页上限/续拉：limit 超上限被截断，offset 第二页，非法值显式报错
+            ("list_devices", {"limit": 10000}, {"ok": True, "limit": 500, "count": 6}),
+            ("list_devices", {"limit": 3}, {"ok": True, "count": 3, "has_more": True,
+                               "next_offset": 3}),
+            ("list_devices", {"offset": 5}, {"ok": True, "count": 1, "has_more": False}),
             # 关键字别名 query/q/search/name 等价于 keyword
             ("list_devices", {"query": "客厅"}, {"ok": True, "total": 3}),
             ("list_devices", {"q": "客厅"}, {"ok": True, "total": 3}),
@@ -305,6 +310,11 @@ async def main():
                                                        "confirm_token": tok2})
         d6 = mismatch["data"] if isinstance(mismatch["data"], dict) else {}
         check(d6.get("code") == "confirm_token_mismatch", "P3 意图不匹配被拒", d6.get("code"))
+        # 普通实体上的脚本/系统级服务也必须二次确认，不能借实体域绕过危险判定
+        script = await call(session, "call_service", {"entity": "客厅灯", "service": "script.turn_on"})
+        d7 = script["data"] if isinstance(script["data"], dict) else {}
+        check(d7.get("code") == "confirmation_required",
+              "P3 普通实体上的脚本服务也需确认", d7.get("code"))
 
     if failures:
         print("\n===== FAILED " + str(len(failures)) + " 项 =====")

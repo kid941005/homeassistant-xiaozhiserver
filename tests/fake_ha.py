@@ -5,7 +5,7 @@
 只实现本服务用到的 /api 子集，并刻意复刻 HA 的真实行为：
 对「不存在的实体」调用 service 也返回 200 []（静默假成功），以验证回读复核逻辑。
 
-运行：TEST_TOKEN=yourpass python tests/fake_ha.py
+运行：FAKE_HA_TOKEN=yourpass python tests/fake_ha.py
 （默认监听 127.0.0.1:8123；令牌通过 FAKE_HA_TOKEN 指定，缺省 devtoken）
 """
 import asyncio

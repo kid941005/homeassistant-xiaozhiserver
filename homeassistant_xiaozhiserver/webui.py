@@ -12,8 +12,15 @@
 """
 from __future__ import annotations
 
+try:  # 独立运行 WebUI 时也读取项目 .env；容器内由 env_file 注入，不覆盖已有值
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:  # noqa: BLE001
+    pass
+
 import asyncio
 import html
+import inspect
 import json
 import logging
 import os
@@ -42,7 +49,7 @@ _TOOLS: list[tuple[str, str, str]] = [
     ("get_device_state", "查询单个设备状态", '{"entity": "客厅灯"}'),
     ("control_device", "控制设备（危险设备需 confirm_token）", '{"entity": "客厅灯", "action": "turn_on"}'),
     ("list_services", "查询某类设备支持的服务与参数", '{"domain": "light"}'),
-    ("call_service", "调用任意 HA 服务", '{"domain": "light", "service": "turn_on", "data": {"entity_id": "light.living_room"}}'),
+    ("call_service", "调用任意 HA 服务", '{"entity": "客厅灯", "service": "light.turn_on", "data": {"brightness_pct": 50}}'),
     ("list_domains", "列出设备类型", "{}"),
 ]
 _TOOL_FUNCS = {
@@ -50,6 +57,8 @@ _TOOL_FUNCS = {
     for name, _, _ in _TOOLS
     if hasattr(mcp_server, name)
 }
+# 只展示当前 mcp 版本实际注册成功的工具，避免 UI 可选中但调用 404。
+_TOOLS = [tool for tool in _TOOLS if tool[0] in _TOOL_FUNCS]
 
 _DOMAIN_LABELS = {
     "light": "灯具",
@@ -134,6 +143,18 @@ def _mask_endpoint(raw: str) -> str:
 
 def create_app() -> FastAPI:
     app = FastAPI(title="homeassistant-xiaozhiserver WebUI", docs_url=None, redoc_url=None, openapi_url=None)
+
+    @app.middleware("http")
+    async def _same_origin(request: Request, call_next):
+        """无独立密码时至少拒绝浏览器跨站写请求（CSRF 防护）。"""
+        if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+            origin = request.headers.get("origin")
+            if origin and urlsplit(origin).netloc != request.headers.get("host", ""):
+                return JSONResponse(
+                    {"ok": False, "code": "cross_origin_blocked", "message": "拒绝跨站请求。"},
+                    status_code=403,
+                )
+        return await call_next(request)
 
     async def _status_data() -> dict[str, Any]:
         ha_url = _env("HA_URL")
@@ -312,7 +333,7 @@ def create_app() -> FastAPI:
     @app.get("/", response_class=HTMLResponse)
     async def index() -> HTMLResponse:
         status, devices = await asyncio.gather(_status_data(), _devices_data())
-        logs = read_recent_logs(limit=200)
+        logs = await asyncio.to_thread(read_recent_logs, limit=200)
         return HTMLResponse(_render_index(status, devices, logs, _config_data()))
 
     @app.get("/api/status")
@@ -329,7 +350,7 @@ def create_app() -> FastAPI:
 
     @app.get("/api/logs")
     async def api_logs(limit: str = "200", level: str = "") -> JSONResponse:
-        data, status_code = _logs_data(limit, level)
+        data, status_code = await asyncio.to_thread(_logs_data, limit, level)
         return JSONResponse(data, status_code=status_code)
 
     @app.post("/tool", response_class=HTMLResponse)
@@ -338,7 +359,7 @@ def create_app() -> FastAPI:
         name = str(form.get("name") or "")
         raw_params = str(form.get("params") or "").strip() or "{}"
         result, status = await _execute_tool(name, raw_params)
-        return HTMLResponse(_render_tool_result(name, raw_params, result, status))
+        return HTMLResponse(_render_tool_result(name, raw_params, result, status), status_code=status)
 
     @app.post("/api/tool/{name}")
     async def api_tool(name: str, request: Request) -> JSONResponse:
@@ -367,13 +388,19 @@ def create_app() -> FastAPI:
         if not isinstance(params, dict):
             return {"ok": False, "code": "invalid_argument", "message": "参数必须是 JSON 对象。"}, 400
         try:
-            result = await fn(**params)
+            inspect.signature(fn).bind(**params)
         except TypeError as exc:
             return {"ok": False, "code": "invalid_argument",
                     "message": "参数与工具签名不匹配：" + str(exc)}, 400
+        try:
+            result = await fn(**params)
         except Exception:  # noqa: BLE001
             log.exception("webui tool=%s failed", name)
             return {"ok": False, "code": "internal_error", "message": "工具调用失败，详见服务端日志。"}, 500
+        # WebUI 无独立密码，不复用 MCP 的危险设备确认令牌，避免两次请求即可绕过确认。
+        if isinstance(result, dict) and result.get("requires_confirmation"):
+            return {"ok": False, "code": "dangerous_operation_blocked",
+                    "message": "WebUI 不执行危险设备操作；请通过小智语音确认后再操作。"}, 403
         return result, 200
 
     return app
@@ -485,7 +512,10 @@ def _render_log_entries(entries: list[dict[str, str]]) -> str:
         return "<div class='muted'>暂无日志。</div>"
     out: list[str] = []
     for entry in entries:
-        level = html.escape(str(entry.get("level") or "INFO"))
+        level = str(entry.get("level") or "INFO").upper()
+        if level not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+            level = "INFO"
+        level = html.escape(level)
         version = str(entry.get("version") or "")
         version_html = ("<span class='log-ver'>v" + html.escape(version) + "</span>") if version else ""
         message = html.escape(str(entry.get("message") or "")).replace("\n", "<br>")
@@ -595,7 +625,9 @@ def _render_index(status: dict[str, Any], devices: dict[str, Any],
 
 def _render_tool_result(name: str, params: str, result: Any, status: int) -> str:
     pretty = json.dumps(result, ensure_ascii=False, indent=2, default=str)
-    badge = "<span class='ok'>成功</span>" if status == 200 else "<span class='bad'>失败（HTTP " + str(status) + "）</span>"
+    ok = not (isinstance(result, dict) and result.get("ok") is False)
+    badge = ("<span class='ok'>成功</span>" if status == 200 and ok
+             else "<span class='bad'>失败（HTTP " + str(status) + "）</span>")
     body = (
         "<section><h2>调用结果 " + badge + "</h2>"
         "<table><tr><th>工具</th><td><code>" + html.escape(name) + "</code></td></tr>"

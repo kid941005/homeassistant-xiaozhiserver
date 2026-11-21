@@ -108,15 +108,27 @@ def read_recent_logs(limit: int = 200, level: str | None = None) -> list[dict[st
         wanted = ""
 
     path = log_file_path()
+    # 只读文件尾部固定窗口：日志无限增长时也不会把整个文件读进内存。
+    max_bytes = 256 * 1024
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            lines = fh.readlines()
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            start = max(0, size - max_bytes)
+            fh.seek(start)
+            raw = fh.read()
     except (FileNotFoundError, OSError):
         return []
+    text = raw.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    if start > 0 and lines:
+        lines = lines[1:]  # 丢掉被截断的第一行
+    if lines and not raw.endswith(b"\n"):
+        lines = lines[:-1]  # 正在写入的半行不参与解析
 
     entries: list[dict[str, str]] = []
-    for raw in lines[-max(limit * 4, 500):]:
-        line = raw.rstrip("\r\n")
+    for raw_line in lines[-max(limit * 4, 500):]:
+        line = raw_line.rstrip("\r\n")
         match = _LINE_RE.match(line)
         if match:
             entries.append({

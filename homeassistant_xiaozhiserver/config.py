@@ -100,6 +100,7 @@ LOG_FILE = env_str("LOG_FILE", "")
 DEFAULT_LIST_LIMIT = env_int("DEFAULT_LIST_LIMIT", 50, 1, 10000)
 MAX_LIST_LIMIT = env_int("MAX_LIST_LIMIT", 500, 1, 10000)
 if DEFAULT_LIST_LIMIT > MAX_LIST_LIMIT:
+    log.warning("DEFAULT_LIST_LIMIT=%s 大于 MAX_LIST_LIMIT=%s，按上限使用", DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT)
     DEFAULT_LIST_LIMIT = MAX_LIST_LIMIT
 
 # 控制后回读
@@ -113,5 +114,10 @@ DANGER_CONFIRM_ENABLED = env_bool("DANGER_CONFIRM_ENABLED", True)
 DANGER_CONFIRM_TTL = env_float("DANGER_CONFIRM_TTL", 120.0, 1.0, 86400.0)
 DANGEROUS_DOMAINS = env_set("DANGEROUS_DOMAINS", "lock,alarm_control_panel")
 DANGEROUS_COVER_CLASSES = env_set("DANGEROUS_COVER_CLASSES", "garage,door,gate,window")
+# 这些服务域即使目标实体本身不危险，也可能执行脚本/系统级动作，同样需要二次确认。
+DANGEROUS_SERVICE_DOMAINS = env_set(
+    "DANGEROUS_SERVICE_DOMAINS",
+    "lock,alarm_control_panel,script,shell_command,python_script",
+)
 
 # WebUI 固定监听 0.0.0.0:8099，无独立密码；不需要额外环境变量

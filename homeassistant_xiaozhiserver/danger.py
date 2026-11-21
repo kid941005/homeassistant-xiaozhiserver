@@ -13,10 +13,15 @@ from .config import (
     DANGER_CONFIRM_TTL,
     DANGEROUS_COVER_CLASSES,
     DANGEROUS_DOMAINS,
+    DANGEROUS_SERVICE_DOMAINS,
 )
 from .service import _domain_of, _friendly_name
 
 log = logging.getLogger("homeassistant_xiaozhiserver.danger")
+
+# homeassistant 域只有系统级动作需要确认；toggle 等日常动作不在此列。
+_DANGEROUS_HOMEASSISTANT_SERVICES = {"restart", "stop", "reload_all", "reload_core_config"}
+
 
 def _danger_flags(entity_id: str, attributes: Optional[dict]) -> tuple:
     """判断实体是否属于高风险设备（操作需二次确认）。"""
@@ -24,9 +29,21 @@ def _danger_flags(entity_id: str, attributes: Optional[dict]) -> tuple:
     if domain in DANGEROUS_DOMAINS:
         return True, "该设备类型（" + domain + "）属于高风险设备"
     if domain == "cover":
-        dc = str((attributes or {}).get("device_class") or "").strip().lower()
+        attrs = attributes if isinstance(attributes, dict) else {}
+        dc = str(attrs.get("device_class") or "").strip().lower()
         if dc in DANGEROUS_COVER_CLASSES:
             return True, "该 cover 设备类型（" + dc + "）属于高风险（门窗/车库等）"
+    return False, None
+
+
+def _service_is_dangerous(service_domain: str, service: str) -> tuple:
+    """服务本身是否高风险：脚本/系统命令/系统级动作即使目标实体普通也要确认。"""
+    dom = str(service_domain or "").strip().lower()
+    svc = str(service or "").strip().lower()
+    if dom in DANGEROUS_SERVICE_DOMAINS:
+        return True, "服务类型（" + dom + "." + svc + "）属于高风险"
+    if dom == "homeassistant" and svc in _DANGEROUS_HOMEASSISTANT_SERVICES:
+        return True, "系统级服务（homeassistant." + svc + "）属于高风险"
     return False, None
 
 
@@ -78,7 +95,10 @@ def _danger_block(st: dict, service_domain: str, service: str,
         return None
     _prune_confirm_tokens()
     eid = str(st.get("entity_id"))
-    dangerous, reason = _danger_flags(eid, st.get("attributes") or {})
+    entity_dangerous, reason = _danger_flags(eid, st.get("attributes") or {})
+    dangerous = entity_dangerous
+    if not dangerous:
+        dangerous, reason = _service_is_dangerous(service_domain, service)
     if not dangerous:
         return None
     name = _friendly_name(st)
@@ -92,9 +112,10 @@ def _danger_block(st: dict, service_domain: str, service: str,
     if not token:
         new_token = _issue_confirm_token(eid, service_domain, service, payload)
         log.warning("danger confirmation required entity=%s service=%s reason=%s", eid, svc_str, reason)
+        subject = "是危险设备" if entity_dangerous else "的本次操作是高风险操作"
         return {**base, "code": "confirmation_required",
                 "confirm_token": new_token, "expires_in": ttl,
-                "message": "『" + name + "』是危险设备（" + str(reason) + "），为避免误操作未执行。"
+                "message": "『" + name + "』" + subject + "（" + str(reason) + "），为避免误操作未执行。"
                            "请先向用户明确确认动作，确认后再带上 confirm_token 调用一次；"
                            "令牌 " + str(ttl) + " 秒内有效且仅可使用一次。"}
     rec = _CONFIRM_TOKENS.get(token)

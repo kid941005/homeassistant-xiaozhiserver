@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import ssl
 import time
 from typing import Any
@@ -27,6 +28,14 @@ try:  # 设备/实体注册表需通过 HA WebSocket API 读取；缺失时降�
     import websockets
 except Exception:  # noqa: BLE001
     websockets = None
+
+_ENTITY_ID_RE = re.compile(r"^[a-z0-9_]+\.[a-z0-9_]+$")
+_SERVICE_NAME_RE = re.compile(r"^[a-z0-9_]+$")
+
+
+def is_entity_id(value: object) -> bool:
+    """entity_id 必须是 domain.object_id 形式，避免把用户输入拼进 URL 路径。"""
+    return bool(_ENTITY_ID_RE.match(str(value or "").strip()))
 
 
 class HAError(Exception):
@@ -156,15 +165,28 @@ class HAClient:
         return data if isinstance(data, list) else []
 
     async def get_state(self, entity_id: str) -> dict | None:
+        eid = str(entity_id or "").strip()
+        if not is_entity_id(eid):
+            raise HAError("invalid_entity", "entity_id 格式不合法：" + eid + "。应为 domain.object_id，如 light.living_room。")
         try:
-            return await self._request("GET", "/api/states/" + entity_id)
+            data = await self._request("GET", "/api/states/" + eid)
         except HAError as e:
             if e.code == "not_found":
                 return None
             raise
+        if not isinstance(data, dict):
+            raise HAError("invalid_response", "Home Assistant 返回的实体状态不是 JSON 对象。")
+        return data
 
     async def call_service(self, domain: str, service: str, data: dict) -> Any:
-        return await self._request("POST", "/api/services/" + domain + "/" + service, json=data)
+        dom = str(domain or "").strip()
+        svc = str(service or "").strip()
+        if not _SERVICE_NAME_RE.match(dom) or not _SERVICE_NAME_RE.match(svc):
+            raise HAError("invalid_service", "服务名格式不合法：" + dom + "." + svc + "。只允许小写字母、数字与下划线。")
+        result = await self._request("POST", "/api/services/" + dom + "/" + svc, json=data)
+        if result is not None and not isinstance(result, (dict, list)):
+            raise HAError("invalid_response", "Home Assistant 返回的服务调用结果不是 JSON 对象/数组。")
+        return result
 
     async def ping(self) -> bool:
         await self._request("GET", "/api/")
@@ -283,8 +305,8 @@ class HAClient:
         ref = (ref or "").strip()
         if not ref:
             return None, []
-        # 1) 直接当作 entity_id
-        if "." in ref and " " not in ref:
+        # 1) 直接当作 entity_id；只接受合法格式，避免把用户输入拼进 URL 路径
+        if is_entity_id(ref):
             st = await self.get_state(ref)
             if st is not None:
                 return st, []

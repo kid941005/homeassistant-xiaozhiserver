@@ -28,7 +28,9 @@ def _brief_attributes(attributes: Any) -> tuple[dict, bool]:
 
 
 def summarize(st: dict) -> dict:
-    a = st.get("attributes") or {}
+    a = st.get("attributes")
+    if not isinstance(a, dict):
+        a = {}
     return {
         "entity_id": st.get("entity_id"),
         "name": _friendly_name(st),
@@ -83,7 +85,8 @@ def _entity_view(st: dict, devices: dict, ents: dict, areas: Optional[dict] = No
     v["device_id"] = did
     d = devices.get(did) if did else None
     v["device_name"] = _device_label(d)
-    area_id = (d.get("area_id") if d else None) or re.get("area_id")
+    # HA 语义：实体级 area 覆盖设备级 area。
+    area_id = re.get("area_id") or (d.get("area_id") if d else None)
     v["area_id"] = area_id
     v["area_name"] = (areas or {}).get(area_id) if area_id else None
     return v

@@ -12,9 +12,11 @@ Docker 中由 CMD 直接执行 python /app/mcp_pipe.py /app/server.py。
 import asyncio
 import logging
 import os
+import random
 import signal
 import subprocess
 import sys
+import time
 from urllib.parse import urlsplit, urlunsplit
 
 import websockets
@@ -125,7 +127,13 @@ async def pipe_process_stderr(process, target: str) -> None:
 async def connect_to_server(uri: str, script_path: str, target: str) -> None:
     """连接接入点并启动一次 MCP server；连接断开后由外层重连。"""
     logger.info("[%s] 正在连接 MCP 接入点 %s", target, _safe_endpoint(uri))
-    async with websockets.connect(uri) as websocket:
+    async with websockets.connect(
+        uri,
+        max_size=16 * 1024 * 1024,
+        ping_interval=20,
+        ping_timeout=20,
+        open_timeout=15,
+    ) as websocket:
         logger.info("[%s] MCP接入点连接成功", target)
 
         cmd, env = build_server_command(script_path)
@@ -167,11 +175,16 @@ async def connect_with_retry(uri: str, script_path: str, target: str) -> None:
         try:
             if attempt > 0:
                 logger.info("[%s] %ss 后进行第 %s 次重连", target, backoff, attempt)
-                await asyncio.sleep(backoff)
+                await asyncio.sleep(backoff * (0.5 + random.random()))
+            started = time.monotonic()
             await connect_to_server(uri, script_path, target)
         except asyncio.CancelledError:
             raise
         except Exception as e:
+            # 连接稳定运行过一段时间后再断开，重置退避，避免长期运行后从 600s 开始重连。
+            if time.monotonic() - started > 60:
+                attempt = 0
+                backoff = INITIAL_BACKOFF
             attempt += 1
             logger.warning("[%s] 连接断开（第 %s 次）：%s", target, attempt, e)
             backoff = min(backoff * 2, MAX_BACKOFF)
@@ -194,6 +207,7 @@ def main() -> None:
     script_path = sys.argv[1] if len(sys.argv) >= 2 else "server.py"
     target = os.path.basename(script_path)
     signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 
     try:
         asyncio.run(connect_with_retry(endpoint, script_path, target))

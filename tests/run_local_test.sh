@@ -25,13 +25,14 @@ trap cleanup EXIT INT TERM
 
 "$PY" tests/fake_ha.py & FAKE=$!
 
-# 等待 fake HA 的 HTTP 端口可连接（最多 15s）
+# 等待 fake HA 的 HTTP 与 WebSocket 端口都可连接（最多 15s）；注册表依赖 WS
 READY=0
 for _ in $(seq 1 60); do
   if "$PY" - <<'PY' >/dev/null 2>&1
 import socket
-s = socket.create_connection(("127.0.0.1", 8123), timeout=1)
-s.close()
+for port in (8123, 8124):
+    s = socket.create_connection(("127.0.0.1", port), timeout=1)
+    s.close()
 PY
   then
     READY=1
@@ -40,7 +41,7 @@ PY
   sleep 0.25
 done
 if [ "$READY" != "1" ]; then
-  echo "fake HA 未在预期时间内启动（127.0.0.1:8123 不可达）" >&2
+  echo "fake HA 未在预期时间内启动（127.0.0.1:8123 或 8124 不可达）" >&2
   exit 1
 fi
 

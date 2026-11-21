@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import functools
 import logging
-import os
 import time
 import uuid
 from typing import Any, Optional
@@ -80,14 +79,37 @@ def get_ha() -> HAClient:
     return _ha
 
 
+_SENSITIVE_EXACT = {
+    "code", "pin", "passcode", "password", "token", "secret", "authorization",
+    "cookie", "credential", "api_key", "apikey", "access_key", "private_key",
+}
+
+
 def _is_sensitive(key: str) -> bool:
     k = key.lower()
-    return any(m in k for m in ("token", "password", "secret", "authorization", "cookie"))
+    if k in _SENSITIVE_EXACT:
+        return True
+    return any(m in k for m in ("token", "password", "secret", "authorization",
+                                "cookie", "passcode", "credential"))
 
 
 def _short(value: Any, limit: int = 200) -> str:
     text = repr(value)
     return text if len(text) <= limit else text[:limit] + "..."
+
+
+def _safe_value(value: Any, depth: int = 0) -> Any:
+    """递归脱敏日志参数；限制深度/数量，避免超大对象拖慢日志。"""
+    if depth >= 3:
+        if isinstance(value, (dict, list, tuple)):
+            return "<max-depth>"
+        return _short(value)
+    if isinstance(value, dict):
+        return {str(k): ("***" if _is_sensitive(str(k)) else _safe_value(v, depth + 1))
+                for k, v in list(value.items())[:20]}
+    if isinstance(value, (list, tuple)):
+        return [_safe_value(v, depth + 1) for v in list(value)[:20]]
+    return _short(value)
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -130,47 +152,51 @@ def _accept_extra_arguments(tool_name: str) -> bool:
     MCP SDK 默认按函数签名生成参数模型并忽略多余键，导致 model 传错参数名时
     悄悄拿到全量数据。这里把该工具的校验模型换成允许额外字段的版本，
     由工具函数自己检查 **extra 并返回 invalid_argument。
+
+    该函数依赖 mcp 私有内部结构；任何不兼容都应降级为“不启用严格校验”，
+    不能让 MCP server 或 WebUI 在导入阶段崩溃。
     """
     try:
         from mcp.server.mcpserver.utilities.func_metadata import ArgModelBase
         from pydantic import ConfigDict, create_model
+
+        tool = mcp._tool_manager.get_tool(tool_name)
+        if tool is None:
+            log.warning("无法为 %s 启用未知参数校验（工具未注册）", tool_name)
+            return False
+        base_model = tool.fn_metadata.arg_model
+        # **extra 会被 SDK 当成必填字段，发布前要剔除；extra="allow" 仍能接住多余参数
+        field_defs = {name: (fi.annotation, fi) for name, fi in base_model.model_fields.items()
+                      if name != "extra"}
+
+        class _ArgsWithExtra(ArgModelBase):
+            model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
+
+            def model_dump_one_level(self) -> dict:
+                data = super().model_dump_one_level()
+                extra = self.__pydantic_extra__
+                if extra:
+                    data.update(extra)
+                return data
+
+        tool.fn_metadata.arg_model = create_model(
+            base_model.__name__ + "WithExtra", __base__=_ArgsWithExtra, **field_defs
+        )
+        params = dict(tool.parameters)
+        properties = dict(params.get("properties") or {})
+        properties.pop("extra", None)
+        params["properties"] = properties
+        if "required" in params:
+            required = [n for n in params["required"] if n != "extra"]
+            if required:
+                params["required"] = required
+            else:
+                params.pop("required", None)
+        tool.parameters = params
+        return True
     except Exception:  # noqa: BLE001 mcp 内部 API 变动时优雅降级
-        log.warning("无法为 %s 启用未知参数校验（mcp 内部 API 不可用）", tool_name)
+        log.warning("无法为 %s 启用未知参数校验（mcp 内部 API 不可用或不兼容）", tool_name, exc_info=True)
         return False
-    tool = mcp._tool_manager.get_tool(tool_name)
-    if tool is None:
-        log.warning("无法为 %s 启用未知参数校验（工具未注册）", tool_name)
-        return False
-    base_model = tool.fn_metadata.arg_model
-    # **extra 会被 SDK 当成必填字段，发布前要剔除；extra="allow" 仍能接住多余参数
-    field_defs = {name: (fi.annotation, fi) for name, fi in base_model.model_fields.items()
-                  if name != "extra"}
-
-    class _ArgsWithExtra(ArgModelBase):
-        model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
-
-        def model_dump_one_level(self) -> dict:
-            data = super().model_dump_one_level()
-            extra = self.__pydantic_extra__
-            if extra:
-                data.update(extra)
-            return data
-
-    tool.fn_metadata.arg_model = create_model(
-        base_model.__name__ + "WithExtra", __base__=_ArgsWithExtra, **field_defs
-    )
-    params = dict(tool.parameters)
-    properties = dict(params.get("properties") or {})
-    properties.pop("extra", None)
-    params["properties"] = properties
-    if "required" in params:
-        required = [n for n in params["required"] if n != "extra"]
-        if required:
-            params["required"] = required
-        else:
-            params.pop("required", None)
-    tool.parameters = params
-    return True
 
 
 def _safe_url(raw: str) -> str:
@@ -188,15 +214,9 @@ def _safe_url(raw: str) -> str:
 def _safe_log_args(args: tuple, kwargs: dict) -> dict:
     out: dict = {}
     for i, v in enumerate(args):
-        out["arg" + str(i)] = _short(v)
+        out["arg" + str(i)] = _safe_value(v)
     for k, v in kwargs.items():
-        if _is_sensitive(str(k)):
-            out[str(k)] = "***"
-        elif isinstance(v, dict):
-            out[str(k)] = {str(kk): ("***" if _is_sensitive(str(kk)) else _short(vv, 80))
-                           for kk, vv in list(v.items())[:20]}
-        else:
-            out[str(k)] = _short(v)
+        out[str(k)] = "***" if _is_sensitive(str(k)) else _safe_value(v)
     return out
 
 
@@ -208,7 +228,7 @@ def _log_tool(name: str):
             call_id = uuid.uuid4().hex[:8]
             token = set_call_id(call_id)
             started = time.perf_counter()
-            log.info("tool=%s start args=%s", name, _safe_log_args(args, kwargs))
+            log.debug("tool=%s start args=%s", name, _safe_log_args(args, kwargs))
             try:
                 result = await fn(*args, **kwargs)
             except Exception:
@@ -229,6 +249,23 @@ def _log_tool(name: str):
                 reset_call_id(token)
         return wrapper
     return deco
+
+
+async def _resolve_entity_or_error(ha: HAClient, entity: str, verb: str) -> tuple:
+    """统一实体解析失败结构，避免四处复制歧义/未找到分支。"""
+    st, cands = await ha.resolve_entity(entity)
+    if st is not None:
+        return st, None
+    if cands:
+        return None, {
+            "ok": False, "code": "ambiguous",
+            "message": "『" + str(entity) + "』匹配到多个设备，请指定更精确的名称或 entity_id。",
+            "candidates": [str(c.get("entity_id")) for c in cands[:10]],
+        }
+    return None, {
+        "ok": False, "code": "not_found",
+        "message": "未找到设备『" + str(entity) + "』，无法" + verb + "。可先用 list_devices 查询。",
+    }
 
 
 @mcp.tool()
@@ -359,10 +396,16 @@ async def list_devices(
             msg = "共 " + str(total) + " 个实体，本次返回 " + str(len(page)) + " 个"
         msg += "（还有更多，可用 offset=" + str(next_off) + " 继续）" if has_more else "。"
         if applied_defaults:
-            note = "未指定过滤条件，默认仅返回可控制设备"
+            notes = []
+            hints = []
+            if applied_defaults.get("controllable_only"):
+                notes.append("默认仅返回可控制设备")
+                hints.append("controllable_only=false")
             if "limit" in applied_defaults:
-                note += "、每页 " + str(applied_defaults["limit"]) + " 条"
-            msg = note + "（可用 controllable_only=false 或 limit 覆盖）。" + msg
+                notes.append("每页 " + str(applied_defaults["limit"]) + " 条")
+                hints.append("limit")
+            tail = "（可用 " + " 或 ".join(hints) + " 覆盖）。" if hints else "。"
+            msg = "未指定过滤条件，" + "、".join(notes) + tail + msg
         if has_more and not has_filter:
             msg += " 目标设备可能不在当前页，请用 keyword/area 精确过滤后再控制。"
         return {
@@ -399,15 +442,9 @@ async def get_device_state(entity: str, include_all_attributes: bool = False) ->
     try:
         include_all_attributes = _as_bool(include_all_attributes)
         ha = get_ha()
-        st, cands = await ha.resolve_entity(entity)
-        if st is None:
-            if cands:
-                names = [(_friendly_name(c) + " (" + str(c.get("entity_id")) + ")") for c in cands[:10]]
-                return {"ok": False, "code": "ambiguous",
-                        "message": "『" + str(entity) + "』匹配到多个设备，请指定更精确的名称或 entity_id。",
-                        "candidates": names}
-            return {"ok": False, "code": "not_found",
-                    "message": "未找到设备『" + str(entity) + "』。可先用 list_devices 查询可用设备。"}
+        st, error = await _resolve_entity_or_error(ha, entity, "查询状态")
+        if error is not None:
+            return error
         try:
             reg = await ha.get_registries()
         except HAError:
@@ -471,14 +508,9 @@ async def control_device(entity: str, action: str, value: Optional[Any] = None,
     """
     try:
         ha = get_ha()
-        st, cands = await ha.resolve_entity(entity)
-        if st is None:
-            if cands:
-                return {"ok": False, "code": "ambiguous",
-                        "message": "『" + str(entity) + "』匹配到多个设备，无法确定控制目标，请指定更精确名称或 entity_id。",
-                        "candidates": [str(c.get("entity_id")) for c in cands[:10]]}
-            return {"ok": False, "code": "not_found",
-                    "message": "未找到设备『" + str(entity) + "』，无法控制。可先用 list_devices 查询。"}
+        st, error = await _resolve_entity_or_error(ha, entity, "控制")
+        if error is not None:
+            return error
         eid = str(st.get("entity_id"))
         domain = _domain_of(eid)
         info = _controllability(eid, st.get("state"))
@@ -524,7 +556,7 @@ async def control_device(entity: str, action: str, value: Optional[Any] = None,
 @mcp.tool()
 @_log_tool("list_services")
 async def list_services(entity: Optional[str] = None, domain: Optional[str] = None,
-                        keyword: Optional[str] = None, detailed: bool = False) -> dict:
+                        keyword: Optional[str] = None, detailed: Optional[bool] = None) -> dict:
     """查询 Home Assistant 中某类设备/某个设备支持的服务（能力）及参数。
 
     这是“能力自描述”工具：让调用方在不了解设备细节时，先查清能对这个设备做什么、
@@ -544,20 +576,15 @@ async def list_services(entity: Optional[str] = None, domain: Optional[str] = No
         catalog = await ha.get_services()
         target = None
         if entity:
-            st, cands = await ha.resolve_entity(entity)
-            if st is None:
-                if cands:
-                    return {"ok": False, "code": "ambiguous",
-                            "message": "『" + str(entity) + "』匹配到多个设备，请指定更精确名称或 entity_id。",
-                            "candidates": [str(c.get("entity_id")) for c in cands[:10]]}
-                return {"ok": False, "code": "not_found",
-                        "message": "未找到设备『" + str(entity) + "』。可先用 list_devices 查询。"}
+            st, error = await _resolve_entity_or_error(ha, entity, "查询能力")
+            if error is not None:
+                return error
             target = _domain_of(str(st.get("entity_id")))
         elif domain:
             target = domain.strip().lower()
 
         kw = (keyword or "").strip().lower()
-        detailed = _as_bool(detailed) or bool(target)
+        detailed = _as_bool(detailed, default=bool(target))
 
         def match(svc_name: str, svc_def: Any) -> bool:
             if not kw:
@@ -645,14 +672,9 @@ async def call_service(entity: str, service: str, data: Optional[dict] = None,
     """
     try:
         ha = get_ha()
-        st, cands = await ha.resolve_entity(entity)
-        if st is None:
-            if cands:
-                return {"ok": False, "code": "ambiguous",
-                        "message": "『" + str(entity) + "』匹配到多个设备，无法确定控制目标，请指定更精确名称或 entity_id。",
-                        "candidates": [str(c.get("entity_id")) for c in cands[:10]]}
-            return {"ok": False, "code": "not_found",
-                    "message": "未找到设备『" + str(entity) + "』，无法调用服务。可先用 list_devices 查询。"}
+        st, error = await _resolve_entity_or_error(ha, entity, "调用服务")
+        if error is not None:
+            return error
         eid = str(st.get("entity_id"))
         spec = (service or "").strip()
         if not spec:
@@ -685,7 +707,9 @@ async def call_service(entity: str, service: str, data: Optional[dict] = None,
         result = await _apply_and_confirm(ha, st, service_domain, svc, payload, spec)
         result["ok"] = True
         result["device_action"] = svc
-        if service_domain in DOMAIN_ACTIONS and svc in DIRECT_RESPONSE_SERVICES:
+        direct = (service_domain in DOMAIN_ACTIONS and svc in DIRECT_RESPONSE_SERVICES) or (
+            service_domain == "homeassistant" and svc == "toggle")
+        if direct:
             result["action"] = "RESPONSE"
             result["response"] = result.get("voice") or result.get("message") or "操作已完成。"
         return result
@@ -753,14 +777,21 @@ async def list_domains() -> dict:
 def main() -> None:
     setup_logging()
     log.info("startup transport=stdio log_level=%s", LOG_LEVEL)
+    try:
+        ha = get_ha()
+    except HAError as e:
+        log.error("HA 配置无效，拒绝启动：%s（%s）", e.message, e.code)
+        raise SystemExit(2)
+    except Exception as e:  # noqa: BLE001
+        log.error("HA 客户端初始化失败，拒绝启动：%s", e)
+        raise SystemExit(2)
     log.info(
-        "HA config url=%s token=%s timeout=%ss verify_ssl=%s ws_enabled=%s ws_url=%s",
-        _safe_url(os.environ.get("HA_URL", "(not set)")),
-        "set" if os.environ.get("HA_TOKEN") else "missing",
-        os.environ.get("HA_TIMEOUT", "10"),
-        os.environ.get("HA_VERIFY_SSL", "true"),
-        os.environ.get("HA_WS_ENABLED", "true"),
-        os.environ.get("HA_WS_URL") or "(derived from HA_URL)",
+        "HA config url=%s token=set timeout=%ss verify_ssl=%s ws_enabled=%s ws_url=%s",
+        _safe_url(ha.base_url),
+        ha.timeout,
+        ha.verify_ssl,
+        ha.ws_enabled,
+        _safe_url(ha.ws_url),
     )
     mcp.run(transport="stdio")
 

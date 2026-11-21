@@ -147,6 +147,7 @@ homeassistant-xiaozhiserver/
 | `DANGER_CONFIRM_TTL` | | `120` | 危险操作确认令牌有效期（秒），一次性使用 |
 | `DANGEROUS_DOMAINS` | | `lock,alarm_control_panel` | 视为危险设备的 domain（逗号分隔） |
 | `DANGEROUS_COVER_CLASSES` | | `garage,door,gate,window` | 视为危险 cover 的 device_class（逗号分隔） |
+| `DANGEROUS_SERVICE_DOMAINS` | | `lock,alarm_control_panel,script,shell_command,python_script` | 即使目标实体不危险，这些服务域也要求二次确认（逗号分隔） |
 > WebUI 随服务启动，固定监听 `0.0.0.0:8099`，无独立密码，直接复用 `HA_URL` / `HA_TOKEN`；不需要任何 `WEBUI_*` 环境变量。
 
 > 数值类环境变量写错不会导致启动崩溃：`config.py` 会记录 warning 并回退默认值或边界值。
@@ -184,8 +185,8 @@ docker compose logs -f homeassistant-xiaozhiserver
 容器内会同时启动两个进程：WebUI（后台）和 MCP bridge（前台）。看到以下日志即表示桥接成功：
 
 ```text
-MCP_PIPE - MCP接入点连接成功
-MCP_PIPE - 已启动 MCP server：...
+2026-01-01 12:00:00 INFO  v1.13.2 MCP_PIPE [-] MCP接入点连接成功
+2026-01-01 12:00:00 INFO  v1.13.2 MCP_PIPE [-] 已启动 MCP server：...
 ```
 
 > **MCP bridge 本身不监听端口**，它主动连出到 `MCP_ENDPOINT`，不需要做入站映射。容器暴露的 `8099` 只给 WebUI 用：浏览器打开 `http://<宿主机IP>:8099/` 即可，无需登录。
@@ -210,9 +211,9 @@ python mcp_pipe.py server.py
 python -m homeassistant_xiaozhiserver
 ```
 
-### 5.4 并入现有 deploy compose
+### 5.4 并入现有 compose（可选）
 
-`deploy/docker-compose.yml` 已包含单服务，关键配置如下：
+本仓库不包含 `deploy/` 目录；如果你的 NAS/服务器已有自己的 compose（例如 `deploy/docker-compose.yml`），把下面这个服务合并进去即可：
 
 ```yaml
   homeassistant-xiaozhiserver:
@@ -225,10 +226,9 @@ python -m homeassistant_xiaozhiserver
       - "8099:8099"
 ```
 
-在 `deploy/.env` 中补充 `MCP_ENDPOINT` / `HA_URL` / `HA_TOKEN` 后执行：
+在**该 compose 所在目录**的 `.env` 中补充 `MCP_ENDPOINT` / `HA_URL` / `HA_TOKEN` 后执行：
 
 ```bash
-cd deploy
 docker compose pull homeassistant-xiaozhiserver
 docker compose up -d homeassistant-xiaozhiserver
 docker compose ps homeassistant-xiaozhiserver
@@ -263,7 +263,10 @@ python -m homeassistant_xiaozhiserver.webui
 - WebUI **没有登录口令**，请只绑定可信内网，不要直接暴露公网；远程访问优先走 SSH 隧道或带鉴权的反向代理。
 - 页面与 `/api/status`、`/api/config` 只展示掩码后的 `HA_TOKEN` / `MCP_ENDPOINT` 令牌，不会回传明文。
 - 工具调试台只允许调用六个白名单工具，参数必须是 JSON 对象。
-- 容器以非 root 用户（uid 10001）运行。
+- WebUI 对危险设备操作只返回 `dangerous_operation_blocked`，不执行、不回传 `confirm_token`；门锁/安防等操作请走小智语音确认。
+- WebUI 对 POST/PUT/PATCH/DELETE 校验同源 `Origin`，降低 CSRF 风险；但它仍没有登录口令，不能替代访问控制。
+- 服务日志只读取文件尾部固定窗口，日志文件很大时也不会把整个文件读入内存。
+- 容器以非 root 用户（uid 10001）运行，并带 `HEALTHCHECK` 探测 `/api/status`。
 
 ---
 
@@ -281,7 +284,7 @@ python -m homeassistant_xiaozhiserver.webui
 | `area` | string | 否 | 区域过滤：区域名称或 `area_id`，模糊匹配（如「客厅」「living_room」）；依赖 HA 区域注册表返回 `area_name`，按 `area_id` 过滤始终可用 |
 | `controllable_only` | bool | 否 | 只返回可控制设备（自动排除 sensor 等只读实体）；**不传且无其他过滤条件时默认 true** |
 | `group_by` | string | 否 | `entity`（默认，逐实体）或 `device`（按物理设备聚合） |
-| `limit` | int | 否 | 每页条数，默认 `DEFAULT_LIST_LIMIT`（通常 50）、上限 `MAX_LIST_LIMIT`；**无过滤条件时同样使用 `DEFAULT_LIST_LIMIT`** |
+| `limit` | int | 否 | 每页条数，默认 `DEFAULT_LIST_LIMIT`（通常 50）、上限 `MAX_LIST_LIMIT`；**无过滤条件时同样使用 `DEFAULT_LIST_LIMIT`**；`limit<=0` 回退默认值，`offset<0` 视为 0 |
 | `offset` | int | 否 | 起始偏移，默认 0 |
 
 > `keyword`、`domain`、`area` 可任意组合，例如 `{"area":"客厅","domain":"light"}` 只返回客厅的灯。
@@ -520,6 +523,8 @@ if "action" in resultJson:
 
 `control_device` 的 `response` 只包含设备名和中文动作，不含 `turn_off`、`light.turn_off`、`entity_id` 或英文状态。`call_service` 对可控 domain 的常见控制服务（`turn_on`/`turn_off`/`set_temperature`/`set_hvac_mode`/`set_fan_mode` 等）同样返回 `action: "RESPONSE"` 与中文 `response`；脚本、场景、未知服务不返回 `action`，走 `REQLLM`，由 LLM 根据中文 `message` 组织回复。
 
+`call_service` 的二次确认不只按目标实体判断：`script`、`shell_command`、`python_script`、`lock`、`alarm_control_panel` 等服务域，以及 `homeassistant.restart/stop/reload_*` 系统级服务，即使目标实体是普通灯/开关，也会先返回 `confirmation_required`，避免借普通实体执行脚本绕过确认。
+
 设备名称能直接匹配时，模型应直接调用 `control_device`，不要先 `list_devices`；只有名称不明确、需要确认设备能力或设备不存在时才查列表/服务。这样一次语音控制只需要「LLM 决策 → 工具执行 → 直接播报」三步。
 
 ### 7.8 注意事项
@@ -528,7 +533,7 @@ if "action" in resultJson:
 - `MCP_ENDPOINT` 含 token，只放 `.env` 或运行时环境变量，不要提交到 Git、不要写进镜像。
 - 不要把 `/mcp_endpoint/health?key=...` 填进 `MCP_ENDPOINT`。
 - 断线重连会重新启动 `server.py`；危险确认令牌是进程内内存，重连后旧令牌失效，需要重新发起原操作。
-- `deploy/data/.mcp_server_settings.json` 是 xiaozhi-server 的旧「方式 B」MCP 配置；改用接入点后应清空为 `{"mcpServers": {}}`（或删除），否则它会继续连接已移除的 `http://homeassistant-xiaozhiserver:8090/mcp`，造成报错或工具重复。
+- 如果你的 xiaozhi-server 部署目录里还留有旧「方式 B」的 `.mcp_server_settings.json`，改用接入点后应清空为 `{"mcpServers": {}}`（或删除），否则它可能继续连接已移除的 HTTP MCP 地址，造成报错或工具重复。
 
 ---
 
@@ -537,7 +542,7 @@ if "action" in resultJson:
 
 | 用户说 | 调用工具 | 参数 | 返回（节选） |
 |---|---|---|---|
-| 家里有哪些设备？ | `list_devices` | `{}` | `{"ok":true,"total":6,"count":6,"has_more":false,"applied_defaults":{"controllable_only":true,"limit":20},"devices":[...]}`（默认只列可控设备） |
+| 家里有哪些设备？ | `list_devices` | `{}` | `{"ok":true,"total":6,"count":6,"has_more":false,"applied_defaults":{"controllable_only":true,"limit":50},"devices":[...]}`（默认只列可控设备） |
 | 列出所有实体（含传感器） | `list_devices` | `{"controllable_only":false}` | `total=7` |
 | 列出所有的灯 | `list_devices` | `{"domain":"light"}` | `total=1, devices=[{"name":"客厅灯","state":"off"}]` |
 | 客厅都有什么设备？ | `list_devices` | `{"keyword":"客厅"}` | `total=3` |
@@ -583,7 +588,12 @@ if "action" in resultJson:
 
 | code | 含义 | 处理建议 |
 |---|---|---|
-| `config_missing` | 缺少 `HA_URL` / `HA_TOKEN` | 补齐环境变量后重启 |
+| `config_missing` | 缺少 `HA_URL` / `HA_TOKEN` | 补齐环境变量后重启；bridge 启动时会直接失败退出 |
+| `config_invalid` | `HA_URL` 不是 `http://` / `https://` 开头或缺少主机名 | 修正 `HA_URL` 后重启 |
+| `invalid_argument` | 工具收到未知/冲突参数 | 按返回的可用参数名重试 |
+| `invalid_pagination` | `limit` / `offset` 不是整数 | 传正整数 `limit` 与非负整数 `offset` |
+| `invalid_entity` | `entity_id` 不是 `domain.object_id` 格式 | 用 `list_devices` 查正确 entity_id，或直接传中文名称 |
+| `invalid_response` | HA 返回了非预期 JSON 类型 | 检查 HA 版本/反向代理是否改写了响应 |
 | `auth_failed` | 令牌无效/过期/无权限（HTTP 401/403） | 重新生成长期令牌，更新 `HA_TOKEN` |
 | `unreachable` | 连不上 HA | 检查 `HA_URL`、网络连通、容器能否访问该地址 |
 | `timeout` | 请求 HA 超时 | 增大 `HA_TIMEOUT` 或检查网络/HA 负载 |
@@ -593,7 +603,7 @@ if "action" in resultJson:
 | `not_found` | 实体/资源不存在 | 用 `list_devices` 查正确 entity_id |
 | `not_controllable` | 设备类型无内置控制动作（如 sensor） | 只用 `get_device_state` 查询，或 `list_services` 后用 `call_service` |
 | `ambiguous` | 名称匹配到多个设备 | 改用更精确名称或 entity_id |
-| `missing_value` / `invalid_value` | 动作缺参数或取值越界 | 按工具描述传 1-100 等合法值 |
+| `missing_value` / `invalid_value` | 动作缺参数或取值越界 | 按工具描述传 0-100 等合法值（亮度/音量 0 表示关闭/静音） |
 | `unsupported_action` | 动作不支持（含该设备类型不支持） | 使用返回的 `actions` 列表，或 `list_services` 后用 `call_service` |
 | `invalid_service` | `call_service` 的 service 为空/格式错 | 用 `list_services` 查服务名，格式 `service` 或 `domain.service` |
 | `invalid_data` | `data` 不是 JSON 对象、包含 `entity_id` 或字段值非法（如 `rgb_color` 分量越界） | 传键值对对象，如 `{"temperature":26}`；目标实体只用 `entity` 参数指定 |
@@ -618,7 +628,7 @@ if "action" in resultJson:
    docker logs homeassistant-xiaozhiserver 2>&1 | grep '<call_id>'
    ```
    关键日志示例：
-   - `tool=list_devices start args=...` / `tool=list_devices done ok=true elapsed_ms=...`
+   - `tool=list_devices done ok=true elapsed_ms=...`（`start args` 仅在 `LOG_LEVEL=DEBUG` 输出，避免记录用户原话与敏感参数）
    - `action entity=light.living_room service=light.turn_on status=confirmed verified=True attempts=1 elapsed_ms=...`
    - `tool=control_device done ok=false code=not_found ...`
    - `confirm_token` 在日志中显示为 `***`；`HA_TOKEN` 启动日志只显示 `set`/`missing`。
@@ -646,7 +656,7 @@ if "action" in resultJson:
 
 ## 10. 离线测试
 
-提供模拟器与 stdio 端到端脚本，可在没有真实 HA 的情况下验证全部工具。测试口令由你自己指定（模拟器与本服务共用同一个值，**不要用真实 HA 令牌**）。
+提供模拟器与 stdio 端到端脚本，可在没有真实 HA 的情况下覆盖主要工具与关键分支（6 个工具入口、分页/过滤/聚合、控制回读、危险确认、WebUI 安全与示例）。测试口令由你自己指定（模拟器与本服务共用同一个值，**不要用真实 HA 令牌**）。
 
 ```bash
 # 一键运行（推荐）
@@ -654,7 +664,7 @@ export TEST_TOKEN=任意本地测试口令
 bash tests/run_local_test.sh
 ```
 
-脚本会启动 fake HA（HTTP 8123 + WebSocket 8124），等待 8123 可连接后运行端到端断言；e2e 客户端会以 `stdio` 子进程方式启动 `server.py`，结束后自动清理。随后运行 `tests/webui_smoke.py`，校验 WebUI 无需登录即可访问、状态、配置掩码、设备总览（`/api/devices`）、服务日志（`/api/logs`，含版本号）与工具白名单。整个测试不需要 `/ready` 或 8090 端口。
+脚本会启动 fake HA（HTTP 8123 + WebSocket 8124），等待两个端口都可连接后运行端到端断言；e2e 客户端会以 `stdio` 子进程方式启动 `server.py`，结束后自动清理。随后运行 `tests/webui_smoke.py`，校验 WebUI 无需登录即可访问、状态、配置掩码、设备总览（`/api/devices`）、服务日志（`/api/logs`，含版本号）与工具白名单。整个测试不需要 `/ready` 或 8090 端口。
 
 也可分两个终端手动运行：
 
@@ -663,7 +673,7 @@ bash tests/run_local_test.sh
 export FAKE_HA_TOKEN=任意本地测试口令
 python tests/fake_ha.py
 
-# 终端 2：e2e 客户端自己启动 stdio MCP server
+# 终端 2：e2e 客户端自己启动 stdio MCP server（重跑前请重启终端 1 的模拟器，保证初始状态）
 export HA_URL=http://127.0.0.1:8123
 export HA_TOKEN=任意本地测试口令
 export HA_WS_URL=ws://127.0.0.1:8124/api/websocket
@@ -692,7 +702,7 @@ python tests/e2e_mcp_client.py
 - 危险设备二次确认 token 只用于**防误操作**，不是权限控制；真正的访问权限仍由 HA 长期令牌决定。
 - 建议为 HA 使用专用长期令牌，并仅授予必要的设备控制权限。
 - 若 `mcp-endpoint-server` 在公网，使用 `wss://` 并确保 token 不泄露；`mcp_pipe.py` 日志已对 query 脱敏。
-- WebUI 无独立密码、固定 `8099`；请只绑定可信内网，不要直接暴露公网，远程访问优先走 SSH 隧道或带鉴权的反向代理；页面和 API 只展示掩码后的敏感值。
+- WebUI 无独立密码、固定 `8099`；请只绑定可信内网，不要直接暴露公网，远程访问优先走 SSH 隧道或带鉴权的反向代理；页面和 API 只展示掩码后的敏感值。WebUI 已拦截危险设备操作并校验同源写请求，但这只是纵深防御，不能替代网络隔离。
 
 ---
 
@@ -701,6 +711,7 @@ python tests/e2e_mcp_client.py
 
 | 版本 | 主要变化 |
 |---|---|
+| 未发布（审计修复） | 输入校验（entity_id/服务名/HA 响应类型）、脚本与系统级服务纳入二次确认、回读字段与重试逻辑修正、区域优先级修正、日志递归脱敏与尾部读取、WebUI 同源校验与危险操作拦截、bridge 重连退避/WS 大小限制/SIGTERM、容器健康检查与双进程守护、CI 增加测试与版本一致性校验 |
 | v1.13.0 | 简化部署：WebUI 与 MCP bridge 合并为单容器（`docker-entrypoint.sh` 同时启动两进程）；WebUI 去掉独立密码与全部 `WEBUI_*` 环境变量，固定监听 `0.0.0.0:8099`，直接复用 `HA_URL` / `HA_TOKEN`；compose 收敛为单服务；冒烟测试改为无需登录 |
 | v1.13.2 | WebUI 页头、服务日志面板与每条日志显示版本号；日志格式改为 `时间 级别 v版本 logger [call_id] 消息`，`/api/logs` 返回 `version`；bridge 启动日志记录自身版本 |
 | v1.13.1 | 控制结果改为 `action=RESPONSE` + 中文 `response`，修复小智把 `turn_off` 当 `Action` 枚举导致播报“turn off”的问题，并省掉控制后的一次 LLM 往返；`call_service` 常见控制服务同样直接播报；WebUI 去重运行状态/配置、新增按区域与类型展示的可调用设备列表、新增 WebUI+bridge 共享日志面板 |
