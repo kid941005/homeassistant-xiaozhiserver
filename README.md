@@ -112,6 +112,8 @@ homeassistant-xiaozhiserver/
 ├── docker-compose.yml               # 单服务 compose
 ├── requirements.txt
 ├── .env.example
+├── docs/
+│   └── webui.png                    # WebUI 首页截图
 ├── tests/
 │   ├── fake_ha.py                   # 离线 HA 模拟器（HTTP + WebSocket）
 │   ├── e2e_mcp_client.py            # stdio 端到端 MCP 断言
@@ -235,6 +237,10 @@ docker compose logs --tail=100 homeassistant-xiaozhiserver
 ## 5. WebUI
 
 WebUI 与 MCP bridge 在同一个容器内运行：WebUI 后台常驻，bridge 前台运行；容器 `HEALTHCHECK` 探测 `/healthz`（进程存活），`/readyz` 额外反映 HA 是否已配置且可达。
+
+![WebUI 首页](docs/webui.png)
+
+> 截图为离线 fake HA 演示数据，实际设备与状态以你的 Home Assistant 为准。
 
 页面分为四块：
 

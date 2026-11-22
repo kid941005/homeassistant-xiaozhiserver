@@ -1,7 +1,7 @@
 # homeassistant-xiaozhiserver — 小智 MCP 接入点 bridge + WebUI
 # 用法：cp .env.example .env，填写 MCP_ENDPOINT / HA_URL / HA_TOKEN，然后：
 #   docker compose pull && docker compose up -d
-# 一个容器同时运行 MCP 桥接和 WebUI；WebUI 固定 8099，无独立密码。
+# 一个容器同时运行 MCP 桥接和 WebUI；WebUI 默认 8099，无独立密码。
 services:
   homeassistant-xiaozhiserver:
     image: ghcr.io/kid941005/homeassistant-xiaozhiserver:latest
@@ -17,6 +17,9 @@ services:
       - .env
     environment:
       LOG_FILE: /app/logs/homeassistant-xiaozhiserver.log
+      # 显式传入容器，保证监听端口与 ports/健康检查一致；默认 0.0.0.0:8099
+      WEBUI_HOST: ${WEBUI_HOST:-0.0.0.0}
+      WEBUI_PORT: ${WEBUI_PORT:-8099}
     # WEBUI_PORT 可覆盖宿主机/容器端口；容器内监听地址由 .env 的 WEBUI_HOST 决定（默认 0.0.0.0）。
     ports:
       - "${WEBUI_PORT:-8099}:${WEBUI_PORT:-8099}"
