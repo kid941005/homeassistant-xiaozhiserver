@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from fastapi.testclient import TestClient  # noqa: E402
 
 from homeassistant_xiaozhiserver import __version__  # noqa: E402
-from homeassistant_xiaozhiserver.webui import _TOOLS, create_app  # noqa: E402
+from homeassistant_xiaozhiserver.webui import _TOOLS, _mask_endpoint, create_app  # noqa: E402
 
 client = TestClient(create_app(), base_url="http://127.0.0.1:8099")
 
@@ -77,6 +77,8 @@ check("logs 非法 level 返回 400", r.status_code == 400, str(r.status_code))
 
 r = client.get("/api/status")
 check("无需登录访问 /api/status 200", r.status_code == 200, str(r.status_code))
+check("端点掩码覆盖 access_token", "access_token=***" in _mask_endpoint("ws://h:8004/x?access_token=abc"),
+      _mask_endpoint("ws://h:8004/x?access_token=abc"))
 status = r.json()
 check("status.ok 为 True", status.get("ok") is True)
 check("status 含版本号", isinstance(status.get("version"), str) and bool(status["version"]))
@@ -90,7 +92,14 @@ config = r.json()
 check("配置标注只读", "只读" in str(config.get("note", "")))
 keys = {item["key"]: item["value"] for item in config.get("items", [])}
 check("HA_TOKEN 掩码展示", keys.get("HA_TOKEN") in ("已设置（掩码）", "（未设置）"), str(keys.get("HA_TOKEN")))
-check("配置无 WebUI 密码项", not any("WEBUI" in key.upper() or "PASSWORD" in key.upper() for key in keys), str(sorted(keys)))
+_webui_public = {"WEBUI_HOST", "WEBUI_PORT", "WEBUI_ALLOWED_HOSTS"}
+check(
+    "配置无 WebUI 密码项",
+    not any("PASSWORD" in key.upper()
+            or ("WEBUI" in key.upper() and key.upper() not in _webui_public)
+            for key in keys),
+    str(sorted(keys)),
+)
 mcp_raw = os.environ.get("MCP_ENDPOINT", "")
 if mcp_raw:
     from urllib.parse import parse_qsl, urlsplit
@@ -144,6 +153,19 @@ if os.environ.get("HA_URL") and os.environ.get("HA_TOKEN"):
         finally:
             danger_mod.DANGER_CONFIRM_ENABLED = _old_enabled
         check("WebUI 危险闸门独立于 DANGER_CONFIRM_ENABLED",
+              r.status_code == 403 and r.json().get("code") == "dangerous_operation_blocked",
+              str(r.status_code) + " " + r.text[:200])
+
+        import homeassistant_xiaozhiserver.server as mcp_server_mod
+        _real_get_device_state = mcp_server_mod.get_device_state
+        async def _boom(**kwargs):
+            raise RuntimeError("ha unavailable")
+        mcp_server_mod.get_device_state = _boom
+        try:
+            r = post("/api/tool/control_device", json={"entity": "switch.fan", "action": "turn_on"})
+        finally:
+            mcp_server_mod.get_device_state = _real_get_device_state
+        check("WebUI 危险闸门查询异常时失败关闭",
               r.status_code == 403 and r.json().get("code") == "dangerous_operation_blocked",
               str(r.status_code) + " " + r.text[:200])
 

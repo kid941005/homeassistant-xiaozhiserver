@@ -121,6 +121,9 @@ SERVICE_CONFIRM_TIMEOUT = env_float("SERVICE_CONFIRM_TIMEOUT", 4.0, 0.0, 300.0)
 HA_STATE_WS_ENABLED = env_bool("HA_STATE_WS_ENABLED", True)
 HA_STATE_CACHE_TTL = env_float("HA_STATE_CACHE_TTL", 1.0, 0.0, 60.0)
 HA_SERVICES_CACHE_TTL = env_float("HA_SERVICES_CACHE_TTL", 300.0, 0.0, 3600.0)
+# 事件流连续失败达到该次数后暂停自动重连 60s，避免 HA 长期不可用时每 30s 刷一次告警；
+# 下一次工具调用会重新尝试启动事件流。
+HA_STATE_WS_MAX_FAILURES = env_int("HA_STATE_WS_MAX_FAILURES", 5, 1, 100)
 
 # 危险设备二次确认
 DANGER_CONFIRM_ENABLED = env_bool("DANGER_CONFIRM_ENABLED", True)
@@ -133,6 +136,9 @@ DANGEROUS_SERVICE_DOMAINS = env_set(
     "lock,alarm_control_panel,script,shell_command,python_script",
 )
 
-# WebUI 固定监听 0.0.0.0:8099，无独立密码。
+# WebUI 监听地址与端口；默认保持 0.0.0.0:8099 以兼容容器端口映射，无独立密码。
+# 只允许本机访问时可设为 127.0.0.1（容器内需 network_mode: host 或反向代理）。
+WEBUI_HOST = env_str("WEBUI_HOST", "0.0.0.0")
+WEBUI_PORT = env_int("WEBUI_PORT", 8099, 1, 65535)
 # 额外允许的 Host（逗号分隔域名）；本机地址、回环地址与私有网段始终允许。
 WEBUI_ALLOWED_HOSTS = env_set("WEBUI_ALLOWED_HOSTS", "")

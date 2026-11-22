@@ -43,12 +43,15 @@ from .config import (
     HA_SERVICES_CACHE_TTL,
     HA_STATE_CACHE_TTL,
     HA_STATE_WS_ENABLED,
+    HA_STATE_WS_MAX_FAILURES,
     LOG_LEVEL,
     MAX_LIST_LIMIT,
     SERVICE_CONFIRM_DELAY,
     SERVICE_CONFIRM_RETRIES,
     SERVICE_CONFIRM_TIMEOUT,
     WEBUI_ALLOWED_HOSTS,
+    WEBUI_HOST,
+    WEBUI_PORT,
 )
 from .danger import service_is_dangerous
 from .logging_setup import log_file_path, read_recent_logs, setup_logging
@@ -56,9 +59,8 @@ from .logging_setup import log_file_path, read_recent_logs, setup_logging
 log = logging.getLogger("homeassistant_xiaozhiserver.webui")
 
 _STARTED_AT = time.time()
-WEBUI_HOST = "0.0.0.0"
-WEBUI_PORT = 8099
 _MAX_TOOL_BODY = 64 * 1024
+_DANGER_GATED_TOOLS = frozenset({"control_device", "control_devices", "call_service"})
 
 # 工具白名单：名称 -> (说明, 参数示例)
 _TOOLS: list[tuple[str, str, str]] = [
@@ -152,8 +154,9 @@ def _mask_endpoint(raw: str) -> str:
     if not parts.scheme or not parts.netloc:
         return "（格式无法解析）"
     netloc = parts.netloc.rsplit("@", 1)[-1]
+    sensitive = ("token", "key", "secret", "password", "sig", "auth", "credential")
     query = "&".join(
-        key + "=***" if key.lower() in ("token", "key", "secret", "password") else key + "=" + value
+        key + "=***" if any(marker in key.lower() for marker in sensitive) else key + "=" + value
         for key, value in parse_qsl(parts.query, keep_blank_values=True)
     )
     return urlunsplit((parts.scheme, netloc, parts.path, query, ""))
@@ -169,6 +172,23 @@ def create_app() -> FastAPI:
         if value.count(":") == 1:
             return value.rsplit(":", 1)[0]
         return value
+
+    def _host_port(host: str) -> int | None:
+        try:
+            return urlsplit("//" + (host or "").strip()).port
+        except ValueError:
+            return None
+
+    def _origin_allowed(parts, host: str) -> bool:
+        """比较 Origin 与 Host，并按 scheme 归一化默认端口。"""
+        if parts.scheme not in ("http", "https"):
+            return False
+        origin_name = (parts.hostname or "").lower()
+        if not origin_name:
+            return False
+        default_port = 443 if parts.scheme == "https" else 80
+        return (origin_name == _host_name(host)
+                and (parts.port or default_port) == (_host_port(host) or default_port))
 
     def _host_allowed(host: str) -> bool:
         name = _host_name(host)
@@ -213,7 +233,7 @@ def create_app() -> FastAPI:
                     status_code=403,
                 ))
             parts = urlsplit(origin)
-            if parts.scheme not in ("http", "https") or parts.netloc.lower() != host.lower():
+            if not _origin_allowed(parts, host):
                 return _harden(JSONResponse(
                     {"ok": False, "code": "cross_origin_blocked", "message": "拒绝跨站请求。"},
                     status_code=403,
@@ -282,6 +302,7 @@ def create_app() -> FastAPI:
                 {"key": "HA_VERIFY_SSL", "value": verify_ssl, "secret": False},
                 {"key": "HA_WS_ENABLED", "value": ws_enabled, "secret": False},
                 {"key": "HA_STATE_WS_ENABLED", "value": str(HA_STATE_WS_ENABLED).lower(), "secret": False},
+                {"key": "HA_STATE_WS_MAX_FAILURES", "value": str(HA_STATE_WS_MAX_FAILURES), "secret": False},
                 {"key": "HA_STATE_CACHE_TTL", "value": str(HA_STATE_CACHE_TTL), "secret": False},
                 {"key": "HA_SERVICES_CACHE_TTL", "value": str(HA_SERVICES_CACHE_TTL), "secret": False},
                 {"key": "SERVICE_CONFIRM_DELAY", "value": str(SERVICE_CONFIRM_DELAY), "secret": False},
@@ -293,6 +314,8 @@ def create_app() -> FastAPI:
                 {"key": "LOG_LEVEL", "value": LOG_LEVEL, "secret": False},
                 {"key": "DEFAULT_LIST_LIMIT", "value": str(DEFAULT_LIST_LIMIT), "secret": False},
                 {"key": "MAX_LIST_LIMIT", "value": str(MAX_LIST_LIMIT), "secret": False},
+                {"key": "WEBUI_HOST", "value": WEBUI_HOST, "secret": False},
+                {"key": "WEBUI_PORT", "value": str(WEBUI_PORT), "secret": False},
             ],
             "note": "配置为只读视图，展示实际生效值；WebUI 无独立密码，直接使用 HA_URL / HA_TOKEN 连接 HA；修改请更新 .env 并重启服务。",
         }
@@ -497,12 +520,22 @@ def create_app() -> FastAPI:
         if isinstance(raw_entities, list):
             candidates.extend(str(x).strip() for x in raw_entities if str(x).strip())
         for ref in candidates:
+            # 安全判定必须失败关闭：HA 抖动、实体不存在或返回结构异常时都不能当作“非危险”。
             try:
                 info = await mcp_server.get_device_state(entity=ref)
-            except Exception:  # noqa: BLE001
-                info = None
-            view = info.get("entity") if isinstance(info, dict) else None
-            if isinstance(view, dict) and view.get("dangerous"):
+            except Exception as exc:  # noqa: BLE001
+                log.warning("webui danger check failed entity=%s: %s", ref, exc)
+                return {"ok": False, "code": "dangerous_operation_blocked",
+                        "message": "无法确认设备是否安全（" + str(exc) + "），已拒绝执行。"}
+            if not isinstance(info, dict) or info.get("ok") is not True:
+                reason = info.get("message") if isinstance(info, dict) else "返回结构异常"
+                return {"ok": False, "code": "dangerous_operation_blocked",
+                        "message": "无法确认设备是否安全（" + str(reason or "查询失败") + "），已拒绝执行。"}
+            view = info.get("entity")
+            if not isinstance(view, dict):
+                return {"ok": False, "code": "dangerous_operation_blocked",
+                        "message": "无法确认设备是否安全（实体信息缺失），已拒绝执行。"}
+            if view.get("dangerous"):
                 reason = str(view.get("danger_reason") or "该设备属于高风险设备")
                 return {"ok": False, "code": "dangerous_operation_blocked",
                         "message": "WebUI 不执行危险设备操作（" + reason + "）；请通过小智语音确认后再操作。"}
@@ -516,7 +549,7 @@ def create_app() -> FastAPI:
         if isinstance(params, str):
             try:
                 params = json.loads(params) if params.strip() else {}
-            except json.JSONDecodeError as exc:
+            except (json.JSONDecodeError, RecursionError, ValueError) as exc:
                 return {"ok": False, "code": "invalid_argument",
                         "message": "参数不是合法 JSON：" + str(exc)}, 400
         if not isinstance(params, dict):
@@ -526,7 +559,7 @@ def create_app() -> FastAPI:
         except TypeError as exc:
             return {"ok": False, "code": "invalid_argument",
                     "message": "参数与工具签名不匹配：" + str(exc)}, 400
-        if name in ("control_device", "control_devices", "call_service"):
+        if name in _DANGER_GATED_TOOLS:
             blocked = await _webui_danger_block(name, params)
             if blocked is not None:
                 return blocked, 403
@@ -825,7 +858,9 @@ async function loadDevices() {
       entTd.appendChild(cell('div', r.name || r.entity_id || ''));
       entTd.appendChild(cell('small', r.entity_id || '', 'muted'));
       tr.appendChild(entTd);
-      tr.appendChild(cell('td', (r.state || 'unknown') + (r.unit ? ' ' + r.unit : '')));
+      var stateText = (r.state || 'unknown') + (r.unit ? ' ' + r.unit : '');
+      var stateCls = r.state === 'unavailable' ? 'bad' : (r.state === 'unknown' ? 'muted' : '');
+      tr.appendChild(cell('td', stateText, stateCls));
       var actTd = document.createElement('td');
       if (r.actions && r.actions.length) {
         for (var j = 0; j < r.actions.length; j++) actTd.appendChild(cell('span', r.actions[j], 'badge'));
@@ -872,6 +907,7 @@ async function loadLogs() {
       line.className = 'log-line log-' + (e.level || 'INFO');
       line.appendChild(cell('span', e.time || '', 'log-time'));
       line.appendChild(cell('span', e.level || '', 'log-level'));
+      if (e.version) line.appendChild(cell('span', 'v' + e.version, 'log-ver'));
       line.appendChild(cell('span', '[' + (e.logger || '') + ']', 'log-name'));
       line.appendChild(cell('span', e.message || '', 'log-msg'));
       box.appendChild(line);

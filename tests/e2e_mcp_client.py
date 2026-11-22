@@ -254,6 +254,10 @@ async def main():
              {"ok": True, "status": "confirmed", "after_brightness": 127,
               "action": "RESPONSE", "device_action": "set_brightness",
               "response_contains": "亮度", "response_not_contains": "turn_off"}),
+            ("control_device", {"entity": "客厅灯", "action": "set_brightness", "value": 0},
+             {"ok": True, "status": "confirmed", "after_state": "off",
+              "action": "RESPONSE", "device_action": "set_brightness",
+              "response_contains": "已关闭", "response_not_contains": "turn_off"}),
             ("control_device", {"entity": "switch.fan", "action": "turn_on"},
              {"ok": True, "status": "confirmed", "after_state": "on",
               "action": "RESPONSE", "device_action": "turn_on",
@@ -278,11 +282,13 @@ async def main():
             ("control_devices", {"entities": ["switch.fan", "客厅灯"], "action": "turn_on"},
              {"ok": True, "count": 2, "action": "RESPONSE", "response_contains": "已打开"}),
             ("control_devices", {"entities": ["switch.fan", "不存在设备"], "action": "turn_off"},
-             {"ok": True, "count": 1, "action": "RESPONSE", "response_contains": "已关闭"}),
+             {"ok": True, "count": 1, "action": "RESPONSE", "response_contains": "未执行"}),
             ("control_devices", {"entities": [], "action": "turn_on"},
              {"ok": False, "code": "invalid_argument"}),
             ("control_devices", {"entities": ["sensor.living_temp"], "action": "turn_on"},
              {"ok": False, "code": "no_valid_entities"}),
+            ("control_devices", {"entities": ["switch.fan"] * 21, "action": "turn_on"},
+             {"ok": False, "code": "invalid_argument"}),
             # 边界与错误
             ("control_device", {"entity": "sensor.living_temp", "action": "turn_on"},
              {"ok": False, "code": "not_controllable"}),
@@ -311,6 +317,13 @@ async def main():
             ("call_service", {"entity": "客厅灯", "service": "light.turn_on",
                               "data": {"entity_id": "switch.fan"}},
              {"ok": False, "code": "invalid_data"}),
+            # 目标选择器不能从 data 注入，否则可绕过主实体的危险判定
+            ("call_service", {"entity": "客厅灯", "service": "homeassistant.turn_on",
+                              "data": {"target": {"entity_id": "lock.front_door"}}},
+             {"ok": False, "code": "invalid_data"}),
+            ("call_service", {"entity": "客厅灯", "service": "light.turn_on",
+                              "data": {"device_id": "dev_lock"}},
+             {"ok": False, "code": "invalid_data"}),
             ("call_service", {"entity": "客厅灯", "service": "light.turn_on",
                               "data": {"rgb_color": [300, 0, 0]}},
              {"ok": False, "code": "invalid_data"}),
@@ -338,6 +351,11 @@ async def main():
         check(bool(compact_views) and "attributes" not in first_view
               and "controllable" in first_view and "entity_id" in first_view,
               "compact 仅保留关键字段", sorted(first_view.keys()))
+        compact_dev = await call(session, "list_devices", {"compact": True, "group_by": "device"})
+        compact_dev_data = compact_dev["data"] if isinstance(compact_dev["data"], dict) else {}
+        compact_groups = compact_dev_data.get("devices") or []
+        check(bool(compact_groups) and all(g.get("device_name") for g in compact_groups),
+              "compact 设备分组保留设备名", [g.get("device_name") for g in compact_groups])
 
         # P3：危险设备二次确认完整流程
         print("\n== P3 危险设备二次确认 ==")

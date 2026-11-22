@@ -17,8 +17,9 @@ services:
       - .env
     environment:
       LOG_FILE: /app/logs/homeassistant-xiaozhiserver.log
+    # WEBUI_PORT 可覆盖宿主机/容器端口；容器内监听地址由 .env 的 WEBUI_HOST 决定（默认 0.0.0.0）。
     ports:
-      - "8099:8099"
+      - "${WEBUI_PORT:-8099}:${WEBUI_PORT:-8099}"
     volumes:
       - xiaozhi-logs:/app/logs
     security_opt:

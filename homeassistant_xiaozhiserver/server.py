@@ -52,6 +52,11 @@ from .logging_setup import reset_call_id, set_call_id, setup_logging
 log = logging.getLogger("homeassistant_xiaozhiserver.server")
 setup_logging()
 
+# call_service 的 data 中禁止出现目标选择器：目标实体必须由 entity 参数指定。
+_TARGET_SELECTOR_KEYS = frozenset({
+    "entity_id", "target", "device_id", "area_id", "floor_id", "label_id",
+})
+
 mcp = MCPServer(
     "homeassistant-xiaozhiserver",
     instructions=(
@@ -133,7 +138,11 @@ def _as_bool(value: Any, default: bool = False) -> bool:
 
 
 def _parse_pagination(limit: Any, offset: Any) -> Optional[tuple[int, int]]:
-    """把 limit/offset 归一化为合法分页；非法输入返回 None，由调用方返回结构化错误。"""
+    """把 limit/offset 归一化为合法分页。
+
+    limit<=0 回退到 DEFAULT_LIST_LIMIT、offset<0 回退到 0；只有无法转成整数时才返回
+    None，由调用方返回 invalid_pagination。
+    """
     try:
         if limit is None or (isinstance(limit, str) and not limit.strip()):
             lim = DEFAULT_LIST_LIMIT
@@ -424,9 +433,11 @@ async def list_devices(
         lim, off = page_args
         ha = get_ha()
         states, reg = await asyncio.gather(ha.get_states(), ha.get_registries(), return_exceptions=True)
-        if isinstance(states, Exception):
+        if isinstance(states, BaseException):
             raise states
-        if isinstance(reg, Exception):
+        if isinstance(reg, asyncio.CancelledError):
+            raise reg
+        if isinstance(reg, BaseException):
             reg = None
         devices_map, ents_map, areas_map = _registry_maps(reg)
         states = [s for s in states if not is_excluded_entity(s, devices_map, ents_map)]
@@ -526,9 +537,12 @@ def _compact_page(page: list, grouped_by: str) -> list:
         return [_compact_view(v) for v in page]
     out = []
     for group in page:
+        # _group_by_device 的组名字段是 name；兼容读取，避免 compact 模式丢设备名。
         item = {k: group.get(k) for k in
                 ("device_id", "device_name", "area_id", "area_name", "entity_count")
                 if group.get(k) is not None}
+        if "device_name" not in item and group.get("name"):
+            item["device_name"] = group["name"]
         item["entities"] = [_compact_view(e) for e in (group.get("entities") or [])]
         out.append(item)
     return out
@@ -766,6 +780,9 @@ async def control_devices(entities: list[str], action: str, value: Optional[Any]
         if errors:
             out["errors"] = errors
             out["message"] = "部分设备未执行：" + "；".join(str(e.get("message") or e.get("entity")) for e in errors)
+            if voices:
+                # 直出播报必须把未执行数量说出来，避免只播成功项造成“全部成功”的错觉。
+                out["response"] = out["response"] + "；另有 " + str(len(errors)) + " 个设备未执行。"
         return out
     except HAError as e:
         return {"ok": False, **e.to_dict(), "hint": _hint()}
@@ -920,9 +937,13 @@ async def call_service(entity: str, service: str, data: Optional[dict] = None,
         else:
             return {"ok": False, "code": "invalid_data",
                     "message": "data 必须是 JSON 对象（键值对），收到：" + str(type(data).__name__)}
-        if "entity_id" in extra:
+        # 目标选择器只允许来自 entity 参数。否则调用方可在 data 里用 target/device_id
+        # 等字段把服务作用到门锁、车库门等另一批实体，绕过 _danger_block 的主实体判定。
+        blocked_keys = sorted(set(extra) & _TARGET_SELECTOR_KEYS)
+        if blocked_keys:
             return {"ok": False, "code": "invalid_data",
-                    "message": "data 不应包含 entity_id；目标实体由 entity 参数指定，避免覆盖解析结果。"}
+                    "message": "data 不应包含目标选择器 " + "、".join(blocked_keys)
+                    + "；目标实体只能由 entity 参数指定，避免绕过危险操作校验。"}
         payload = {"entity_id": eid}
         payload.update(extra)
         guard = _danger_block(st, service_domain, svc, payload, confirm_token)
@@ -963,9 +984,11 @@ async def list_domains() -> dict:
     try:
         ha = get_ha()
         states, reg = await asyncio.gather(ha.get_states(), ha.get_registries(), return_exceptions=True)
-        if isinstance(states, Exception):
+        if isinstance(states, BaseException):
             raise states
-        if isinstance(reg, Exception):
+        if isinstance(reg, asyncio.CancelledError):
+            raise reg
+        if isinstance(reg, BaseException):
             reg = None
         devices_map, ents_map, _ = _registry_maps(reg)
         states = [s for s in states if not is_excluded_entity(s, devices_map, ents_map)]

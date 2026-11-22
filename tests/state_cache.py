@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
+import time
 from pathlib import Path
+
+from websockets.asyncio.server import serve
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -89,6 +93,73 @@ async def run() -> None:
     check(len(cached) == 1 and calls["states"] == before, "事件流就绪时 get_states 走内存缓存")
 
     await ha.aclose()
+
+    # 真实 WS 事件流：本地起一个最小 HA WebSocket 服务端，验证订阅、事件解析、
+    # 缓存落盘与 ready 置位，而不是手工 set() 绕过整条链路。
+    async def ws_handler(ws) -> None:
+        await ws.send(json.dumps({"type": "auth_required"}))
+        auth = json.loads(await ws.recv())
+        check(auth.get("type") == "auth", "事件流先发 auth")
+        await ws.send(json.dumps({"type": "auth_ok"}))
+        sub = json.loads(await ws.recv())
+        check(sub.get("type") == "subscribe_events" and sub.get("event_type") == "state_changed",
+              "事件流订阅 state_changed")
+        await ws.send(json.dumps({"id": 10, "type": "result", "success": True, "result": None}))
+        await asyncio.sleep(0.1)
+        await ws.send(json.dumps({
+            "id": 11, "type": "event",
+            "event": {"event_type": "state_changed", "data": {
+                "entity_id": "light.a",
+                "old_state": {"entity_id": "light.a", "state": "off", "attributes": {}},
+                "new_state": {"entity_id": "light.a", "state": "on", "attributes": {}},
+            }},
+        }))
+        await asyncio.sleep(2)
+
+    server = await serve(ws_handler, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    ha2 = make_client()
+    ha2.ws_enabled = True
+    ha2.state_ws_enabled = True
+    ha2.ws_url = "ws://127.0.0.1:" + str(port)
+    rest_calls = {"states": 0}
+
+    async def fake_request2(method: str, path: str, **kwargs):
+        if path == "/api/states":
+            rest_calls["states"] += 1
+            return [{"entity_id": "light.a", "state": "off", "attributes": {}}]
+        raise AssertionError("unexpected path " + path)
+
+    ha2._request = fake_request2  # type: ignore[method-assign]
+    try:
+        ha2._ensure_state_stream()
+        await asyncio.wait_for(ha2._state_ws_ready.wait(), 3.0)
+        check(rest_calls["states"] == 1, "事件流就绪前只拉一次全量快照")
+        changed = await ha2.wait_for_state("light.a", lambda s: s.get("state") == "on", timeout=2.0)
+        check(isinstance(changed, dict) and changed.get("state") == "on", "真实 state_changed 事件被解析")
+        cached = await ha2.get_states()
+        check(len(cached) == 1 and cached[0].get("state") == "on" and rest_calls["states"] == 1,
+              "事件写入内存缓存且不再发 REST")
+    finally:
+        await ha2.aclose()
+        server.close()
+        await server.wait_closed()
+
+    # 事件流连续失败熔断：避免 HA 长期不可用时每 30s 刷一次告警。
+    ha3 = make_client()
+    ha3.ws_enabled = True
+    ha3.state_ws_enabled = True
+    ha3.ws_url = "ws://127.0.0.1:1"
+    ha3.timeout = 0.2
+    ha3._state_ws_max_failures = 2
+    ha3._ensure_state_stream()
+    try:
+        await asyncio.wait_for(ha3._state_ws_task, 10.0)
+        check(ha3._state_ws_failures >= 2, "事件流连续失败计数")
+        check(ha3._state_ws_retry_after > time.monotonic(), "事件流连续失败后进入熔断")
+        check(ha3._ensure_state_stream() is False, "熔断期内不重启事件流")
+    finally:
+        await ha3.aclose()
     print("STATE CACHE OK")
 
 

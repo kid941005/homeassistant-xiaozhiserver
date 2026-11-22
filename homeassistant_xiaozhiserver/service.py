@@ -122,6 +122,9 @@ def _voice_message(name: str, action: str, status: str, after: Optional[dict],
             if state in ("on", "off"):
                 return name + "已" + _state_label(state) + "。"
             return name + "已切换。"
+        if label == "调亮度" and (p.get("brightness_pct") == 0
+                                  or (p.get("brightness_pct") is None and state == "off")):
+            return name + "已关闭。"
         if label == "调亮度":
             v = _num_text(p.get("brightness_pct"))
             if v:
@@ -417,6 +420,8 @@ async def _apply_and_confirm_unlocked(ha: "HAClient", st: dict, service_domain: 
 
     min_attempts = max(1, int(SERVICE_CONFIRM_RETRIES) + 1)
     interval = SERVICE_CONFIRM_INTERVAL if SERVICE_CONFIRM_INTERVAL > 0 else 0.0
+    # RETRIES 只是最少回读次数，真正的上限是 TIMEOUT；否则慢设备会在 ~0.6s 就被判为无变化。
+    max_attempts = max(min_attempts, int(SERVICE_CONFIRM_TIMEOUT / max(interval, 0.05)) + 2)
     attempts = 0
     after = None
     changed = False
@@ -478,10 +483,11 @@ async def _apply_and_confirm_unlocked(ha: "HAClient", st: dict, service_domain: 
                 break
         elif changed:
             break
-        # 次数与时间任一到达上限即退出；旧写法要求两者同时成立，导致 RETRIES 实际失效。
-        if attempts >= min_attempts:
+        # 至少回读 min_attempts 次，但最多到 TIMEOUT 对应的次数；
+        # 旧写法 attempts>=min_attempts 先退出，使 TIMEOUT 形同虚设。
+        if attempts >= max_attempts:
             break
-        if (time.monotonic() - started) >= SERVICE_CONFIRM_TIMEOUT:
+        if attempts >= min_attempts and (time.monotonic() - started) >= SERVICE_CONFIRM_TIMEOUT:
             break
 
     verified = bool(check["verified"]) if has_expectation else bool(changed)
@@ -626,7 +632,11 @@ def build_service(action: str, domain: str, value: Any) -> tuple:
         return "media_player", "media_play", {}
     if a == "set_brightness":
         _need_value(a, value)
-        return "light", "turn_on", {"brightness_pct": _clamp_pct(value)}
+        pct = _clamp_pct(value)
+        # 亮度 0 在 HA 中等价于关闭；直接用 turn_off，避免部分灯具忽略 brightness_pct=0 仍保持点亮。
+        if pct == 0:
+            return "light", "turn_off", {}
+        return "light", "turn_on", {"brightness_pct": pct}
     if a == "set_volume":
         _need_value(a, value)
         return "media_player", "volume_set", {"volume_level": round(_clamp_pct(value) / 100.0, 3)}

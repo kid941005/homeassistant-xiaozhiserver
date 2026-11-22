@@ -26,10 +26,10 @@ ENV HA_TIMEOUT=10 \
     HA_VERIFY_SSL=true \
     LOG_LEVEL=INFO
 
-# WebUI 固定监听 8099
+# WebUI 默认监听 8099，可用 WEBUI_PORT 覆盖；EXPOSE 仅作默认声明。
 EXPOSE 8099
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8099/healthz', timeout=3)" || exit 1
+    CMD python -c "import os, urllib.request; port=os.environ.get('WEBUI_PORT','8099'); urllib.request.urlopen('http://127.0.0.1:%s/healthz' % port, timeout=3)" || exit 1
 
 ENTRYPOINT ["/app/docker-entrypoint.sh"]

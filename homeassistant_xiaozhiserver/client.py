@@ -21,7 +21,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from .config import env_bool, env_float
+from .config import HA_STATE_WS_MAX_FAILURES, env_bool, env_float
 
 log = logging.getLogger("homeassistant_xiaozhiserver.client")
 
@@ -71,6 +71,7 @@ class HAClient:
         self.registry_error_ttl = env_float("HA_REGISTRY_ERROR_TTL", 10.0, 0.0, 3600.0)
         self._registry_cache: dict | None = None
         self._registry_ts: float = 0.0
+        self._registry_error_ts: float = 0.0
         self._http: httpx.AsyncClient | None = None
         # 状态/服务缓存与长期 state_changed 事件流：减少每次工具调用拉全量 /api/states。
         self.state_ws_enabled = env_bool("HA_STATE_WS_ENABLED", True)
@@ -84,6 +85,11 @@ class HAClient:
         self._state_ws_task: asyncio.Task | None = None
         self._state_ws_ready = asyncio.Event()
         self._state_ws_stop = asyncio.Event()
+        # 事件流失败熔断：连续失败 max_failures 次后暂停 60s，避免 HA 长期不可用时持续告警。
+        self._state_ws_failures = 0
+        self._state_ws_max_failures = HA_STATE_WS_MAX_FAILURES
+        self._state_ws_retry_after = 0.0
+        self._state_ws_established = False
         self._state_waiters: dict[str, list[tuple[asyncio.Future, Any]]] = {}
         self._entity_locks: dict[str, asyncio.Lock] = {}
         self._validate_config()
@@ -199,11 +205,15 @@ class HAClient:
             return False
         if self._state_ws_task is not None and not self._state_ws_task.done():
             return True
+        # 熔断期内直接回退 REST，由下一次工具调用在冷却结束后重新尝试。
+        if time.monotonic() < self._state_ws_retry_after:
+            return False
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return False
         self._state_ws_stop.clear()
+        self._state_ws_failures = 0
         self._state_ws_task = loop.create_task(self._state_stream_loop())
         return True
 
@@ -289,6 +299,7 @@ class HAClient:
         backoff = 1.0
         while not self._state_ws_stop.is_set():
             started = time.monotonic()
+            self._state_ws_established = False
             try:
                 await self._state_stream_connect()
             except asyncio.CancelledError:
@@ -300,6 +311,21 @@ class HAClient:
                 self._fail_state_waiters()
             if self._state_ws_stop.is_set():
                 break
+            # 只有“建立订阅并稳定运行 >=60s”才算成功；建立后立刻断开仍计为失败，
+            # 避免 HA 反复接受后立刻关闭时形成 1s 级重连风暴。
+            if self._state_ws_established and time.monotonic() - started >= 60.0:
+                self._state_ws_failures = 0
+                self._state_ws_retry_after = 0.0
+                backoff = 1.0
+            else:
+                self._state_ws_failures += 1
+                if self._state_ws_failures >= self._state_ws_max_failures:
+                    self._state_ws_retry_after = time.monotonic() + 60.0
+                    log.warning(
+                        "HA state stream 连续 %s 次失败，暂停自动重连 60s，期间回退 REST 轮询",
+                        self._state_ws_failures,
+                    )
+                    return
             # 连接稳定较久后重置退避，避免历史上多次失败导致后续重连仍等 30 秒。
             if time.monotonic() - started >= 60.0:
                 backoff = 1.0
@@ -339,6 +365,7 @@ class HAClient:
                     break
             # 先订阅再拉一次全量快照，保证事件流就绪时缓存完整，且不丢订阅后到达的事件。
             self._store_states(await self._fetch_states_rest())
+            self._state_ws_established = True
             self._state_ws_ready.set()
             log.info("HA state stream 已连接，已订阅 state_changed（%s 个实体）", len(self._state_entities))
             async for raw in ws:
@@ -456,10 +483,10 @@ class HAClient:
         age = now - self._registry_ts
         if not force and self._registry_cache is not None and age < self.registry_ttl:
             return self._registry_cache
-        # 失败结果只短缓存，避免 WS 瞬时故障后 60 秒内都不再重试
-        if (not force and self._registry_cache is None and self._registry_ts
-                and age < self.registry_error_ttl):
-            return None
+        # 失败只短节流，且不清空仍可用的旧缓存；避免一次抖动让设备名/区域降级 60 秒。
+        if (not force and self._registry_error_ts
+                and now - self._registry_error_ts < self.registry_error_ttl):
+            return self._registry_cache
         try:
             data = await self._ws_registries()
             log.debug("HA registry loaded: devices=%s entities=%s areas=%s",
@@ -472,8 +499,15 @@ class HAClient:
         except Exception as e:  # noqa: BLE001 注册表仅是增强信息，任何异常都降级
             log.warning("HA registry unavailable: %s", e)
             data = None
+        if data is None:
+            # 失败时保留旧缓存，只记录失败时间做短节流。
+            self._registry_error_ts = now
+            if self._registry_cache is None:
+                self._registry_ts = now
+            return self._registry_cache
         self._registry_cache = data
         self._registry_ts = now
+        self._registry_error_ts = 0.0
         return data
 
     async def _ws_registries(self) -> dict:

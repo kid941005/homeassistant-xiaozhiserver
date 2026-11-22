@@ -90,5 +90,8 @@ echo "===== dedupe unit ====="
 echo "===== state cache unit ====="
 "$PY" tests/state_cache.py
 
+echo "===== confirm window unit ====="
+"$PY" tests/confirm_window.py
+
 echo "===== webui smoke ====="
 "$PY" tests/webui_smoke.py

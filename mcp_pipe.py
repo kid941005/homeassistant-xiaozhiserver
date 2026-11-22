@@ -172,11 +172,12 @@ async def connect_with_retry(uri: str, script_path: str, target: str) -> None:
     attempt = 0
     backoff = INITIAL_BACKOFF
     while True:
+        # 在 try 外赋值，保证异常路径也能安全计算连接时长。
+        started = time.monotonic()
         try:
             if attempt > 0:
                 logger.info("[%s] %ss 后进行第 %s 次重连", target, backoff, attempt)
                 await asyncio.sleep(backoff * (0.5 + random.random()))
-            started = time.monotonic()
             await connect_to_server(uri, script_path, target)
         except asyncio.CancelledError:
             raise

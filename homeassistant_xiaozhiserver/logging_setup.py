@@ -140,7 +140,8 @@ def read_recent_logs(limit: int = 200, level: str | None = None) -> list[dict[st
         lines = lines[:-1]  # 正在写入的半行不参与解析
 
     entries: list[dict[str, str]] = []
-    for raw_line in lines[-max(limit * 4, 500):]:
+    # 窗口最多 256KB，逐行解析全部内容，避免 level 过滤前先截断导致凑不满 limit。
+    for raw_line in lines:
         line = raw_line.rstrip("\r\n")
         match = _LINE_RE.match(line)
         if match:
