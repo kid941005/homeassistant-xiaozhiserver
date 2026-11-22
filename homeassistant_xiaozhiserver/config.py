@@ -95,6 +95,9 @@ if LOG_LEVEL not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
 # 共享日志文件（WebUI 与 bridge 两个进程都写入，WebUI 读取尾部展示）
 # 留空时使用系统临时目录，通常不需要设置。
 LOG_FILE = env_str("LOG_FILE", "")
+# 文件日志轮转：单个文件上限与保留份数；设为 0 关闭轮转。
+LOG_MAX_BYTES = env_int("LOG_MAX_BYTES", 5 * 1024 * 1024, 0, 1024 * 1024 * 1024)
+LOG_BACKUP_COUNT = env_int("LOG_BACKUP_COUNT", 3, 0, 50)
 
 # 设备列表
 DEFAULT_LIST_LIMIT = env_int("DEFAULT_LIST_LIMIT", 50, 1, 10000)
@@ -108,11 +111,16 @@ if DEFAULT_LIST_LIMIT > MAX_LIST_LIMIT:
 EXCLUDED_DOMAINS = env_set("EXCLUDED_DOMAINS", "automation,media_player")
 EXCLUDED_DEVICE_KEYWORDS = env_set("EXCLUDED_DEVICE_KEYWORDS", "门铃,水壶,中枢网关")
 
-# 控制后回读
-SERVICE_CONFIRM_DELAY = env_float("SERVICE_CONFIRM_DELAY", 0.6, 0.0, 30.0)
-SERVICE_CONFIRM_RETRIES = env_int("SERVICE_CONFIRM_RETRIES", 1, 0, 20)
+# 控制后回读：默认自适应短轮询；HA WebSocket 可用时优先事件驱动，通常首个事件即确认。
+SERVICE_CONFIRM_DELAY = env_float("SERVICE_CONFIRM_DELAY", 0.15, 0.0, 30.0)
+SERVICE_CONFIRM_RETRIES = env_int("SERVICE_CONFIRM_RETRIES", 3, 0, 20)
 SERVICE_CONFIRM_INTERVAL = env_float("SERVICE_CONFIRM_INTERVAL", SERVICE_CONFIRM_DELAY, 0.0, 30.0)
 SERVICE_CONFIRM_TIMEOUT = env_float("SERVICE_CONFIRM_TIMEOUT", 4.0, 0.0, 300.0)
+
+# 状态/服务缓存与 WebSocket state_changed 事件流
+HA_STATE_WS_ENABLED = env_bool("HA_STATE_WS_ENABLED", True)
+HA_STATE_CACHE_TTL = env_float("HA_STATE_CACHE_TTL", 1.0, 0.0, 60.0)
+HA_SERVICES_CACHE_TTL = env_float("HA_SERVICES_CACHE_TTL", 300.0, 0.0, 3600.0)
 
 # 危险设备二次确认
 DANGER_CONFIRM_ENABLED = env_bool("DANGER_CONFIRM_ENABLED", True)
@@ -125,4 +133,6 @@ DANGEROUS_SERVICE_DOMAINS = env_set(
     "lock,alarm_control_panel,script,shell_command,python_script",
 )
 
-# WebUI 固定监听 0.0.0.0:8099，无独立密码；不需要额外环境变量
+# WebUI 固定监听 0.0.0.0:8099，无独立密码。
+# 额外允许的 Host（逗号分隔域名）；本机地址、回环地址与私有网段始终允许。
+WEBUI_ALLOWED_HOSTS = env_set("WEBUI_ALLOWED_HOSTS", "")

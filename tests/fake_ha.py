@@ -9,6 +9,7 @@
 （默认监听 127.0.0.1:8123；令牌通过 FAKE_HA_TOKEN 指定，缺省 devtoken）
 """
 import asyncio
+import copy
 import json
 import os
 import threading
@@ -91,6 +92,33 @@ STATES = {
 
 # 延迟生效队列：模拟设备状态在服务调用后若干次轮询才真正变化
 PENDING = {}
+# 已订阅 state_changed 的 WebSocket 连接；HTTP 线程通过 WS_LOOP 投递事件。
+WS_CLIENTS = set()
+WS_LOOP = None
+
+
+def _snapshot_state(eid):
+    st = STATES[eid]
+    return {"entity_id": eid, "state": st.get("state"),
+            "attributes": copy.deepcopy(st.get("attributes") or {}),
+            "last_changed": st.get("last_changed"), "last_updated": st.get("last_updated")}
+
+
+def _broadcast_state_change(eid, old_state):
+    """从 HTTP 线程把 state_changed 事件推送给所有订阅连接。"""
+    if WS_LOOP is None or not WS_CLIENTS:
+        return
+    payload = json.dumps({
+        "id": None, "type": "event",
+        "event": {"event_type": "state_changed", "data": {
+            "entity_id": eid, "old_state": old_state, "new_state": _snapshot_state(eid)}},
+    }, ensure_ascii=False)
+
+    def _send():
+        for ws in list(WS_CLIENTS):
+            WS_LOOP.create_task(ws.send(payload))
+
+    WS_LOOP.call_soon_threadsafe(_send)
 
 
 SERVICES = [
@@ -206,8 +234,10 @@ def _apply_pending(eid):
         return
     p["remaining"] -= 1
     if p["remaining"] <= 0:
+        old = _snapshot_state(eid)
         STATES[eid]["state"] = p["state"]
         PENDING.pop(eid, None)
+        _broadcast_state_change(eid, old)
 
 
 def apply_service(domain, service, body):
@@ -219,6 +249,7 @@ def apply_service(domain, service, body):
         return None
     st = STATES[eid]
     a = st["attributes"]
+    old_state = _snapshot_state(eid)
     before = _state_sig(st)
     # 延迟服务：先返回 null，状态在后续第 3 次读取时才生效（2 次读取仍为旧值）
     if service.endswith("_delayed"):
@@ -239,7 +270,10 @@ def apply_service(domain, service, body):
     if service == "turn_on_ignore_brightness":
         st["state"] = "on"
         after = _state_sig(st)
-        return [dict(st)] if after != before else []
+        if after != before:
+            _broadcast_state_change(eid, old_state)
+            return [dict(st)]
+        return []
     if service == "turn_on":
         if domain == "cover":
             st["state"] = "open"
@@ -280,12 +314,13 @@ def apply_service(domain, service, body):
         st["state"] = "unlocked"
     after = _state_sig(st)
     if after != before:
+        _broadcast_state_change(eid, old_state)
         return [dict(st)]
     return []
 
 
-async def _ws_handler(ws):
-    """极简 HA WebSocket：auth 握手 + device/entity 注册表查询。"""
+async def _ws_handler(ws, *args):
+    """极简 HA WebSocket：auth 握手 + 注册表查询 + state_changed 订阅。"""
     await ws.send(json.dumps({"type": "auth_required", "ha_version": "2026.1.0"}))
     try:
         raw = await ws.recv()
@@ -296,25 +331,34 @@ async def _ws_handler(ws):
         await ws.send(json.dumps({"type": "auth_invalid", "message": "Invalid access token"}))
         return
     await ws.send(json.dumps({"type": "auth_ok", "ha_version": "2026.1.0"}))
-    async for raw in ws:
-        req = json.loads(raw)
-        rid = req.get("id")
-        typ = req.get("type")
-        if typ == "config/device_registry/list":
-            result = DEVICE_REGISTRY
-        elif typ == "config/entity_registry/list":
-            result = ENTITY_REGISTRY
-        elif typ == "config/area_registry/list":
-            result = AREA_REGISTRY
-        else:
-            await ws.send(json.dumps({"id": rid, "type": "result", "success": False,
-                                      "error": {"code": "unknown_command", "message": "Unknown command."}}))
-            continue
-        await ws.send(json.dumps({"id": rid, "type": "result", "success": True, "result": result}))
+    WS_CLIENTS.add(ws)
+    try:
+        async for raw in ws:
+            req = json.loads(raw)
+            rid = req.get("id")
+            typ = req.get("type")
+            if typ == "subscribe_events":
+                await ws.send(json.dumps({"id": rid, "type": "result", "success": True, "result": None}))
+                continue
+            if typ == "config/device_registry/list":
+                result = DEVICE_REGISTRY
+            elif typ == "config/entity_registry/list":
+                result = ENTITY_REGISTRY
+            elif typ == "config/area_registry/list":
+                result = AREA_REGISTRY
+            else:
+                await ws.send(json.dumps({"id": rid, "type": "result", "success": False,
+                                          "error": {"code": "unknown_command", "message": "Unknown command."}}))
+                continue
+            await ws.send(json.dumps({"id": rid, "type": "result", "success": True, "result": result}))
+    finally:
+        WS_CLIENTS.discard(ws)
 
 
 def _run_ws():
     async def runner():
+        global WS_LOOP
+        WS_LOOP = asyncio.get_running_loop()
         async with websockets.serve(_ws_handler, BIND, WS_PORT):
             await asyncio.Future()
     asyncio.run(runner())

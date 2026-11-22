@@ -23,7 +23,43 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# 依赖与端口预检：避免旧实例占端口导致 e2e 打在脏状态上。
+if ! "$PY" -c "import websockets" >/dev/null 2>&1; then
+  echo "缺少 websockets 依赖，请先 pip install -r requirements.txt" >&2
+  exit 1
+fi
+if "$PY" - <<'PY'
+import socket, sys
+busy = []
+for port in (8123, 8124):
+    s = socket.socket()
+    s.settimeout(0.3)
+    try:
+        s.connect(("127.0.0.1", port))
+    except OSError:
+        pass
+    else:
+        busy.append(port)
+    finally:
+        s.close()
+if busy:
+    print("端口已被占用：" + ",".join(str(p) for p in busy))
+    sys.exit(1)
+PY
+then
+  :
+else
+  echo "127.0.0.1:8123/8124 已被占用，请先停止旧的 fake_ha.py（例如 pkill -f fake_ha.py）" >&2
+  exit 1
+fi
+
 "$PY" tests/fake_ha.py & FAKE=$!
+sleep 0.3
+if ! kill -0 "$FAKE" 2>/dev/null; then
+  wait "$FAKE" 2>/dev/null || true
+  echo "fake HA 启动失败，请查看上方错误输出。" >&2
+  exit 1
+fi
 
 # 等待 fake HA 的 HTTP 与 WebSocket 端口都可连接（最多 15s）；注册表依赖 WS
 READY=0
@@ -50,6 +86,9 @@ echo "===== e2e (stdio) ====="
 
 echo "===== dedupe unit ====="
 "$PY" tests/dedupe_switch_light.py
+
+echo "===== state cache unit ====="
+"$PY" tests/state_cache.py
 
 echo "===== webui smoke ====="
 "$PY" tests/webui_smoke.py

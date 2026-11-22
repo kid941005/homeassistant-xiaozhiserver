@@ -205,6 +205,9 @@ def main() -> None:
         raise SystemExit(1)
 
     script_path = sys.argv[1] if len(sys.argv) >= 2 else "server.py"
+    if not os.path.isfile(script_path):
+        logger.error("MCP server 脚本不存在：%s", script_path)
+        raise SystemExit(1)
     target = os.path.basename(script_path)
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -217,7 +220,7 @@ def main() -> None:
         raise
     except Exception as e:
         logger.error("程序异常退出：%s", e)
-        raise SystemExit(1)
+        raise SystemExit(1) from e
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
 import ssl
 import time
@@ -71,6 +72,20 @@ class HAClient:
         self._registry_cache: dict | None = None
         self._registry_ts: float = 0.0
         self._http: httpx.AsyncClient | None = None
+        # 状态/服务缓存与长期 state_changed 事件流：减少每次工具调用拉全量 /api/states。
+        self.state_ws_enabled = env_bool("HA_STATE_WS_ENABLED", True)
+        self.state_cache_ttl = env_float("HA_STATE_CACHE_TTL", 1.0, 0.0, 60.0)
+        self.services_ttl = env_float("HA_SERVICES_CACHE_TTL", 300.0, 0.0, 3600.0)
+        self._state_entities: dict[str, dict] = {}
+        self._states_cache: list[dict] | None = None
+        self._states_ts: float = 0.0
+        self._services_cache: list[dict] | None = None
+        self._services_ts: float = 0.0
+        self._state_ws_task: asyncio.Task | None = None
+        self._state_ws_ready = asyncio.Event()
+        self._state_ws_stop = asyncio.Event()
+        self._state_waiters: dict[str, list[tuple[asyncio.Future, Any]]] = {}
+        self._entity_locks: dict[str, asyncio.Lock] = {}
         self._validate_config()
 
     def _validate_config(self) -> None:
@@ -109,7 +124,18 @@ class HAClient:
         return self._http
 
     async def aclose(self) -> None:
-        """释放连接池（进程退出或测试收尾时调用）。"""
+        """释放连接池与状态事件流（进程退出或测试收尾时调用）。"""
+        self._state_ws_stop.set()
+        if self._state_ws_task is not None:
+            self._state_ws_task.cancel()
+            try:
+                await self._state_ws_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # noqa: BLE001
+                log.debug("关闭 HA state stream 时出现异常", exc_info=True)
+            self._state_ws_task = None
+        self._state_ws_ready.clear()
         if self._http is not None:
             await self._http.aclose()
             self._http = None
@@ -154,20 +180,225 @@ class HAClient:
                 return resp.text
         return None
 
-    # ---------------- 上层 API ----------------
-    async def get_states(self) -> list:
+    # ---------------- 状态缓存与事件流 ----------------
+    def state_stream_ready(self) -> bool:
+        """HA WebSocket state_changed 事件流是否已就绪。"""
+        return self._state_ws_ready.is_set()
+
+    def entity_lock(self, entity_id: str) -> asyncio.Lock:
+        """同一实体的控制串行化，避免并发下发/回读互相覆盖。"""
+        lock = self._entity_locks.get(entity_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._entity_locks[entity_id] = lock
+        return lock
+
+    def _ensure_state_stream(self) -> bool:
+        """惰性启动长期状态事件流；事件流不可用时返回 False，调用方回退 REST。"""
+        if not self.ws_enabled or not self.state_ws_enabled or websockets is None:
+            return False
+        if self._state_ws_task is not None and not self._state_ws_task.done():
+            return True
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        self._state_ws_stop.clear()
+        self._state_ws_task = loop.create_task(self._state_stream_loop())
+        return True
+
+    async def _fetch_states_rest(self) -> list[dict]:
         data = await self._request("GET", "/api/states")
         return data if isinstance(data, list) else []
 
-    async def get_services(self) -> list:
-        """GET /api/services，返回服务目录（每个 domain 及其服务与参数字段）。"""
-        data = await self._request("GET", "/api/services")
-        return data if isinstance(data, list) else []
+    def _store_states(self, states: list[dict]) -> None:
+        self._state_entities = {
+            str(s.get("entity_id")): s
+            for s in states
+            if isinstance(s, dict) and s.get("entity_id")
+        }
+        self._states_cache = list(self._state_entities.values())
+        self._states_ts = time.time()
 
-    async def get_state(self, entity_id: str) -> dict | None:
+    def invalidate_states(self) -> None:
+        """服务调用后让状态缓存失效；事件流就绪时保留内存快照，由事件增量更新。"""
+        self._states_ts = 0.0
+        if not self._state_ws_ready.is_set():
+            self._states_cache = None
+            self._state_entities = {}
+
+    def _notify_state(self, entity_id: str, state: dict | None) -> None:
+        items = self._state_waiters.get(entity_id)
+        if not items:
+            return
+        keep: list = []
+        for fut, predicate in items:
+            if fut.done():
+                continue
+            try:
+                matched = bool(predicate(state))
+            except Exception:  # noqa: BLE001 等待者断言异常不应拖垮事件流
+                matched = False
+            if matched:
+                fut.set_result(state)
+            else:
+                keep.append((fut, predicate))
+        if keep:
+            self._state_waiters[entity_id] = keep
+        else:
+            self._state_waiters.pop(entity_id, None)
+
+    def _fail_state_waiters(self) -> None:
+        for items in list(self._state_waiters.values()):
+            for fut, _predicate in items:
+                if not fut.done():
+                    fut.set_result(None)
+        self._state_waiters.clear()
+
+    async def wait_for_state(self, entity_id: str, predicate: Any = None,
+                             timeout: float = 1.0) -> dict | None:
+        """等待某个实体的下一次 state_changed。predicate 返回真才返回；
+        超时、事件流不可用或断线返回 None，由调用方回退 REST 轮询。"""
+        eid = str(entity_id or "").strip()
+        if not self._ensure_state_stream() or not self._state_ws_ready.is_set():
+            return None
+        pred = predicate or (lambda _state: True)
+        current = self._state_entities.get(eid)
+        if isinstance(current, dict):
+            try:
+                if pred(current):
+                    return current
+            except Exception:  # noqa: BLE001
+                pass
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        self._state_waiters.setdefault(eid, []).append((fut, pred))
+        try:
+            return await asyncio.wait_for(fut, timeout=max(0.01, float(timeout)))
+        except asyncio.TimeoutError:
+            return None
+        finally:
+            items = self._state_waiters.get(eid) or []
+            kept = [(f, p) for f, p in items if f is not fut]
+            if kept:
+                self._state_waiters[eid] = kept
+            else:
+                self._state_waiters.pop(eid, None)
+
+    async def _state_stream_loop(self) -> None:
+        backoff = 1.0
+        while not self._state_ws_stop.is_set():
+            started = time.monotonic()
+            try:
+                await self._state_stream_connect()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                log.warning("HA state stream 断开：%s", e)
+            finally:
+                self._state_ws_ready.clear()
+                self._fail_state_waiters()
+            if self._state_ws_stop.is_set():
+                break
+            # 连接稳定较久后重置退避，避免历史上多次失败导致后续重连仍等 30 秒。
+            if time.monotonic() - started >= 60.0:
+                backoff = 1.0
+            await asyncio.sleep(backoff * (0.75 + random.random() * 0.5))
+            backoff = min(backoff * 2.0, 30.0)
+
+    async def _state_stream_connect(self) -> None:
+        kwargs: dict = {
+            "open_timeout": self.timeout,
+            "close_timeout": 2,
+            "ping_interval": 20,
+            "ping_timeout": 20,
+            "max_size": 16 * 1024 * 1024,
+        }
+        if self.ws_url.startswith("wss://"):
+            kwargs["ssl"] = self._ws_ssl()
+        async with websockets.connect(self.ws_url, **kwargs) as ws:
+            hello = json.loads(await asyncio.wait_for(ws.recv(), timeout=self.timeout))
+            if hello.get("type") == "auth_required":
+                await ws.send(json.dumps({"type": "auth", "access_token": self.token}))
+                auth = json.loads(await asyncio.wait_for(ws.recv(), timeout=self.timeout))
+                if auth.get("type") != "auth_ok":
+                    raise HAError("auth_failed", "Home Assistant WebSocket 鉴权失败：请检查 HA_TOKEN 是否有效。")
+            elif hello.get("type") != "auth_ok":
+                raise HAError("ws_error", "Home Assistant WebSocket 握手异常：" + str(hello.get("type")))
+            await ws.send(json.dumps({"id": 10, "type": "subscribe_events", "event_type": "state_changed"}))
+            deadline = time.monotonic() + max(self.timeout * 2, 5.0)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError()
+                msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=remaining))
+                if isinstance(msg, dict) and msg.get("type") == "result" and msg.get("id") == 10:
+                    if not msg.get("success"):
+                        err = msg.get("error") or {}
+                        raise HAError("ws_error", "订阅 Home Assistant 状态事件失败：" + str(err.get("message") or err))
+                    break
+            # 先订阅再拉一次全量快照，保证事件流就绪时缓存完整，且不丢订阅后到达的事件。
+            self._store_states(await self._fetch_states_rest())
+            self._state_ws_ready.set()
+            log.info("HA state stream 已连接，已订阅 state_changed（%s 个实体）", len(self._state_entities))
+            async for raw in ws:
+                try:
+                    msg = json.loads(raw)
+                except Exception:  # noqa: BLE001
+                    continue
+                if not isinstance(msg, dict) or msg.get("type") != "event":
+                    continue
+                event = msg.get("event") or {}
+                if event.get("event_type") != "state_changed":
+                    continue
+                data = event.get("data") or {}
+                old_state = data.get("old_state")
+                new_state = data.get("new_state")
+                eid = (new_state or {}).get("entity_id") or (old_state or {}).get("entity_id")
+                if not eid:
+                    continue
+                if isinstance(new_state, dict):
+                    self._state_entities[eid] = new_state
+                else:
+                    self._state_entities.pop(eid, None)
+                self._states_cache = list(self._state_entities.values())
+                self._states_ts = time.time()
+                self._notify_state(eid, new_state)
+            raise HAError("ws_closed", "Home Assistant 状态事件连接已关闭。")
+
+    # ---------------- 上层 API ----------------
+    async def get_states(self, force: bool = False) -> list:
+        """返回全量实体状态；事件流就绪时直接读内存，否则按短 TTL 缓存，避免重复拉全量。"""
+        self._ensure_state_stream()
+        if self._state_ws_ready.is_set() and not force:
+            return list(self._state_entities.values())
+        now = time.time()
+        if (not force and self._states_cache is not None
+                and now - self._states_ts < self.state_cache_ttl):
+            return list(self._states_cache)
+        self._store_states(await self._fetch_states_rest())
+        return list(self._states_cache or [])
+
+    async def get_services(self, force: bool = False) -> list:
+        """GET /api/services，返回服务目录（每个 domain 及其服务与参数字段），带 TTL 缓存。"""
+        now = time.time()
+        if (not force and self._services_cache is not None
+                and now - self._services_ts < self.services_ttl):
+            return list(self._services_cache)
+        data = await self._request("GET", "/api/services")
+        self._services_cache = data if isinstance(data, list) else []
+        self._services_ts = now
+        return list(self._services_cache)
+
+    async def get_state(self, entity_id: str, force: bool = False) -> dict | None:
         eid = str(entity_id or "").strip()
         if not is_entity_id(eid):
             raise HAError("invalid_entity", "entity_id 格式不合法：" + eid + "。应为 domain.object_id，如 light.living_room。")
+        self._ensure_state_stream()
+        if self._state_ws_ready.is_set() and not force:
+            cached = self._state_entities.get(eid)
+            if isinstance(cached, dict):
+                return cached
         try:
             data = await self._request("GET", "/api/states/" + eid)
         except HAError as e:
@@ -176,6 +407,10 @@ class HAClient:
             raise
         if not isinstance(data, dict):
             raise HAError("invalid_response", "Home Assistant 返回的实体状态不是 JSON 对象。")
+        self._state_entities[eid] = data
+        if self._states_cache is not None:
+            self._states_cache = list(self._state_entities.values())
+            self._states_ts = time.time()
         return data
 
     async def call_service(self, domain: str, service: str, data: dict) -> Any:
@@ -186,6 +421,7 @@ class HAClient:
         result = await self._request("POST", "/api/services/" + dom + "/" + svc, json=data)
         if result is not None and not isinstance(result, (dict, list)):
             raise HAError("invalid_response", "Home Assistant 返回的服务调用结果不是 JSON 对象/数组。")
+        self.invalidate_states()
         return result
 
     async def ping(self) -> bool:
@@ -297,19 +533,20 @@ class HAClient:
     async def resolve_entity(self, ref: str) -> tuple:
         """把 entity_id 或友好名解析成一个实体。
 
-        返回 (entity, candidates)：
+        返回 (entity, candidates, states)：
         - entity 非空：唯一命中
         - entity 为空且 candidates 非空：多个候选（歧义），需调用方消歧
         - 两者皆空：未找到
+        - states 为按名称解析时已拉取的全量状态，供调用方复用；直接 entity_id 命中时为 None
         """
         ref = (ref or "").strip()
         if not ref:
-            return None, []
+            return None, [], None
         # 1) 直接当作 entity_id；只接受合法格式，避免把用户输入拼进 URL 路径
         if is_entity_id(ref):
             st = await self.get_state(ref)
             if st is not None:
-                return st, []
+                return st, [], None
         states = await self.get_states()
         low = ref.lower()
 
@@ -318,15 +555,15 @@ class HAClient:
 
         exact = [s for s in states if fname(s).lower() == low]
         if len(exact) == 1:
-            return exact[0], []
+            return exact[0], [], states
         if len(exact) > 1:
-            return None, exact
+            return None, exact, states
         contains = [s for s in states if low in fname(s).lower()]
         if len(contains) == 1:
-            return contains[0], []
+            return contains[0], [], states
         if len(contains) > 1:
-            return None, contains
+            return None, contains, states
         byid = [s for s in states if low in str(s.get("entity_id", "")).lower()]
         if len(byid) == 1:
-            return byid[0], []
-        return None, byid
+            return byid[0], [], states
+        return None, byid, states

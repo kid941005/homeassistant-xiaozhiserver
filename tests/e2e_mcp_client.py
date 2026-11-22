@@ -18,7 +18,7 @@ from mcp import Client, StdioServerParameters
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SERVER_SCRIPT = PROJECT_ROOT / "server.py"
 EXPECTED_TOOLS = {
-    "list_devices", "get_device_state", "control_device",
+    "list_devices", "get_device_state", "control_device", "control_devices",
     "list_services", "call_service", "list_domains",
 }
 failures = []
@@ -54,12 +54,29 @@ def verify_case(index, name, args, r, expected):
     if not isinstance(d, dict):
         return
     check(not r["isError"], label + " 不是 MCP isError", r["isError"])
+    known_keys = {
+        "ok", "applied_limit_gt", "applied_limit_eq", "status", "code", "total",
+        "count", "grouped_by", "domain", "domain_count", "service_count", "limit",
+        "has_more", "next_offset", "deduplicated_switch_count", "suggested_entity_id",
+        "entity_id", "status_in", "service", "action", "device_action",
+        "response_contains", "response_not_contains", "entity_state", "entity_area_id",
+        "entity_area_name", "first_area_name", "first_domain", "entity_dangerous",
+        "after_state", "after_brightness", "after_volume", "dangerous_domains_contains",
+        "domains_not_contains", "dangerous_entities_contains", "attributes_truncated",
+    }
+    unknown = sorted(set(expected) - known_keys)
+    check(not unknown, label + " 存在未知期望键", unknown)
     if "ok" in expected:
         check(d.get("ok") is expected["ok"], label + " ok", d.get("ok"))
     if "applied_limit_gt" in expected:
         applied_limit = (d.get("applied_defaults") or {}).get("limit")
         check(isinstance(applied_limit, int) and applied_limit > expected["applied_limit_gt"],
               label + " applied_defaults.limit > " + str(expected["applied_limit_gt"]),
+              applied_limit)
+    if "applied_limit_eq" in expected:
+        applied_limit = (d.get("applied_defaults") or {}).get("limit")
+        check(applied_limit == expected["applied_limit_eq"],
+              label + " applied_defaults.limit == " + str(expected["applied_limit_eq"]),
               applied_limit)
     for key in ("status", "code", "total", "count", "grouped_by", "domain",
                 "domain_count", "service_count", "limit", "has_more", "next_offset",
@@ -152,19 +169,20 @@ async def main():
         tools = await session.list_tools()
         names = [t.name for t in tools.tools]
         print("TOOLS:", names)
-        check(set(names) == EXPECTED_TOOLS, "工具清单为 6 个预期工具", names)
+        check(set(names) == EXPECTED_TOOLS, "工具清单为 7 个预期工具", names)
 
         cases = [
             # 列表 / 过滤 / 分页 / 聚合
             # 无过滤条件：默认只返回可控制设备且每页 DEFAULT_LIST_LIMIT 条（可见 6 个实体中 5 个可控）
             ("list_devices", {}, {"ok": True, "total": 5, "count": 5,
                                    "grouped_by": "entity",
-                                   "applied_limit_gt": 20}),
+                                   "applied_limit_eq": 50}),
             ("list_devices", {"domain": "light"}, {"ok": True, "total": 1}),
             ("list_devices", {"keyword": "客厅"}, {"ok": True, "total": 3}),
             ("list_devices", {"keyword": "客厅灯"},
              {"ok": True, "total": 1, "first_domain": "light",
               "deduplicated_switch_count": 1}),
+            ("list_devices", {"compact": True}, {"ok": True, "total": 5}),
             ("list_devices", {"area": "客厅"}, {"ok": True, "total": 5,
                                                 "first_area_name": "客厅"}),
             ("list_devices", {"area": "玄关"}, {"ok": True, "total": 1}),
@@ -257,6 +275,14 @@ async def main():
             ("control_device", {"entity": "switch.living_room_duplicate", "action": "turn_on"},
              {"ok": False, "code": "duplicate_switch",
               "suggested_entity_id": "light.living_room"}),
+            ("control_devices", {"entities": ["switch.fan", "客厅灯"], "action": "turn_on"},
+             {"ok": True, "count": 2, "action": "RESPONSE", "response_contains": "已打开"}),
+            ("control_devices", {"entities": ["switch.fan", "不存在设备"], "action": "turn_off"},
+             {"ok": True, "count": 1, "action": "RESPONSE", "response_contains": "已关闭"}),
+            ("control_devices", {"entities": [], "action": "turn_on"},
+             {"ok": False, "code": "invalid_argument"}),
+            ("control_devices", {"entities": ["sensor.living_temp"], "action": "turn_on"},
+             {"ok": False, "code": "no_valid_entities"}),
             # 边界与错误
             ("control_device", {"entity": "sensor.living_temp", "action": "turn_on"},
              {"ok": False, "code": "not_controllable"}),
@@ -303,6 +329,15 @@ async def main():
             print("\n== " + name + " " + json.dumps(args, ensure_ascii=False))
             print("   result=" + json.dumps(d, ensure_ascii=False)[:1000])
             verify_case(index, name, args, r, expected)
+
+        # 精简返回体：compact 只保留关键字段
+        compact = await call(session, "list_devices", {"compact": True})
+        compact_data = compact["data"] if isinstance(compact["data"], dict) else {}
+        compact_views = compact_data.get("devices") or []
+        first_view = compact_views[0] if compact_views else {}
+        check(bool(compact_views) and "attributes" not in first_view
+              and "controllable" in first_view and "entity_id" in first_view,
+              "compact 仅保留关键字段", sorted(first_view.keys()))
 
         # P3：危险设备二次确认完整流程
         print("\n== P3 危险设备二次确认 ==")

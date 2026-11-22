@@ -88,8 +88,8 @@ def is_excluded_entity(st: dict, devices: Optional[dict] = None, ents: Optional[
     if not EXCLUDED_DEVICE_KEYWORDS:
         return False
     texts = [eid, _friendly_name(st)]
-    re = (ents or {}).get(eid) or {}
-    did = re.get("device_id")
+    ent_rec = (ents or {}).get(eid) or {}
+    did = ent_rec.get("device_id")
     d = (devices or {}).get(did) if did else None
     label = _device_label(d)
     if label:
@@ -145,12 +145,17 @@ def redundant_switch_map(
             "switches": [str(x.get("entity_id") or "") for x in switches],
         }
         if len(lights) == 1 and len(switches) == 1:
+            light_id = str(lights[0].get("entity_id") or "")
             light_label = _normalize_label(_friendly_name(lights[0]))
             switch_label = _normalize_label(_friendly_name(switches[0]))
-            if light_label and light_label == switch_label:
-                hidden[str(switches[0].get("entity_id") or "")] = str(lights[0].get("entity_id") or "")
+            light_info = _controllability(light_id, lights[0].get("state"))
+            if not light_info.get("controllable"):
+                info["reason"] = "灯具当前不可控制（" + str(light_info.get("controllable_reason") or "不可用") + "），未自动隐藏开关"
+            elif light_label and light_label == switch_label:
+                hidden[str(switches[0].get("entity_id") or "")] = light_id
                 continue
-            info["reason"] = "同一设备下开关与灯具名称不同，无法确认是重复项，未自动隐藏"
+            else:
+                info["reason"] = "同一设备下开关与灯具名称不同，无法确认是重复项，未自动隐藏"
         else:
             info["reason"] = "同一设备下存在多个灯具或多个开关，无法唯一确定重复项，未自动隐藏"
         ambiguous.append(info)
@@ -172,13 +177,13 @@ def _entity_view(st: dict, devices: dict, ents: dict, areas: Optional[dict] = No
     v.update(_controllability(st.get("entity_id", ""), st.get("state")))
     v.update(_danger_info(st.get("entity_id", ""), st.get("attributes") or {}))
     eid = str(st.get("entity_id", ""))
-    re = ents.get(eid) or {}
-    did = re.get("device_id")
+    ent_rec = ents.get(eid) or {}
+    did = ent_rec.get("device_id")
     v["device_id"] = did
     d = devices.get(did) if did else None
     v["device_name"] = _device_label(d)
     # HA 语义：实体级 area 覆盖设备级 area。
-    area_id = re.get("area_id") or (d.get("area_id") if d else None)
+    area_id = ent_rec.get("area_id") or (d.get("area_id") if d else None)
     v["area_id"] = area_id
     v["area_name"] = (areas or {}).get(area_id) if area_id else None
     return v
@@ -193,7 +198,7 @@ def _group_by_device(views: list, devices: dict, areas: Optional[dict] = None) -
         g = groups.get(key)
         if g is None:
             d = devices.get(did) if did else None
-            area_id = (d.get("area_id") if d else None) or v.get("area_id")
+            area_id = v.get("area_id") or (d.get("area_id") if d else None)
             area_name = (areas or {}).get(area_id) if area_id else None
             if not area_name:
                 area_name = v.get("area_name")

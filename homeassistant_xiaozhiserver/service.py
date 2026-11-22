@@ -280,9 +280,11 @@ def _value_matches(actual: Any, expected: Any, tolerance: float = 0.0) -> bool:
     if isinstance(expected, (list, tuple)):
         if not isinstance(actual, (list, tuple)) or len(actual) != len(expected):
             return False
-        return all(_value_matches(a, e, tolerance) for a, e in zip(actual, expected))
+        return all(_value_matches(a, e, tolerance) for a, e in zip(actual, expected, strict=True))
     if isinstance(expected, bool) or isinstance(actual, bool):
-        return actual is not None and bool(actual) == bool(expected)
+        if actual is None:
+            return expected is False
+        return bool(actual) == bool(expected)
     na, ne = _num(actual), _num(expected)
     if na is not None and ne is not None:
         return abs(na - ne) <= float(tolerance or 0)
@@ -295,8 +297,8 @@ def _rgb_components(value: Any, code: str = "invalid_value", label: str = "颜�
         raise HAError(code, label + " 必须是 [r,g,b] 三个 0-255 整数，收到：" + str(value))
     try:
         rgb = [int(x) for x in value]
-    except (TypeError, ValueError):
-        raise HAError(code, label + " 必须是 [r,g,b] 三个 0-255 整数，收到：" + str(value))
+    except (TypeError, ValueError) as exc:
+        raise HAError(code, label + " 必须是 [r,g,b] 三个 0-255 整数，收到：" + str(value)) from exc
     if any(c < 0 or c > 255 for c in rgb):
         raise HAError(code, label + " 每个分量必须在 0-255，收到：" + str(value))
     return rgb
@@ -332,12 +334,15 @@ def _expected_attributes(payload: dict) -> dict:
     for field in ("preset_mode", "swing_mode", "source", "effect", "direction"):
         if field in payload:
             exp[field] = {"expected": payload.get(field), "tolerance": 0}
-    if "percentage" in payload:
-        exp["percentage"] = {"expected": _num(payload.get("percentage")), "tolerance": 1}
-    if "position" in payload:
-        exp["current_position"] = {"expected": _num(payload.get("position")), "tolerance": 1}
-    if "tilt_position" in payload:
-        exp["current_tilt_position"] = {"expected": _num(payload.get("tilt_position")), "tolerance": 1}
+    pct = _num(payload.get("percentage"))
+    if pct is not None:
+        exp["percentage"] = {"expected": pct, "tolerance": 1}
+    pos = _num(payload.get("position"))
+    if pos is not None:
+        exp["current_position"] = {"expected": pos, "tolerance": 1}
+    tilt = _num(payload.get("tilt_position"))
+    if tilt is not None:
+        exp["current_tilt_position"] = {"expected": tilt, "tolerance": 1}
     return exp
 
 
@@ -368,6 +373,21 @@ def _check_after(after: Optional[dict], expected_state: Optional[str],
 
 async def _apply_and_confirm(ha: "HAClient", st: dict, service_domain: str,
                              service: str, payload: dict, action_label: str) -> dict:
+    """同一实体的控制串行执行，避免并发下发与回读互相覆盖。"""
+    eid = str(st.get("entity_id"))
+    lock_factory = getattr(ha, "entity_lock", None)
+    if not callable(lock_factory):
+        return await _apply_and_confirm_unlocked(
+            ha, st, service_domain, service, payload, action_label
+        )
+    async with lock_factory(eid):
+        return await _apply_and_confirm_unlocked(
+            ha, st, service_domain, service, payload, action_label
+        )
+
+
+async def _apply_and_confirm_unlocked(ha: "HAClient", st: dict, service_domain: str,
+                                      service: str, payload: dict, action_label: str) -> dict:
     """执行 HA 服务调用，并在超时窗口内轮询回读，校验「状态 + 属性」是否达到预期。
 
     不再只判断「有没有变化」，而是按服务语义推导预期：
@@ -403,21 +423,53 @@ async def _apply_and_confirm(ha: "HAClient", st: dict, service_domain: str,
     readback_errors: list = []
     check = {"verified": False, "checks": [], "mismatches": []}
 
-    while True:
-        if attempts == 0:
-            if SERVICE_CONFIRM_DELAY > 0:
-                await asyncio.sleep(SERVICE_CONFIRM_DELAY)
-        else:
-            # 即使配置为 0 也让出事件循环，避免在超时窗口内忙等轰击 HA。
-            await asyncio.sleep(max(0.05, interval))
-        attempts += 1
+    def _matches(candidate: dict | None) -> bool:
+        snap = snapshot(candidate)
+        if has_expectation:
+            return bool(_check_after(snap, expected, attr_expect)["verified"])
+        return snap is not None and snap != before
+
+    stream_ready = getattr(ha, "state_stream_ready", None)
+    wait_state = getattr(ha, "wait_for_state", None)
+    ensure_stream = getattr(ha, "_ensure_state_stream", None)
+    can_events = callable(stream_ready) and callable(wait_state)
+    if callable(ensure_stream):
         try:
-            after_st = await ha.get_state(eid)
-        except HAError as e:
-            after_st = None
-            # 服务已下发，回读失败不应伪造成“无变化”；记录错误供调用方判断。
-            if e.code not in readback_errors:
-                readback_errors.append(e.code)
+            ensure_stream()
+        except Exception:  # noqa: BLE001 事件流只是加速手段，失败继续轮询
+            pass
+
+    while True:
+        attempts += 1
+        after_st = None
+        if can_events and stream_ready():
+            try:
+                after_st = await wait_state(eid, _matches, timeout=max(0.05, interval))
+            except Exception as e:  # noqa: BLE001
+                log.debug("wait_for_state 失败，回退轮询：%s", e)
+                after_st = None
+            if after_st is None:
+                # 事件流未命中（含 fake HA 的延迟服务：读取才推进状态）时，回退一次 REST 读。
+                try:
+                    after_st = await ha.get_state(eid, force=True)
+                except HAError as e:
+                    after_st = None
+                    if e.code not in readback_errors:
+                        readback_errors.append(e.code)
+        else:
+            if attempts == 1:
+                if SERVICE_CONFIRM_DELAY > 0:
+                    await asyncio.sleep(SERVICE_CONFIRM_DELAY)
+            else:
+                # 即使配置为 0 也让出事件循环，避免在超时窗口内忙等轰击 HA。
+                await asyncio.sleep(max(0.05, interval))
+            try:
+                after_st = await ha.get_state(eid)
+            except HAError as e:
+                after_st = None
+                # 服务已下发，回读失败不应伪造成“无变化”；记录错误供调用方判断。
+                if e.code not in readback_errors:
+                    readback_errors.append(e.code)
         after = snapshot(after_st)
         changed = after is not None and after != before
         check = _check_after(after, expected, attr_expect)
@@ -485,14 +537,14 @@ async def _apply_and_confirm(ha: "HAClient", st: dict, service_domain: str,
 
 def _need_value(action: str, value: Any) -> None:
     if value is None or (isinstance(value, str) and value.strip() == ""):
-        raise HAError("missing_value", "动作 " + action + " 需要提供 value 参数（如亮度 1-100、温度、色温开尔文、颜色 #RRGGBB）。")
+        raise HAError("missing_value", "动作 " + action + " 需要提供 value 参数（如亮度 0-100、温度、色温开尔文、颜色 #RRGGBB）。")
 
 
 def _clamp_pct(value: Any) -> int:
     try:
         v = float(value)
-    except (TypeError, ValueError):
-        raise HAError("invalid_value", "value 必须是 0-100 的数字，收到：" + str(value))
+    except (TypeError, ValueError) as exc:
+        raise HAError("invalid_value", "value 必须是 0-100 的数字，收到：" + str(value)) from exc
     if v < 0 or v > 100:
         raise HAError("invalid_value", "value 必须在 0-100 之间，收到：" + str(value))
     return int(round(v))
@@ -512,8 +564,8 @@ def _parse_color(value: Any) -> list:
         raise HAError("invalid_value", "颜色格式应为 #RRGGBB 或 'r,g,b'，收到：" + str(value))
     try:
         rgb = [int(p, base) for p in parts]
-    except (TypeError, ValueError):
-        raise HAError("invalid_value", "颜色格式应为 #RRGGBB 或 'r,g,b'，收到：" + str(value))
+    except (TypeError, ValueError) as exc:
+        raise HAError("invalid_value", "颜色格式应为 #RRGGBB 或 'r,g,b'，收到：" + str(value)) from exc
     if len(rgb) != 3 or any(c < 0 or c > 255 for c in rgb):
         raise HAError("invalid_value", "RGB 每个分量必须在 0-255，收到：" + str(value))
     return rgb
@@ -586,14 +638,14 @@ def build_service(action: str, domain: str, value: Any) -> tuple:
         _need_value(a, value)
         try:
             return "climate", "set_temperature", {"temperature": float(value)}
-        except (TypeError, ValueError):
-            raise HAError("invalid_value", "温度 value 必须是数字，收到：" + str(value))
+        except (TypeError, ValueError) as exc:
+            raise HAError("invalid_value", "温度 value 必须是数字，收到：" + str(value)) from exc
     if a == "set_color_temp":
         _need_value(a, value)
         try:
             return "light", "turn_on", {"color_temp_kelvin": int(float(value))}
-        except (TypeError, ValueError):
-            raise HAError("invalid_value", "色温 value 必须是开尔文数字，收到：" + str(value))
+        except (TypeError, ValueError) as exc:
+            raise HAError("invalid_value", "色温 value 必须是开尔文数字，收到：" + str(value)) from exc
     if a == "set_color":
         _need_value(a, value)
         return "light", "turn_on", {"rgb_color": _parse_color(value)}

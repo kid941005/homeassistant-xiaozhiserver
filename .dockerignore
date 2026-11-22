@@ -1,7 +1,13 @@
 .venv/
 __pycache__/
 *.pyc
+*.pyo
 .env
 .git
+.gitignore
+.github/
+.ruff_cache/
+.dsh-project-memory/
+.learnings/
 tests/
 *.md

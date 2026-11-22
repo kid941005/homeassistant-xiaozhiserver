@@ -2,7 +2,7 @@
 
 > 把 **Home Assistant** 的实体与服务封装成标准 **MCP（Model Context Protocol）** 工具，供 **小智（xiaozhi-server）** 通过 **MCP 接入点** 用自然语言查询和控制智能家居设备。
 
-**当前版本：v1.13.5** · Python 3.12 · 传输方式：**stdio MCP server + WebSocket bridge** · 单容器部署（MCP bridge + WebUI）
+**当前版本：v1.13.6** · Python 3.12 · 传输方式：**stdio MCP server + WebSocket bridge** · 单容器部署（MCP bridge + WebUI）
 
 ---
 
@@ -47,7 +47,7 @@
 
 | 能力 | 说明 |
 |---|---|
-| 6 个 MCP 工具 | `list_devices`、`get_device_state`、`control_device`、`list_services`、`call_service`、`list_domains` |
+| 7 个 MCP 工具 | `list_devices`、`get_device_state`、`control_device`、`control_devices`、`list_services`、`call_service`、`list_domains` |
 | 小智 MCP 接入点 | 只保留 stdio + WebSocket bridge；bridge 主动出站，不需要为 MCP 暴露入站端口 |
 | 设备查询 | 支持名称、`entity_id`、`domain`、`area` 组合过滤，支持分页与按物理设备聚合 |
 | 常用控制 | 开关、亮度、音量、温度、色温、颜色、窗帘、门锁等按 domain 自动映射 HA 服务 |
@@ -83,7 +83,7 @@
 一次典型调用：
 
 1. `mcp_pipe.py` 启动时主动连接 `MCP_ENDPOINT`，随后以 stdio 启动 `server.py`；
-2. 小智后端通过 MCP 接入点完成 `initialize` / `tools/list`，拿到 6 个工具；
+2. 小智后端通过 MCP 接入点完成 `initialize` / `tools/list`，拿到 7 个工具；
 3. 用户说话，LLM 选择工具与参数；
 4. `tools/call` 经 bridge 传给 MCP server，再由 server 调用 HA REST/WS；
 5. 结构化结果原路返回，小智直接播报或交给 LLM 组织回复。
@@ -103,7 +103,7 @@ homeassistant-xiaozhiserver/
 │   ├── service.py                   # 动作映射、预期属性、回读校验
 │   ├── danger.py                    # 危险设备判定与一次性确认令牌
 │   ├── views.py                     # 实体摘要、可控标记、区域、按设备聚合
-│   ├── server.py                    # 6 个 MCP 工具与 stdio 进程入口
+│   ├── server.py                    # 7 个 MCP 工具与 stdio 进程入口
 │   └── webui.py                     # WebUI：状态/设备总览/日志/工具调试台
 ├── server.py                        # 兼容入口，等价于 python -m homeassistant_xiaozhiserver
 ├── mcp_pipe.py                      # 小智 MCP 接入点 WebSocket ↔ stdio bridge
@@ -115,6 +115,8 @@ homeassistant-xiaozhiserver/
 ├── tests/
 │   ├── fake_ha.py                   # 离线 HA 模拟器（HTTP + WebSocket）
 │   ├── e2e_mcp_client.py            # stdio 端到端 MCP 断言
+│   ├── dedupe_switch_light.py       # 同名开关/灯具去重边界单测
+│   ├── state_cache.py               # 状态/服务缓存与失效单测
 │   ├── webui_smoke.py               # WebUI 接口冒烟测试
 │   └── run_local_test.sh            # 一键测试入口
 └── README.md
@@ -130,7 +132,7 @@ homeassistant-xiaozhiserver/
 | `service.py` | 动作到 HA 服务映射、预期状态/属性、控制后回读校验 |
 | `danger.py` | 危险设备与服务判定、一次性 `confirm_token` 的签发与消费 |
 | `views.py` | 实体视图裁剪、可控性/危险标记、区域解析、按设备聚合、隐藏设备过滤 |
-| `server.py` | 6 个 MCP 工具与 stdio 进程入口 |
+| `server.py` | 7 个 MCP 工具与 stdio 进程入口 |
 | `mcp_pipe.py` | 连接小智 MCP 接入点、启动 stdio server、转发 JSON-RPC、断线重连 |
 | `webui.py` | FastAPI WebUI 与只读/调试 API；固定 `0.0.0.0:8099`，无独立密码 |
 
@@ -184,8 +186,8 @@ docker compose logs -f homeassistant-xiaozhiserver
 看到以下日志表示 bridge 已连上小智：
 
 ```text
-2026-01-01 12:00:00 INFO  v1.13.5 MCP_PIPE [-] MCP接入点连接成功
-2026-01-01 12:00:00 INFO  v1.13.5 MCP_PIPE [-] 已启动 MCP server：...
+2026-01-01 12:00:00 INFO  v1.13.6 MCP_PIPE [-] MCP接入点连接成功
+2026-01-01 12:00:00 INFO  v1.13.6 MCP_PIPE [-] 已启动 MCP server：...
 ```
 
 WebUI 地址：`http://<宿主机IP>:8099/`，无需账号密码。
@@ -231,7 +233,7 @@ docker compose logs --tail=100 homeassistant-xiaozhiserver
 
 ## 5. WebUI
 
-WebUI 与 MCP bridge 在同一个容器内运行：WebUI 后台常驻，bridge 前台运行；容器 `HEALTHCHECK` 探测 `/api/status`。
+WebUI 与 MCP bridge 在同一个容器内运行：WebUI 后台常驻，bridge 前台运行；容器 `HEALTHCHECK` 探测 `/healthz`（进程存活），`/readyz` 额外反映 HA 是否已配置且可达。
 
 页面分为四块：
 
@@ -251,11 +253,13 @@ WebUI 与 MCP bridge 在同一个容器内运行：WebUI 后台常驻，bridge �
 | GET | `/api/config` | 只读配置，敏感值掩码 |
 | GET | `/api/devices` | 设备总览数据 |
 | GET | `/api/logs?limit=200&level=INFO` | 最近日志，`limit` 1–500 |
-| POST | `/api/tool/{name}` | JSON 工具调试，仅白名单 6 个工具 |
+| GET | `/healthz` | 存活探针，仅表示 WebUI 进程可响应 |
+| GET | `/readyz` | 就绪探针，HA 已配置且可达时 200，否则 503 |
+| POST | `/api/tool/{name}` | JSON 工具调试，仅白名单 7 个工具；请求体上限 64KB |
 
-WebUI 使用 `.env` 中的 `HA_URL` / `HA_TOKEN`，**没有独立登录口令**，请只绑定可信内网。远程访问建议 SSH 隧道或带鉴权的反向代理。WebUI 会拦截危险设备操作并校验同源写请求，但这只是纵深防御，不是访问控制。
+WebUI 使用 `.env` 中的 `HA_URL` / `HA_TOKEN`，**没有独立登录口令**，请只绑定可信内网。远程访问建议 SSH 隧道或带鉴权的反向代理。WebUI 会独立拦截危险设备与高风险服务（不受 `DANGER_CONFIRM_ENABLED` 影响），写请求必须同源并校验 Host/Origin，所有响应附带 `X-Content-Type-Options`、`X-Frame-Options`、`CSP` 等安全头；但这只是纵深防御，不是访问控制。允许的 Host 默认是 localhost/内网 IP，跨网段或域名访问可通过 `WEBUI_ALLOWED_HOSTS` 追加。
 
-日志默认写入系统临时目录的 `homeassistant-xiaozhiserver.log`，可用 `LOG_FILE` 指定。容器内如需长期保留，建议挂载目录：
+日志默认写入系统临时目录的 `homeassistant-xiaozhiserver.log`，可用 `LOG_FILE` 指定，并按 `LOG_MAX_BYTES` / `LOG_BACKUP_COUNT` 轮转。项目根 `docker-compose.yml` 已把 `/app/logs` 挂到命名卷并设置 json-file 日志上限；非 compose 部署如需长期保留，建议挂载目录：
 
 ```bash
 docker run -v ./logs:/var/log/homeassistant-xiaozhiserver \
@@ -285,6 +289,9 @@ docker run -v ./logs:/var/log/homeassistant-xiaozhiserver \
 | `HA_WS_URL` | 自动推导 | HA WebSocket 地址，如 `ws://homeassistant:8123/api/websocket` |
 | `HA_REGISTRY_TTL` | `60` | 注册表成功缓存秒数 |
 | `HA_REGISTRY_ERROR_TTL` | `10` | 注册表失败后的重试间隔秒数 |
+| `HA_STATE_WS_ENABLED` | `true` | 是否订阅 HA `state_changed` 事件，用事件驱动控制确认并维护内存状态缓存 |
+| `HA_STATE_CACHE_TTL` | `1.0` | 未订阅事件时 `get_states` 的短缓存秒数；`0` 关闭 |
+| `HA_SERVICES_CACHE_TTL` | `300` | `get_services` 服务目录缓存秒数；`0` 关闭 |
 
 ### 6.3 设备与分页
 
@@ -303,8 +310,8 @@ docker run -v ./logs:/var/log/homeassistant-xiaozhiserver \
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `SERVICE_CONFIRM_DELAY` | `0.6` | 服务调用后首次回读前等待秒数 |
-| `SERVICE_CONFIRM_RETRIES` | `1` | 回读额外重试次数 |
+| `SERVICE_CONFIRM_DELAY` | `0.15` | 未启用状态事件流时，服务调用后首次回读前等待秒数 |
+| `SERVICE_CONFIRM_RETRIES` | `3` | 回读额外重试次数 |
 | `SERVICE_CONFIRM_INTERVAL` | 同 `SERVICE_CONFIRM_DELAY` | 回读轮询间隔秒数 |
 | `SERVICE_CONFIRM_TIMEOUT` | `4.0` | 回读确认总超时秒数 |
 
@@ -324,6 +331,9 @@ docker run -v ./logs:/var/log/homeassistant-xiaozhiserver \
 |---|---|---|
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL` |
 | `LOG_FILE` | 系统临时目录下 `homeassistant-xiaozhiserver.log` | WebUI 与 bridge 共享日志文件路径 |
+| `LOG_MAX_BYTES` | `5242880` | 单个日志文件轮转阈值（字节），`0` 表示不按大小轮转 |
+| `LOG_BACKUP_COUNT` | `3` | 保留的历史日志文件数量 |
+| `WEBUI_ALLOWED_HOSTS` | 空 | 额外允许访问 WebUI 的 Host（逗号分隔，不含端口）；默认已允许 localhost 与内网 IP |
 
 ---
 
@@ -336,6 +346,7 @@ docker run -v ./logs:/var/log/homeassistant-xiaozhiserver \
 | `list_devices` | 查询设备列表，支持关键字、类型、区域、分页、按设备聚合；自动隐藏与灯具同名重复的开关 |
 | `get_device_state` | 查询单个设备状态与关键属性 |
 | `control_device` | 常用控制：开关、亮度、音量、温度、颜色、窗帘、门锁等 |
+| `control_devices` | 批量控制多个设备（同一 action，只做一次危险确认，并发执行） |
 | `list_services` | 查询某类/某个设备支持哪些服务与字段 |
 | `call_service` | 通用 HA 服务调用，覆盖 `control_device` 未封装的能力 |
 | `list_domains` | 汇总设备类型、可控类型与危险实体 |
@@ -351,6 +362,7 @@ docker run -v ./logs:/var/log/homeassistant-xiaozhiserver \
 | `group_by` | string | 否 | `entity`（默认）或 `device`（按物理设备聚合） |
 | `limit` | int | 否 | 每页条数，默认 `DEFAULT_LIST_LIMIT`；非法值返回 `invalid_pagination` |
 | `offset` | int | 否 | 起始偏移，默认 `0` |
+| `compact` | bool | 否 | 只返回精简字段（`entity_id`/`name`/`domain`/`state`/`controllable`/设备与区域），适合语音链路降 token |
 
 返回（entity 模式）：
 
@@ -402,7 +414,7 @@ docker run -v ./logs:/var/log/homeassistant-xiaozhiserver \
 
 默认只返回亮度、色温、音量、温度、位置、电池等关键属性；`attributes_truncated=true` 表示还有更多属性。
 
-### 7.3 `control_device` — 控制设备
+### 7.3 `control_device` / `control_devices` — 控制设备
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
@@ -419,8 +431,8 @@ docker run -v ./logs:/var/log/homeassistant-xiaozhiserver \
 | `toggle` | 切换 | — |
 | `open` / `close` / `stop` / `pause` / `continue` / `resume` / `play` | 按设备能力映射 | — |
 | `lock` / `unlock` | 上锁 / 解锁（lock） | — |
-| `set_brightness` | 设置亮度（light） | 1–100 |
-| `set_volume` | 设置音量（media_player） | 1–100 |
+| `set_brightness` | 设置亮度（light） | 0–100 |
+| `set_volume` | 设置音量（media_player） | 0–100 |
 | `volume_mute` / `volume_unmute` | 静音 / 取消静音 | — |
 | `set_temperature` | 设置温度（climate） | 摄氏度 |
 | `set_color_temp` | 设置色温（light） | 开尔文 |
@@ -438,6 +450,8 @@ docker run -v ./logs:/var/log/homeassistant-xiaozhiserver \
 | vacuum | turn_on, turn_off, stop, pause, continue, resume |
 | lock | lock, unlock |
 | scene / script | turn_on |
+
+`control_devices` 参数为 `entities`（string 列表，最多 20 个）、`action`、`value`、`confirm_token`；同一 `action` 批量执行，返回 `count`、合并后的中文 `response` 与逐设备 `results`，单个设备失败会收集到 `errors` 而不中断其余设备。
 
 控制后回读状态：
 
@@ -474,7 +488,7 @@ docker run -v ./logs:/var/log/homeassistant-xiaozhiserver \
 
 ### 7.6 `list_domains` — 设备类型汇总
 
-无参数。返回 `{ok, domains:{light:3,switch:2,...}, controllable_domains:[...], dangerous_domains:[...], dangerous_entities:[...], dangerous_entity_count, message}`。
+无参数。返回 `{ok, domains:{light:3,switch:2,...}, controllable_domains:[...], dangerous_domains:[...], dangerous_entities:[...], dangerous_entity_count, deduplicated_switch_count, message}`。
 
 ### 7.7 结果结构与播报协议
 
@@ -519,7 +533,7 @@ docker run -v ./logs:/var/log/homeassistant-xiaozhiserver \
 
 ### 8.2 智控台核对
 
-刷新 MCP 工具后应看到 6 个工具：`list_devices`、`get_device_state`、`control_device`、`list_services`、`call_service`、`list_domains`。
+刷新 MCP 工具后应看到 7 个工具：`list_devices`、`get_device_state`、`control_device`、`control_devices`、`list_services`、`call_service`、`list_domains`。
 
 推荐在智控台角色提示词中加一句：
 
@@ -593,6 +607,8 @@ docker run -v ./logs:/var/log/homeassistant-xiaozhiserver \
 | `confirmation_required` | 危险操作首次调用，未带 token | 向用户确认后带 `confirm_token` 重试 |
 | `invalid_confirm_token` / `confirm_token_expired` / `confirm_token_mismatch` | 令牌无效/过期/不匹配 | 重新发起原操作获取新 token |
 | `ws_error` / `registry_error` | HA WebSocket 注册表失败 | 一般会降级；检查权限/网络，或设 `HA_WS_ENABLED=false` |
+| `payload_too_large` | WebUI 工具调试请求体超过 64KB | 缩小参数或改走 MCP 调用 |
+| `host_not_allowed` | WebUI 的 Host 不在允许范围 | 使用 localhost/内网 IP，或配置 `WEBUI_ALLOWED_HOSTS` |
 | `internal_error` | 未预期内部错误 | 查看服务日志 |
 
 ### 10.2 常见问题
@@ -622,9 +638,11 @@ bash tests/run_local_test.sh
 
 1. 启动 `tests/fake_ha.py`；
 2. 等待 HTTP 8123 与 WebSocket 8124 就绪；
-3. 运行 `tests/e2e_mcp_client.py`，以 stdio 子进程启动 `server.py`，覆盖 6 个工具入口、过滤/分页/聚合、回读校验、危险确认、隐藏设备等分支；
-4. 运行 `tests/webui_smoke.py`，校验 WebUI 无需登录、状态、配置掩码、设备总览、日志与工具白名单；
-5. 结束后自动清理。
+3. 运行 `tests/e2e_mcp_client.py`，以 stdio 子进程启动 `server.py`，覆盖 7 个工具入口、过滤/分页/聚合、批量控制、回读校验、危险确认、隐藏设备等分支；
+4. 运行 `tests/dedupe_switch_light.py`，校验同名开关/灯具去重的各边界；
+5. 运行 `tests/state_cache.py`，校验状态/服务缓存命中、强制刷新与服务调用后失效；
+6. 运行 `tests/webui_smoke.py`，校验 WebUI 无需登录、状态、配置掩码、设备总览、日志、健康探针、安全响应头与工具白名单；
+6. 结束后自动清理。
 
 手动运行见 `tests/run_local_test.sh` 内注释；重跑前请重启 fake HA，保证初始状态。
 
@@ -635,7 +653,7 @@ bash tests/run_local_test.sh
 - `HA_TOKEN` / `MCP_ENDPOINT` 只通过环境变量注入，不写入镜像、代码或 Git；`.env` 已被 `.gitignore` 忽略。
 - bridge 主动出站，不要为它暴露入站端口；WebUI 的 8099 只建议绑定可信内网。
 - WebUI 无独立密码，远程访问请使用 SSH 隧道或带鉴权的反向代理；页面和 API 只展示掩码后的敏感值。
-- 容器以非 root 用户（uid 10001）运行，并带 `/api/status` 健康检查。
+- 容器以非 root 用户（uid 10001）运行，并带 `/healthz` 健康检查；`/readyz` 可反映 HA 就绪状态。
 - 危险操作确认只用于防误操作，不是权限控制；真正权限由 HA 长期令牌决定。
 - 建议为 HA 使用专用长期令牌，只授予必要设备权限；公网接入使用 `wss://` 并保护 token。
 
@@ -645,6 +663,7 @@ bash tests/run_local_test.sh
 
 | 版本 | 主要变化 |
 |---|---|
+| v1.13.6 | 去重前校验灯具可用性、注册表不可用兜底；WebUI Host/Origin 白名单、安全响应头、64KB 请求体上限、`/healthz`/`/readyz`、生效配置展示；日志轮转与 compose 日志卷；CI 增加 PR 测试与版本一致性校验；新增 `HA state_changed` 事件流与状态/服务缓存、自适应回读确认、批量 `control_devices`、`list_devices compact`、小智侧 MCP 重连与 action 白名单、首次连接失败自动重试、状态流退避重置、同实体控制串行化 |
 | v1.13.5 | 同一设备下与灯具同名且唯一的开关自动去重，只保留灯具；新增 `duplicate_switch` 错误与 `deduplicated_switch_count` / `ambiguous_switch_groups` |
 | v1.13.4 | 默认隐藏门铃、自动化、热水壶、中枢网关、媒体五类设备；新增 `EXCLUDED_DOMAINS` / `EXCLUDED_DEVICE_KEYWORDS` |
 | v1.13.3 | 全面审计修复：输入校验、脚本/系统级服务确认、回读与重试修正、日志脱敏与尾部读取、WebUI 同源校验、bridge 重连与 SIGTERM、健康检查、CI 测试 |

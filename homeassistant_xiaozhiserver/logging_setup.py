@@ -14,10 +14,10 @@ import os
 import re
 import sys
 import tempfile
-from logging.handlers import WatchedFileHandler
+from logging.handlers import RotatingFileHandler, WatchedFileHandler
 
 from . import __version__
-from .config import LOG_FILE, LOG_LEVEL
+from .config import LOG_BACKUP_COUNT, LOG_FILE, LOG_LEVEL, LOG_MAX_BYTES
 
 _CALL_ID = contextvars.ContextVar("call_id", default="-")
 _VERSION_LOGGED = False
@@ -56,6 +56,8 @@ def setup_logging() -> None:
     level = getattr(logging, level_name, logging.INFO)
     root = logging.getLogger()
     root.setLevel(level)
+    for name in ("httpx", "httpx2", "httpcore"):
+        logging.getLogger(name).setLevel(max(level, logging.WARNING))
 
     if not any(getattr(h, "_homeassistant_xiaozhiserver", False) for h in root.handlers):
         handler = logging.StreamHandler(sys.stderr)
@@ -71,12 +73,23 @@ def setup_logging() -> None:
             parent = os.path.dirname(path)
             if parent:
                 os.makedirs(parent, exist_ok=True)
-            handler = WatchedFileHandler(
-                path,
-                encoding="utf-8",
-                errors="replace",
-                delay=True,
-            )
+            if LOG_MAX_BYTES > 0:
+                # 两个进程共享同一文件；轮转以单进程为主，极端并发下可能竞争，
+                # 因此优先在容器外使用 logrotate，或保持默认较小上限。
+                handler = RotatingFileHandler(
+                    path,
+                    maxBytes=LOG_MAX_BYTES,
+                    backupCount=LOG_BACKUP_COUNT,
+                    encoding="utf-8",
+                    delay=True,
+                )
+            else:
+                handler = WatchedFileHandler(
+                    path,
+                    encoding="utf-8",
+                    errors="replace",
+                    delay=True,
+                )
         except OSError as exc:
             logging.getLogger("homeassistant_xiaozhiserver.logging").warning(
                 "无法创建日志文件 %s：%s", path, exc

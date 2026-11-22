@@ -7,7 +7,7 @@
 安全约定：
 - WebUI 无独立登录口令，请只绑定可信内网，不要直接暴露公网；
 - HA_TOKEN、MCP_ENDPOINT 的令牌只做掩码展示，绝不回传明文；
-- 工具名白名单，只允许调用 server.py 暴露的六个工具；
+- 工具名白名单，只允许调用 server.py 暴露的七个工具；
 - 日志来自共享日志文件，包含 WebUI 与 MCP bridge 两个进程。
 """
 from __future__ import annotations
@@ -21,6 +21,7 @@ except Exception:  # noqa: BLE001
 import asyncio
 import html
 import inspect
+import ipaddress
 import json
 import logging
 import os
@@ -34,7 +35,22 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from . import __version__
 from . import server as mcp_server
 from .client import HAError
-from .config import DEFAULT_LIST_LIMIT, LOG_LEVEL, MAX_LIST_LIMIT
+from .config import (
+    DANGEROUS_SERVICE_DOMAINS,
+    DEFAULT_LIST_LIMIT,
+    EXCLUDED_DEVICE_KEYWORDS,
+    EXCLUDED_DOMAINS,
+    HA_SERVICES_CACHE_TTL,
+    HA_STATE_CACHE_TTL,
+    HA_STATE_WS_ENABLED,
+    LOG_LEVEL,
+    MAX_LIST_LIMIT,
+    SERVICE_CONFIRM_DELAY,
+    SERVICE_CONFIRM_RETRIES,
+    SERVICE_CONFIRM_TIMEOUT,
+    WEBUI_ALLOWED_HOSTS,
+)
+from .danger import service_is_dangerous
 from .logging_setup import log_file_path, read_recent_logs, setup_logging
 
 log = logging.getLogger("homeassistant_xiaozhiserver.webui")
@@ -42,12 +58,14 @@ log = logging.getLogger("homeassistant_xiaozhiserver.webui")
 _STARTED_AT = time.time()
 WEBUI_HOST = "0.0.0.0"
 WEBUI_PORT = 8099
+_MAX_TOOL_BODY = 64 * 1024
 
 # 工具白名单：名称 -> (说明, 参数示例)
 _TOOLS: list[tuple[str, str, str]] = [
     ("list_devices", "列出/查询设备（keyword/domain/area/分页）", '{"keyword": "客厅"}'),
     ("get_device_state", "查询单个设备状态", '{"entity": "客厅灯"}'),
     ("control_device", "控制设备（危险设备需 confirm_token）", '{"entity": "客厅灯", "action": "turn_on"}'),
+    ("control_devices", "批量控制多个设备（同一动作）", '{"entities": ["客厅灯", "switch.fan"], "action": "turn_on"}'),
     ("list_services", "查询某类设备支持的服务与参数", '{"domain": "light"}'),
     ("call_service", "调用任意 HA 服务", '{"entity": "客厅灯", "service": "light.turn_on", "data": {"brightness_pct": 50}}'),
     ("list_domains", "列出设备类型", "{}"),
@@ -144,17 +162,63 @@ def _mask_endpoint(raw: str) -> str:
 def create_app() -> FastAPI:
     app = FastAPI(title="homeassistant-xiaozhiserver WebUI", docs_url=None, redoc_url=None, openapi_url=None)
 
+    def _host_name(host: str) -> str:
+        value = (host or "").strip().lower()
+        if value.startswith("["):
+            return value[1:].split("]", 1)[0]
+        if value.count(":") == 1:
+            return value.rsplit(":", 1)[0]
+        return value
+
+    def _host_allowed(host: str) -> bool:
+        name = _host_name(host)
+        if not name:
+            return False
+        if name == "localhost":
+            return True
+        if name in WEBUI_ALLOWED_HOSTS:
+            return True
+        try:
+            ip = ipaddress.ip_address(name)
+        except ValueError:
+            return False
+        return ip.is_loopback or ip.is_private or ip.is_link_local
+
+    def _harden(response):
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        response.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data:; connect-src 'self'",
+        )
+        return response
+
     @app.middleware("http")
     async def _same_origin(request: Request, call_next):
-        """无独立密码时至少拒绝浏览器跨站写请求（CSRF 防护）。"""
+        """无独立密码时的纵深防御：校验 Host/Origin 并补充安全响应头。"""
+        host = request.headers.get("host", "")
+        if not _host_allowed(host):
+            return _harden(JSONResponse(
+                {"ok": False, "code": "host_not_allowed", "message": "Host 不在允许范围内。"},
+                status_code=403,
+            ))
         if request.method in ("POST", "PUT", "PATCH", "DELETE"):
             origin = request.headers.get("origin")
-            if origin and urlsplit(origin).netloc != request.headers.get("host", ""):
-                return JSONResponse(
+            if not origin:
+                return _harden(JSONResponse(
+                    {"ok": False, "code": "cross_origin_blocked", "message": "写请求必须携带同源 Origin。"},
+                    status_code=403,
+                ))
+            parts = urlsplit(origin)
+            if parts.scheme not in ("http", "https") or parts.netloc.lower() != host.lower():
+                return _harden(JSONResponse(
                     {"ok": False, "code": "cross_origin_blocked", "message": "拒绝跨站请求。"},
                     status_code=403,
-                )
-        return await call_next(request)
+                ))
+        return _harden(await call_next(request))
 
     async def _status_data() -> dict[str, Any]:
         ha_url = _env("HA_URL")
@@ -198,24 +262,39 @@ def create_app() -> FastAPI:
         }
 
     def _config_data() -> dict[str, Any]:
-        def env(name: str, default: str) -> str:
-            raw = os.environ.get(name)
-            return raw.strip() if raw is not None and raw.strip() else default
+        try:
+            ha = mcp_server.get_ha()
+            timeout = str(ha.timeout)
+            verify_ssl = str(ha.verify_ssl).lower()
+            ws_enabled = str(ha.ws_enabled).lower()
+        except Exception:  # noqa: BLE001 - 未配置时仍返回只读视图
+            timeout = _env("HA_TIMEOUT", "10")
+            verify_ssl = _env("HA_VERIFY_SSL", "true").lower()
+            ws_enabled = _env("HA_WS_ENABLED", "true").lower()
 
         return {
             "ok": True,
             "items": [
-                {"key": "HA_URL", "value": _mask_url(env("HA_URL", "")), "secret": False},
-                {"key": "HA_TOKEN", "value": _mask_secret(env("HA_TOKEN", "")), "secret": True},
-                {"key": "MCP_ENDPOINT", "value": _mask_endpoint(env("MCP_ENDPOINT", "")), "secret": True},
-                {"key": "HA_TIMEOUT", "value": env("HA_TIMEOUT", "10"), "secret": False},
-                {"key": "HA_VERIFY_SSL", "value": env("HA_VERIFY_SSL", "true"), "secret": False},
-                {"key": "HA_WS_ENABLED", "value": env("HA_WS_ENABLED", "true"), "secret": False},
+                {"key": "HA_URL", "value": _mask_url(_env("HA_URL")), "secret": False},
+                {"key": "HA_TOKEN", "value": _mask_secret(_env("HA_TOKEN")), "secret": True},
+                {"key": "MCP_ENDPOINT", "value": _mask_endpoint(_env("MCP_ENDPOINT")), "secret": True},
+                {"key": "HA_TIMEOUT", "value": timeout, "secret": False},
+                {"key": "HA_VERIFY_SSL", "value": verify_ssl, "secret": False},
+                {"key": "HA_WS_ENABLED", "value": ws_enabled, "secret": False},
+                {"key": "HA_STATE_WS_ENABLED", "value": str(HA_STATE_WS_ENABLED).lower(), "secret": False},
+                {"key": "HA_STATE_CACHE_TTL", "value": str(HA_STATE_CACHE_TTL), "secret": False},
+                {"key": "HA_SERVICES_CACHE_TTL", "value": str(HA_SERVICES_CACHE_TTL), "secret": False},
+                {"key": "SERVICE_CONFIRM_DELAY", "value": str(SERVICE_CONFIRM_DELAY), "secret": False},
+                {"key": "SERVICE_CONFIRM_RETRIES", "value": str(SERVICE_CONFIRM_RETRIES), "secret": False},
+                {"key": "SERVICE_CONFIRM_TIMEOUT", "value": str(SERVICE_CONFIRM_TIMEOUT), "secret": False},
+                {"key": "EXCLUDED_DOMAINS", "value": ",".join(sorted(EXCLUDED_DOMAINS)), "secret": False},
+                {"key": "EXCLUDED_DEVICE_KEYWORDS", "value": ",".join(sorted(EXCLUDED_DEVICE_KEYWORDS)), "secret": False},
+                {"key": "DANGEROUS_SERVICE_DOMAINS", "value": ",".join(sorted(DANGEROUS_SERVICE_DOMAINS)), "secret": False},
                 {"key": "LOG_LEVEL", "value": LOG_LEVEL, "secret": False},
                 {"key": "DEFAULT_LIST_LIMIT", "value": str(DEFAULT_LIST_LIMIT), "secret": False},
                 {"key": "MAX_LIST_LIMIT", "value": str(MAX_LIST_LIMIT), "secret": False},
             ],
-            "note": "配置为只读；WebUI 无独立密码，直接使用 HA_URL / HA_TOKEN 连接 HA；修改请更新 .env 并重启服务。",
+            "note": "配置为只读视图，展示实际生效值；WebUI 无独立密码，直接使用 HA_URL / HA_TOKEN 连接 HA；修改请更新 .env 并重启服务。",
         }
 
     async def _devices_data() -> dict[str, Any]:
@@ -330,6 +409,16 @@ def create_app() -> FastAPI:
             "limit": limit,
         }, 200
 
+    @app.get("/healthz")
+    async def healthz() -> JSONResponse:
+        return JSONResponse({"ok": True})
+
+    @app.get("/readyz")
+    async def readyz() -> JSONResponse:
+        status = await _status_data()
+        ready = bool(status.get("ha", {}).get("configured") and status.get("ha", {}).get("reachable"))
+        return JSONResponse({"ok": ready, "ha": status.get("ha")}, status_code=200 if ready else 503)
+
     @app.get("/", response_class=HTMLResponse)
     async def index() -> HTMLResponse:
         status, devices = await asyncio.gather(_status_data(), _devices_data())
@@ -363,16 +452,61 @@ def create_app() -> FastAPI:
 
     @app.post("/api/tool/{name}")
     async def api_tool(name: str, request: Request) -> JSONResponse:
-        raw = await request.body()
+        raw = bytearray()
+        try:
+            async for chunk in request.stream():
+                if len(raw) + len(chunk) > _MAX_TOOL_BODY:
+                    return JSONResponse(
+                        {"ok": False, "code": "payload_too_large",
+                         "message": "请求体超过 64KB 上限。"},
+                        status_code=413,
+                    )
+                raw.extend(chunk)
+        except Exception:  # noqa: BLE001
+            return JSONResponse(
+                {"ok": False, "code": "invalid_argument", "message": "读取请求体失败。"},
+                status_code=400,
+            )
         try:
             payload = json.loads(raw.decode("utf-8")) if raw and raw.strip() else {}
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
             return JSONResponse(
                 {"ok": False, "code": "invalid_argument", "message": "请求体不是合法 JSON：" + str(exc)},
                 status_code=400,
             )
         result, status = await _execute_tool(name, payload)
         return JSONResponse(result, status_code=status)
+
+    async def _webui_danger_block(name: str, params: dict) -> dict | None:
+        """WebUI 侧独立的高风险闸门，不依赖 DANGER_CONFIRM_ENABLED，也不接受确认令牌。"""
+        if str(params.get("confirm_token") or "").strip():
+            return {"ok": False, "code": "dangerous_operation_blocked",
+                    "message": "WebUI 不执行带确认令牌的危险操作；请通过小智语音确认后再操作。"}
+        service = str(params.get("service") or "").strip().lower()
+        if "." in service:
+            domain, svc = service.split(".", 1)
+            dangerous, reason = service_is_dangerous(domain, svc)
+            if dangerous:
+                return {"ok": False, "code": "dangerous_operation_blocked",
+                        "message": "WebUI 不执行高风险服务（" + reason + "）；请通过小智语音确认后再操作。"}
+        candidates: list[str] = []
+        entity = str(params.get("entity") or "").strip()
+        if entity:
+            candidates.append(entity)
+        raw_entities = params.get("entities")
+        if isinstance(raw_entities, list):
+            candidates.extend(str(x).strip() for x in raw_entities if str(x).strip())
+        for ref in candidates:
+            try:
+                info = await mcp_server.get_device_state(entity=ref)
+            except Exception:  # noqa: BLE001
+                info = None
+            view = info.get("entity") if isinstance(info, dict) else None
+            if isinstance(view, dict) and view.get("dangerous"):
+                reason = str(view.get("danger_reason") or "该设备属于高风险设备")
+                return {"ok": False, "code": "dangerous_operation_blocked",
+                        "message": "WebUI 不执行危险设备操作（" + reason + "）；请通过小智语音确认后再操作。"}
+        return None
 
     async def _execute_tool(name: str, params: Any) -> tuple[Any, int]:
         fn = _TOOL_FUNCS.get(name)
@@ -392,6 +526,10 @@ def create_app() -> FastAPI:
         except TypeError as exc:
             return {"ok": False, "code": "invalid_argument",
                     "message": "参数与工具签名不匹配：" + str(exc)}, 400
+        if name in ("control_device", "control_devices", "call_service"):
+            blocked = await _webui_danger_block(name, params)
+            if blocked is not None:
+                return blocked, 403
         try:
             result = await fn(**params)
         except Exception:  # noqa: BLE001

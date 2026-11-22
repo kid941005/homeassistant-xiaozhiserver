@@ -18,7 +18,13 @@ from fastapi.testclient import TestClient  # noqa: E402
 from homeassistant_xiaozhiserver import __version__  # noqa: E402
 from homeassistant_xiaozhiserver.webui import _TOOLS, create_app  # noqa: E402
 
-client = TestClient(create_app())
+client = TestClient(create_app(), base_url="http://127.0.0.1:8099")
+
+
+def post(path: str, **kwargs):
+    headers = dict(kwargs.pop("headers", {}) or {})
+    headers.setdefault("Origin", "http://127.0.0.1:8099")
+    return client.post(path, headers=headers, **kwargs)
 
 
 def check(name: str, cond: bool, extra: str = "") -> None:
@@ -44,6 +50,14 @@ devices = r.json()
 check("devices 返回 rows 列表", isinstance(devices.get("rows"), list), str(type(devices.get("rows"))))
 if os.environ.get("HA_URL") and os.environ.get("HA_TOKEN"):
     check("已配置 HA 时设备加载成功", devices.get("ok") is True, json.dumps(devices, ensure_ascii=False)[:300])
+    if os.environ.get("FAKE_HA_TOKEN"):
+        rows = devices.get("rows") or []
+        ids = {row.get("entity_id") for row in rows}
+        check("设备总览返回 5 个可控实体", devices.get("total") == 5 and len(rows) == 5,
+              str(devices.get("total")) + " rows=" + str(len(rows)))
+        check("设备总览不含被隐藏或去重实体",
+              not ({"switch.doorbell", "light.hub_indicator", "switch.living_room_duplicate"} & ids),
+              str(sorted(ids)))
 else:
     check("未配置 HA 时设备返回 config_missing", devices.get("code") == "config_missing", json.dumps(devices, ensure_ascii=False)[:300])
 
@@ -66,7 +80,7 @@ check("无需登录访问 /api/status 200", r.status_code == 200, str(r.status_c
 status = r.json()
 check("status.ok 为 True", status.get("ok") is True)
 check("status 含版本号", isinstance(status.get("version"), str) and bool(status["version"]))
-check("status 工具数为 6", len(status.get("tools") or []) == 6, str(len(status.get("tools") or [])))
+check("status 工具数为 7", len(status.get("tools") or []) == 7, str(len(status.get("tools") or [])))
 ha_token_env = os.environ.get("HA_TOKEN", "")
 check("HA_TOKEN 不回传明文", ha_token_env == "" or ha_token_env not in json.dumps(status, ensure_ascii=False))
 
@@ -86,39 +100,55 @@ if mcp_raw:
           bool(token_value) and token_value not in masked_endpoint,
           masked_endpoint)
 
-r = client.post("/api/tool/list_devices", json={"limit": "abc"})
+r = client.get("/healthz")
+check("健康检查 200", r.status_code == 200 and r.json().get("ok") is True, r.text[:200])
+check("安全响应头存在", r.headers.get("X-Content-Type-Options") == "nosniff")
+
+r = post("/api/tool/list_devices", json={"limit": "abc"})
 check("非法分页参数返回 invalid_pagination",
       r.status_code == 200 and r.json().get("code") == "invalid_pagination", r.text[:200])
 
-r = client.post("/api/tool/not_a_tool", json={})
+r = post("/api/tool/not_a_tool", json={})
 check("未知工具返回 404", r.status_code == 404, str(r.status_code))
 check("未知工具错误码", r.json().get("code") == "unknown_tool", str(r.json()))
 
-r = client.post("/api/tool/list_domains", content="{bad json", headers={"Content-Type": "application/json"})
+r = post("/api/tool/list_domains", content="{bad json", headers={"Content-Type": "application/json"})
 check("非法 JSON 返回 400", r.status_code == 400, str(r.status_code))
 
-r = client.post("/api/tool/list_domains", json=[1, 2])
+r = post("/api/tool/list_domains", json=[1, 2])
 check("非对象参数返回 400", r.status_code == 400, str(r.status_code))
 check("非对象参数错误码", r.json().get("code") == "invalid_argument", str(r.json()))
 
-r = client.post("/tool", data={"name": "list_domains", "params": "[1,2]"})
+r = post("/tool", data={"name": "list_domains", "params": "[1,2]"})
 check("表单非对象参数返回失败页", r.status_code == 400 and "失败" in r.text, str(r.status_code))
 
-r = client.post("/api/tool/list_domains", json={}, headers={"Origin": "http://evil.example"})
+r = post("/api/tool/list_domains", json={}, headers={"Origin": "http://evil.example"})
 check("跨站写请求被拒绝", r.status_code == 403 and r.json().get("code") == "cross_origin_blocked",
       str(r.status_code) + " " + r.text[:200])
 
 if os.environ.get("HA_URL") and os.environ.get("HA_TOKEN"):
-    r = client.post("/api/tool/list_domains", json={})
+    r = post("/api/tool/list_domains", json={})
     check("list_domains 调用成功", r.status_code == 200 and r.json().get("ok") is True, str(r.status_code) + " " + r.text[:200])
 
-    r = client.post("/api/tool/control_device", json={"entity": "大门门锁", "action": "unlock"})
+    r = post("/api/tool/control_device", json={"entity": "大门门锁", "action": "unlock"})
     check("WebUI 拦截危险设备操作", r.status_code == 403 and r.json().get("code") == "dangerous_operation_blocked",
           str(r.status_code) + " " + r.text[:200])
     check("WebUI 不回传 confirm_token", "confirm_token" not in r.text, r.text[:200])
 
+    if os.environ.get("FAKE_HA_TOKEN"):
+        import homeassistant_xiaozhiserver.danger as danger_mod
+        _old_enabled = danger_mod.DANGER_CONFIRM_ENABLED
+        danger_mod.DANGER_CONFIRM_ENABLED = False
+        try:
+            r = post("/api/tool/control_device", json={"entity": "大门门锁", "action": "unlock"})
+        finally:
+            danger_mod.DANGER_CONFIRM_ENABLED = _old_enabled
+        check("WebUI 危险闸门独立于 DANGER_CONFIRM_ENABLED",
+              r.status_code == 403 and r.json().get("code") == "dangerous_operation_blocked",
+              str(r.status_code) + " " + r.text[:200])
+
     examples = {name: example for name, _, example in _TOOLS}
-    r = client.post("/api/tool/call_service", json=json.loads(examples["call_service"]))
+    r = post("/api/tool/call_service", json=json.loads(examples["call_service"]))
     check("工具调试台示例可执行", r.status_code == 200 and r.json().get("ok") is True,
           str(r.status_code) + " " + r.text[:200])
 else:

@@ -16,7 +16,9 @@ COPY server.py ./server.py
 COPY mcp_pipe.py ./mcp_pipe.py
 COPY docker-entrypoint.sh /app/docker-entrypoint.sh
 
-RUN useradd -m -u 10001 --no-log-init appuser && chmod 0755 /app/docker-entrypoint.sh
+RUN useradd -m -u 10001 --no-log-init appuser \
+    && chmod 0755 /app/docker-entrypoint.sh \
+    && install -d -o appuser -g appuser /app/logs
 USER appuser
 
 # HA_URL / HA_TOKEN / MCP_ENDPOINT 由运行时注入，不写入镜像
@@ -28,6 +30,6 @@ ENV HA_TIMEOUT=10 \
 EXPOSE 8099
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8099/api/status', timeout=3)" || exit 1
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8099/healthz', timeout=3)" || exit 1
 
 ENTRYPOINT ["/app/docker-entrypoint.sh"]

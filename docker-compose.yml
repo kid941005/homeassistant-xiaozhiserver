@@ -11,7 +11,23 @@ services:
     #   dockerfile: Dockerfile
     container_name: homeassistant-xiaozhiserver
     restart: unless-stopped
+    init: true
+    stop_grace_period: 15s
     env_file:
       - .env
+    environment:
+      LOG_FILE: /app/logs/homeassistant-xiaozhiserver.log
     ports:
       - "8099:8099"
+    volumes:
+      - xiaozhi-logs:/app/logs
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  xiaozhi-logs:

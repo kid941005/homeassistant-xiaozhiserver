@@ -47,6 +47,11 @@ def _service_is_dangerous(service_domain: str, service: str) -> tuple:
     return False, None
 
 
+def service_is_dangerous(service_domain: str, service: str) -> tuple:
+    """公开封装：供 WebUI 等调用方判断服务本身是否高风险。"""
+    return _service_is_dangerous(service_domain, service)
+
+
 def _danger_info(entity_id: str, attributes: Optional[dict]) -> dict:
     dangerous, reason = _danger_flags(entity_id, attributes)
     return {"dangerous": dangerous, "danger_reason": reason}
