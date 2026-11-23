@@ -1,9 +1,10 @@
-# 上限 <2.4：server.py 的 _accept_extra_arguments 依赖 mcp 2.3 的私有工具元数据结构。
-mcp>=2.3,<2.4
-httpx>=0.27,<1
-websockets>=12,<16
-python-dotenv>=1.0,<2
-fastapi>=0.115,<1
-uvicorn>=0.30,<1
-pydantic>=2,<3
-python-multipart>=0.0.9,<1
+# 直接依赖精确锁定（版本与本地测试环境一致），升级时请同步 Dockerfile digest 与 CI 测试。
+# mcp 2.3.0：避免 mcp 2.4 的潜在不兼容；本仓库已不再依赖其私有工具元数据 API。
+mcp==2.3.0
+httpx==0.28.1
+websockets==15.0.1
+python-dotenv==1.2.4
+fastapi==0.165.0
+uvicorn==0.54.0
+pydantic==2.14.3
+python-multipart==0.0.34

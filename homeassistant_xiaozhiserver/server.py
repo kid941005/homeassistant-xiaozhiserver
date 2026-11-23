@@ -1,20 +1,10 @@
 # -*- coding: utf-8 -*-
 """homeassistant-xiaozhiserver — 小智 MCP 服务（Home Assistant 桥）。
 
-把 Home Assistant 的设备能力封装成标准 MCP 工具，供小智（xiaozhi-esp32-server）
-通过 MCP 接入点调用。本进程固定以 stdio 运行，由 mcp_pipe.py 桥接 WebSocket。
-
-模块划分：
-  config.py    环境变量解析与运行常量（非法值回退并告警）
-  client.py    HA REST/WebSocket 客户端、鉴权与错误归一化
-  service.py   动作映射、状态/属性预期、回读校验
-  danger.py    危险设备判定与一次性确认令牌
-  views.py     实体摘要、可控性标记、按设备聚合
-  server.py    MCP 工具定义与 stdio 进程入口
+MCP 工具薄包装层：业务逻辑在 devices.DeviceService，进程入口在 main()。
 """
 from __future__ import annotations
 
-import asyncio
 import functools
 import logging
 import time
@@ -24,38 +14,13 @@ from urllib.parse import urlsplit, urlunsplit
 
 from mcp.server.mcpserver import MCPServer
 
-from .config import DEFAULT_LIST_LIMIT, EXCLUDED_DOMAINS, LOG_LEVEL, MAX_LIST_LIMIT
+from .config import LOG_LEVEL
 from .client import HAError, HAClient
-from .danger import _danger_block, _danger_flags, _service_is_dangerous
-from .service import (
-    DIRECT_RESPONSE_SERVICES,
-    DOMAIN_ACTIONS,
-    _apply_and_confirm,
-    _domain_of,
-    _field_brief,
-    _friendly_name,
-    _hint,
-    build_service,
-)
-from .views import (
-    _brief_attributes,
-    _controllability,
-    _entity_view,
-    _drop_redundant_switches,
-    _group_by_device,
-    _registry_maps,
-    is_excluded_entity,
-    redundant_switch_map,
-)
-from .logging_setup import reset_call_id, set_call_id, setup_logging
+from .devices import DeviceService
+from .logging_setup import set_call_id, reset_call_id, setup_logging
+from .metrics import metrics
 
 log = logging.getLogger("homeassistant_xiaozhiserver.server")
-setup_logging()
-
-# call_service 的 data 中禁止出现目标选择器：目标实体必须由 entity 参数指定。
-_TARGET_SELECTOR_KEYS = frozenset({
-    "entity_id", "target", "device_id", "area_id", "floor_id", "label_id",
-})
 
 mcp = MCPServer(
     "homeassistant-xiaozhiserver",
@@ -80,6 +45,7 @@ mcp = MCPServer(
 )
 
 _ha: Optional[HAClient] = None
+_service: Optional[DeviceService] = None
 
 
 def get_ha() -> HAClient:
@@ -87,6 +53,13 @@ def get_ha() -> HAClient:
     if _ha is None:
         _ha = HAClient()
     return _ha
+
+
+def get_device_service() -> DeviceService:
+    global _service
+    if _service is None:
+        _service = DeviceService(get_ha)
+    return _service
 
 
 _SENSITIVE_EXACT = {
@@ -121,96 +94,6 @@ def _safe_value(value: Any, depth: int = 0) -> Any:
         return [_safe_value(v, depth + 1) for v in list(value)[:20]]
     return _short(value)
 
-
-def _as_bool(value: Any, default: bool = False) -> bool:
-    """兼容直接 Python 调用传入字符串的布尔值，避免 "false" 被当成 True。"""
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return default
-    if isinstance(value, str):
-        v = value.strip().lower()
-        if v in ("1", "true", "yes", "on", "y"):
-            return True
-        if v in ("0", "false", "no", "off", "n", ""):
-            return False
-    return bool(value)
-
-
-def _parse_pagination(limit: Any, offset: Any) -> Optional[tuple[int, int]]:
-    """把 limit/offset 归一化为合法分页。
-
-    limit<=0 回退到 DEFAULT_LIST_LIMIT、offset<0 回退到 0；只有无法转成整数时才返回
-    None，由调用方返回 invalid_pagination。
-    """
-    try:
-        if limit is None or (isinstance(limit, str) and not limit.strip()):
-            lim = DEFAULT_LIST_LIMIT
-        else:
-            lim = int(limit)
-            if lim <= 0:
-                lim = DEFAULT_LIST_LIMIT
-        lim = min(lim, MAX_LIST_LIMIT)
-        if offset is None or (isinstance(offset, str) and not offset.strip()):
-            off = 0
-        else:
-            off = int(offset)
-        return lim, max(0, off)
-    except (TypeError, ValueError):
-        return None
-
-
-def _accept_extra_arguments(tool_name: str) -> bool:
-    """让指定工具能收到未声明的参数，以便显式报错而不是被 MCP SDK 静默丢弃。
-
-    MCP SDK 默认按函数签名生成参数模型并忽略多余键，导致 model 传错参数名时
-    悄悄拿到全量数据。这里把该工具的校验模型换成允许额外字段的版本，
-    由工具函数自己检查 **extra 并返回 invalid_argument。
-
-    该函数依赖 mcp 私有内部结构；任何不兼容都应降级为“不启用严格校验”，
-    不能让 MCP server 或 WebUI 在导入阶段崩溃。
-    """
-    try:
-        from mcp.server.mcpserver.utilities.func_metadata import ArgModelBase
-        from pydantic import ConfigDict, create_model
-
-        tool = mcp._tool_manager.get_tool(tool_name)
-        if tool is None:
-            log.warning("无法为 %s 启用未知参数校验（工具未注册）", tool_name)
-            return False
-        base_model = tool.fn_metadata.arg_model
-        # **extra 会被 SDK 当成必填字段，发布前要剔除；extra="allow" 仍能接住多余参数
-        field_defs = {name: (fi.annotation, fi) for name, fi in base_model.model_fields.items()
-                      if name != "extra"}
-
-        class _ArgsWithExtra(ArgModelBase):
-            model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
-
-            def model_dump_one_level(self) -> dict:
-                data = super().model_dump_one_level()
-                extra = self.__pydantic_extra__
-                if extra:
-                    data.update(extra)
-                return data
-
-        tool.fn_metadata.arg_model = create_model(
-            base_model.__name__ + "WithExtra", __base__=_ArgsWithExtra, **field_defs
-        )
-        params = dict(tool.parameters)
-        properties = dict(params.get("properties") or {})
-        properties.pop("extra", None)
-        params["properties"] = properties
-        if "required" in params:
-            required = [n for n in params["required"] if n != "extra"]
-            if required:
-                params["required"] = required
-            else:
-                params.pop("required", None)
-        tool.parameters = params
-        return True
-    except Exception:  # noqa: BLE001 mcp 内部 API 变动时优雅降级
-        log.warning("无法为 %s 启用未知参数校验（mcp 内部 API 不可用或不兼容）", tool_name, exc_info=True)
-        return False
 
 
 def _safe_url(raw: str) -> str:
@@ -249,7 +132,15 @@ def _log_tool(name: str):
                 log.exception("tool=%s exception", name)
                 raise
             else:
-                elapsed_ms = int((time.perf_counter() - started) * 1000)
+                elapsed = time.perf_counter() - started
+                elapsed_ms = int(elapsed * 1000)
+                result_code = result.get("code", "") if isinstance(result, dict) else ""
+                metrics.record_tool(
+                    name,
+                    not (isinstance(result, dict) and result.get("ok") is False),
+                    elapsed,
+                    str(result_code or "ok"),
+                )
                 if isinstance(result, dict) and result.get("ok") is False:
                     log.warning("tool=%s done ok=false code=%s elapsed_ms=%s message=%s",
                                 name, result.get("code"), elapsed_ms, _short(result.get("message"), 300))
@@ -264,92 +155,6 @@ def _log_tool(name: str):
         return wrapper
     return deco
 
-
-async def _excluded_entity_error(ha: HAClient, st: dict) -> Optional[dict]:
-    """实体属于隐藏类型/设备时返回错误结构，否则返回 None。"""
-    try:
-        reg = await ha.get_registries()
-    except HAError:
-        reg = None
-    devices_map, ents_map, _ = _registry_maps(reg)
-    if not is_excluded_entity(st, devices_map, ents_map):
-        return None
-    return {"ok": False, "code": "unsupported_device",
-            "message": "该设备不在本 MCP 服务开放范围内，已隐藏。",
-            "entity_id": str(st.get("entity_id") or "")}
-
-
-async def _redundant_switch_context(ha: HAClient, states: Optional[list] = None) -> tuple:
-    """惰性加载实体状态与注册表，返回 (hidden_switch_map, ambiguous_groups)。
-
-    states 可由 resolve_entity 复用，避免按名称解析时重复拉取全量状态。
-    """
-    if states is None:
-        try:
-            states = await ha.get_states()
-        except HAError:
-            return {}, []
-    try:
-        reg = await ha.get_registries()
-    except HAError:
-        reg = None
-    devices_map, ents_map, _ = _registry_maps(reg)
-    return redundant_switch_map(states, devices_map, ents_map)
-
-
-def _duplicate_switch_error(st: dict, light_id: str) -> dict:
-    eid = str(st.get("entity_id") or "")
-    return {
-        "ok": False, "code": "duplicate_switch",
-        "message": "『" + _friendly_name(st) + "』是与灯具重复的开关，已由灯具 " + light_id + " 替代；请直接使用该灯具实体。",
-        "entity_id": eid, "suggested_entity_id": light_id,
-    }
-
-
-async def _resolve_entity_or_error(ha: HAClient, entity: str, verb: str) -> tuple:
-    """统一实体解析失败结构，避免四处复制歧义/未找到分支。"""
-    st, cands, states = await ha.resolve_entity(entity)
-    switch_ids = []
-    if st is not None:
-        switch_ids = [str(st.get("entity_id") or "")]
-    elif cands:
-        switch_ids = [str(c.get("entity_id") or "") for c in cands]
-    hidden = {}
-    if any(_domain_of(eid) == "switch" for eid in switch_ids):
-        hidden, _ = await _redundant_switch_context(ha, states)
-    if st is not None:
-        eid = str(st.get("entity_id") or "")
-        blocked = await _excluded_entity_error(ha, st)
-        if blocked is not None:
-            return None, blocked
-        light_id = hidden.get(eid)
-        if light_id:
-            return None, _duplicate_switch_error(st, light_id)
-        return st, None
-    if cands:
-        visible = [c for c in cands if str(c.get("entity_id") or "") not in hidden]
-        if len(visible) == 1:
-            st = visible[0]
-            blocked = await _excluded_entity_error(ha, st)
-            if blocked is not None:
-                return None, blocked
-            return st, None
-        if len(visible) > 1:
-            cands = visible
-        elif hidden:
-            switch = next((c for c in cands if str(c.get("entity_id") or "") in hidden), None)
-            if switch is not None:
-                return None, _duplicate_switch_error(
-                    switch, hidden[str(switch.get("entity_id") or "")])
-        return None, {
-            "ok": False, "code": "ambiguous",
-            "message": "『" + str(entity) + "』匹配到多个设备，请指定更精确的名称或 entity_id。",
-            "candidates": [str(c.get("entity_id")) for c in cands[:10]],
-        }
-    return None, {
-        "ok": False, "code": "not_found",
-        "message": "未找到设备『" + str(entity) + "』，无法" + verb + "。可先用 list_devices 查询。",
-    }
 
 
 @mcp.tool()
@@ -367,7 +172,6 @@ async def list_devices(
     compact: bool = False,
     limit: Optional[int] = None,
     offset: int = 0,
-    **extra: Any,
 ) -> dict:
     """列出/查询 Home Assistant 中的设备。
 
@@ -383,8 +187,6 @@ async def list_devices(
     未传任何过滤条件（keyword/domain/area）时，为控制返回体积默认只返回可控制
     设备且每页 DEFAULT_LIST_LIMIT（通常 50）条；可用 controllable_only=false、
     limit 显式覆盖。
-    传入本工具不支持的参数会返回 invalid_argument 并列出可用参数。
-
     每个实体带 controllable（是否可控制）、actions（内置动作）、
     device_id/device_name/area_id/area_name。
 
@@ -395,162 +197,7 @@ async def list_devices(
 
     适用场景：用户问「有哪些设备」「列出所有的灯」「客厅有什么设备」「哪些设备能控制」。
     """
-    known_args = ("keyword", "query", "q", "search", "name", "domain", "area",
-                  "controllable_only", "group_by", "compact", "limit", "offset")
-    if extra:
-        unknown = "、".join(sorted(str(k) for k in extra))
-        return {"ok": False, "code": "invalid_argument",
-                "message": "不支持的参数：" + unknown + "。可用参数：" + "、".join(known_args) + "。"}
-
-    aliases = [("keyword", keyword), ("query", query), ("q", q),
-               ("search", search), ("name", name)]
-    provided = [(k, v.strip()) for k, v in aliases if isinstance(v, str) and v.strip()]
-    distinct = {v for _, v in provided}
-    if len(distinct) > 1:
-        detail = "、".join(k + "=" + v for k, v in provided)
-        return {"ok": False, "code": "invalid_argument",
-                "message": "关键字参数只能提供一个（keyword/query/q/search/name），"
-                           "但收到不同取值：" + detail + "。"}
-    keyword = provided[0][1] if provided else None
-
-    has_filter = bool(keyword or domain or area)
-    applied_defaults: dict = {}
-    if controllable_only is None:
-        controllable_only = not has_filter
-        if not has_filter:
-            applied_defaults["controllable_only"] = True
-    else:
-        controllable_only = _as_bool(controllable_only)
-    if limit is None and not has_filter:
-        limit = DEFAULT_LIST_LIMIT
-        applied_defaults["limit"] = limit
-
-    try:
-        page_args = _parse_pagination(limit, offset)
-        if page_args is None:
-            return {"ok": False, "code": "invalid_pagination",
-                    "message": "limit/offset 必须是整数：limit 为正整数，offset 为非负整数。"}
-        lim, off = page_args
-        ha = get_ha()
-        states, reg = await asyncio.gather(ha.get_states(), ha.get_registries(), return_exceptions=True)
-        if isinstance(states, BaseException):
-            raise states
-        if isinstance(reg, asyncio.CancelledError):
-            raise reg
-        if isinstance(reg, BaseException):
-            reg = None
-        devices_map, ents_map, areas_map = _registry_maps(reg)
-        states = [s for s in states if not is_excluded_entity(s, devices_map, ents_map)]
-        states, hidden_switches, ambiguous_switch_groups = _drop_redundant_switches(
-            states, devices_map, ents_map)
-        if hidden_switches:
-            log.info("list_devices hidden redundant switches=%d", len(hidden_switches))
-        if ambiguous_switch_groups:
-            log.warning("list_devices ambiguous switch/light groups=%s", ambiguous_switch_groups)
-        views = [_entity_view(s, devices_map, ents_map, areas_map) for s in states]
-        if domain:
-            d = domain.strip().lower()
-            views = [v for v in views if str(v.get("entity_id", "")).startswith(d + ".")]
-        if keyword:
-            kw = keyword.strip().lower()
-            views = [
-                v for v in views
-                if kw in str(v.get("name", "")).lower()
-                or kw in str(v.get("entity_id", "")).lower()
-                or kw in str(v.get("device_name") or "").lower()
-            ]
-        if area:
-            av = area.strip().lower()
-            views = [
-                v for v in views
-                if av in str(v.get("area_name") or "").lower()
-                or av in str(v.get("area_id") or "").lower()
-            ]
-        if controllable_only:
-            views = [v for v in views if v.get("controllable")]
-
-        mode = (group_by or "entity").strip().lower()
-        if mode in ("device", "devices", "设备"):
-            items = _group_by_device(views, devices_map, areas_map)
-            grouped_by = "device"
-        elif mode in ("entity", "entities", "实体"):
-            items = views
-            grouped_by = "entity"
-        else:
-            return {"ok": False, "code": "invalid_group_by",
-                    "message": "group_by 仅支持 entity 或 device，收到：" + str(group_by) + "。entity 按实体逐条返回，device 按物理设备聚合。"}
-
-        total = len(items)
-        page = items[off:off + lim]
-        if compact:
-            page = _compact_page(page, grouped_by)
-        next_off = off + len(page)
-        has_more = next_off < total
-        if grouped_by == "device":
-            ent_total = sum(int(g.get("entity_count") or 0) for g in items)
-            msg = "共 " + str(total) + " 个设备（聚合 " + str(ent_total) + " 个实体），本次返回 " + str(len(page)) + " 个"
-        else:
-            msg = "共 " + str(total) + " 个实体，本次返回 " + str(len(page)) + " 个"
-        msg += "（还有更多，可用 offset=" + str(next_off) + " 继续）" if has_more else "。"
-        if applied_defaults:
-            notes = []
-            hints = []
-            if applied_defaults.get("controllable_only"):
-                notes.append("默认仅返回可控制设备")
-                hints.append("controllable_only=false")
-            if "limit" in applied_defaults:
-                notes.append("每页 " + str(applied_defaults["limit"]) + " 条")
-                hints.append("limit")
-            tail = "（可用 " + " 或 ".join(hints) + " 覆盖）。" if hints else "。"
-            msg = "未指定过滤条件，" + "、".join(notes) + tail + msg
-        if has_more and not has_filter:
-            msg += " 目标设备可能不在当前页，请用 keyword/area 精确过滤后再控制。"
-        if hidden_switches:
-            msg += "（已自动隐藏 " + str(len(hidden_switches)) + " 个与灯具重复的开关）"
-        return {
-            "ok": True, "grouped_by": grouped_by, "registry_available": reg is not None,
-            "area": (area.strip() if area else None),
-            "total": total, "count": len(page), "offset": off,
-            "limit": lim, "has_more": has_more,
-            "next_offset": next_off if has_more else None,
-            "applied_defaults": applied_defaults or None,
-            "deduplicated_switch_count": len(hidden_switches),
-            "ambiguous_switch_groups": ambiguous_switch_groups or None,
-            "devices": page, "message": msg,
-        }
-    except HAError as e:
-        return {"ok": False, **e.to_dict(), "hint": _hint()}
-    except Exception as e:  # noqa: BLE001 保证不崩溃
-        return {"ok": False, "code": "internal_error", "message": "查询设备列表失败：" + str(e)}
-
-
-_COMPACT_ENTITY_KEYS = ("entity_id", "name", "domain", "state", "controllable",
-                        "device_id", "device_name", "area_id", "area_name")
-
-
-def _compact_view(view: dict) -> dict:
-    return {k: view.get(k) for k in _COMPACT_ENTITY_KEYS if view.get(k) is not None}
-
-
-def _compact_page(page: list, grouped_by: str) -> list:
-    if grouped_by == "entity":
-        return [_compact_view(v) for v in page]
-    out = []
-    for group in page:
-        # _group_by_device 的组名字段是 name；兼容读取，避免 compact 模式丢设备名。
-        item = {k: group.get(k) for k in
-                ("device_id", "device_name", "area_id", "area_name", "entity_count")
-                if group.get(k) is not None}
-        if "device_name" not in item and group.get("name"):
-            item["device_name"] = group["name"]
-        item["entities"] = [_compact_view(e) for e in (group.get("entities") or [])]
-        out.append(item)
-    return out
-
-
-# 让 list_devices 显式拒绝未知参数（否则会被 MCP SDK 静默忽略）
-_accept_extra_arguments("list_devices")
-
+    return await get_device_service().list_devices(**locals())
 
 @mcp.tool()
 @_log_tool("get_device_state")
@@ -564,41 +211,7 @@ async def get_device_state(entity: str, include_all_attributes: bool = False) ->
     实体的巨大 attributes 占用上下文；需要完整属性时传 include_all_attributes=true。
     适用场景：用户问「客厅灯现在开着吗」「卧室温度多少」「空调什么状态」。
     """
-    try:
-        include_all_attributes = _as_bool(include_all_attributes)
-        ha = get_ha()
-        st, error = await _resolve_entity_or_error(ha, entity, "查询状态")
-        if error is not None:
-            return error
-        try:
-            reg = await ha.get_registries()
-        except HAError:
-            reg = None
-        devices_map, ents_map, areas_map = _registry_maps(reg)
-        s = _entity_view(st, devices_map, ents_map, areas_map)
-        s["last_changed"] = st.get("last_changed")
-        s["last_updated"] = st.get("last_updated")
-        all_attrs = st.get("attributes")
-        if not isinstance(all_attrs, dict):
-            all_attrs = {}
-        if include_all_attributes:
-            attrs, truncated = all_attrs, False
-        else:
-            attrs, truncated = _brief_attributes(all_attrs)
-        s["attributes"] = attrs
-        s["attributes_truncated"] = truncated
-        s["attribute_count"] = len(all_attrs)
-        msg = s["name"] + " 当前状态：" + str(s["state"])
-        if s.get("unit"):
-            msg += " " + str(s["unit"])
-        if truncated:
-            msg += "（默认仅关键属性；完整属性请传 include_all_attributes=true）"
-        return {"ok": True, "entity": s, "message": msg}
-    except HAError as e:
-        return {"ok": False, **e.to_dict(), "hint": _hint()}
-    except Exception as e:  # noqa: BLE001
-        return {"ok": False, "code": "internal_error", "message": "查询设备状态失败：" + str(e)}
-
+    return await get_device_service().get_device_state(**locals())
 
 @mcp.tool()
 @_log_tool("control_device")
@@ -631,52 +244,7 @@ async def control_device(entity: str, action: str, value: Optional[Any] = None,
     适用场景：「把客厅灯亮度调到 50」「关掉风扇」「空调设到 26 度」「电视音量 30」。
     设备名称能直接匹配时不需要先调 list_devices；只有名称不明确或设备不存在时才先查询。
     """
-    try:
-        ha = get_ha()
-        st, error = await _resolve_entity_or_error(ha, entity, "控制")
-        if error is not None:
-            return error
-        eid = str(st.get("entity_id"))
-        domain = _domain_of(eid)
-        info = _controllability(eid, st.get("state"))
-        if not info["controllable"]:
-            return {
-                "ok": False, "code": "not_controllable",
-                "message": "『" + _friendly_name(st) + "』（" + domain + "）不可控制：" + info["controllable_reason"] + "。",
-                "entity_id": eid, "domain": domain, "actions": info["actions"],
-            }
-        action_name = (action or "").strip().lower()
-        allowed = info.get("actions") or []
-        if action_name not in allowed:
-            return {
-                "ok": False, "code": "unsupported_action",
-                "message": "『" + _friendly_name(st) + "』（" + domain + "）不支持动作：" + str(action) +
-                           "。该类型可用动作：" + ", ".join(allowed) +
-                           "。如需调用其它服务，请先用 list_services 查询，再用 call_service 调用。",
-                "entity_id": eid, "domain": domain, "actions": allowed,
-                "hint": "control_device 只做常用动作封装；任意 HA 服务请用 call_service。",
-            }
-        sd, svc, extra = build_service(action_name, domain, value)
-        payload = {"entity_id": eid}
-        payload.update(extra)
-        guard = _danger_block(st, sd, svc, payload, confirm_token)
-        if guard is not None:
-            return guard
-        result = await _apply_and_confirm(ha, st, sd, svc, payload, action_name)
-        result["ok"] = True
-        # 注意：xiaozhi MCP 接入点把结果里的 action 当作 Action 枚举名解析；
-        # turn_off / turn_on 不是合法枚举，会被转成 Action.ERROR 并把 "turn_off" 直接 TTS。
-        # 因此设备动作放在 device_action，成功时用 action=RESPONSE + 中文 response 让助手直接播报，
-        # 省掉一次 LLM 往返；确认/错误分支不返回 action，仍交给 LLM 处理。
-        result["device_action"] = action_name
-        result["action"] = "RESPONSE"
-        result["response"] = result.get("voice") or result.get("message") or "操作已完成。"
-        return result
-    except HAError as e:
-        return {"ok": False, **e.to_dict(), "hint": "可先用 list_devices / get_device_state 确认设备与能力后重试。"}
-    except Exception as e:  # noqa: BLE001
-        return {"ok": False, "code": "internal_error", "message": "控制设备失败：" + str(e)}
-
+    return await get_device_service().control_device(**locals())
 
 @mcp.tool()
 @_log_tool("control_devices")
@@ -689,106 +257,7 @@ async def control_devices(entities: list[str], action: str, value: Optional[Any]
     任一目标属于危险设备或本次服务高风险时，整批只申请一次 confirm_token；
     用户确认后带同一 token 重试整批即可。单次最多 20 个设备。
     """
-    try:
-        ha = get_ha()
-        action_name = (action or "").strip().lower()
-        refs = [str(x).strip() for x in (entities or []) if str(x).strip()]
-        if not refs:
-            return {"ok": False, "code": "invalid_argument", "message": "entities 不能为空，请提供至少一个设备名称或 entity_id。"}
-        if len(refs) > 20:
-            return {"ok": False, "code": "invalid_argument", "message": "单次最多批量控制 20 个设备，收到 " + str(len(refs)) + " 个。"}
-
-        resolved: list = []
-        errors: list = []
-        seen: set[str] = set()
-        for ref in refs:
-            st, error = await _resolve_entity_or_error(ha, ref, "控制")
-            if error is not None:
-                errors.append({"entity": ref, "error": error})
-                continue
-            eid = str(st.get("entity_id"))
-            if not eid or eid in seen:
-                continue
-            seen.add(eid)
-            domain = _domain_of(eid)
-            info = _controllability(eid, st.get("state"))
-            if not info["controllable"]:
-                errors.append({"entity": ref, "entity_id": eid, "code": "not_controllable",
-                               "message": "『" + _friendly_name(st) + "』不可控制：" + info["controllable_reason"]})
-                continue
-            allowed = info.get("actions") or []
-            if action_name not in allowed:
-                errors.append({"entity": ref, "entity_id": eid, "code": "unsupported_action",
-                               "message": "『" + _friendly_name(st) + "』不支持动作 " + action_name})
-                continue
-            try:
-                sd, svc, extra = build_service(action_name, domain, value)
-            except HAError as exc:
-                errors.append({"entity": ref, "entity_id": eid, "code": exc.code,
-                               "message": _friendly_name(st) + " 动作参数无效：" + exc.message})
-                continue
-            payload = {"entity_id": eid}
-            payload.update(extra)
-            resolved.append({"st": st, "entity_id": eid, "domain": domain,
-                             "service_domain": sd, "service": svc,
-                             "extra": extra, "payload": payload})
-
-        if not resolved:
-            return {"ok": False, "code": "no_valid_entities",
-                    "message": "没有可执行的目标设备。", "errors": errors or None}
-
-        rep = None
-        for op in resolved:
-            dangerous, _reason = _danger_flags(op["entity_id"], op["st"].get("attributes") or {})
-            if not dangerous:
-                dangerous, _reason = _service_is_dangerous(op["service_domain"], op["service"])
-            if dangerous:
-                rep = op
-                break
-        if rep is not None:
-            combined = [{"entity_id": op["entity_id"],
-                         "service": op["service_domain"] + "." + op["service"],
-                         "data": op["extra"]} for op in resolved]
-            guard_payload = {"entity_id": [op["entity_id"] for op in resolved], "batch": combined}
-            guard = _danger_block(rep["st"], rep["service_domain"], rep["service"],
-                                  guard_payload, confirm_token)
-            if guard is not None:
-                guard["entities"] = [op["entity_id"] for op in resolved]
-                return guard
-
-        tasks = [_apply_and_confirm(ha, op["st"], op["service_domain"], op["service"],
-                                    op["payload"], action_name) for op in resolved]
-        raw_results = await asyncio.gather(*tasks, return_exceptions=True)
-        per: list = []
-        voices: list = []
-        for op, result in zip(resolved, raw_results, strict=True):
-            if isinstance(result, Exception):
-                per.append({"ok": False, "entity_id": op["entity_id"], "code": "internal_error",
-                            "message": str(result)})
-                continue
-            result["ok"] = True
-            result["device_action"] = action_name
-            result["action"] = "RESPONSE"
-            result["response"] = result.get("voice") or result.get("message") or "操作已完成。"
-            per.append(result)
-            voices.append(str(result["response"]))
-
-        ok = any(item.get("ok") for item in per)
-        out = {"ok": ok, "count": len(per), "action": "RESPONSE" if voices else None,
-               "response": "；".join(voices) if voices else "批量控制未执行。",
-               "results": per}
-        if errors:
-            out["errors"] = errors
-            out["message"] = "部分设备未执行：" + "；".join(str(e.get("message") or e.get("entity")) for e in errors)
-            if voices:
-                # 直出播报必须把未执行数量说出来，避免只播成功项造成“全部成功”的错觉。
-                out["response"] = out["response"] + "；另有 " + str(len(errors)) + " 个设备未执行。"
-        return out
-    except HAError as e:
-        return {"ok": False, **e.to_dict(), "hint": _hint()}
-    except Exception as e:  # noqa: BLE001
-        return {"ok": False, "code": "internal_error", "message": "批量控制失败：" + str(e)}
-
+    return await get_device_service().control_devices(**locals())
 
 @mcp.tool()
 @_log_tool("list_services")
@@ -808,86 +277,7 @@ async def list_services(entity: Optional[str] = None, domain: Optional[str] = No
 
     适用场景：「空调能做什么操作」「灯支持调色温吗」「这个设备有哪些可控项」。
     """
-    try:
-        ha = get_ha()
-        catalog = await ha.get_services()
-        target = None
-        if entity:
-            st, error = await _resolve_entity_or_error(ha, entity, "查询能力")
-            if error is not None:
-                return error
-            target = _domain_of(str(st.get("entity_id")))
-        elif domain:
-            target = domain.strip().lower()
-
-        if target and target in EXCLUDED_DOMAINS:
-            return {"ok": False, "code": "no_services",
-                    "message": "设备类型『" + str(target) + "』不在本 MCP 服务开放范围内。"}
-
-        kw = (keyword or "").strip().lower()
-        detailed = _as_bool(detailed, default=bool(target))
-
-        def match(svc_name: str, svc_def: Any) -> bool:
-            if not kw:
-                return True
-            if not isinstance(svc_def, dict):
-                svc_def = {}
-            text = (svc_name + " " + str(svc_def.get("description", "")) + " " +
-                    str(svc_def.get("name", ""))).lower()
-            return kw in text
-
-        domains_out = []
-        service_total = 0
-        for entry in catalog:
-            if not isinstance(entry, dict):
-                continue
-            d = str(entry.get("domain", ""))
-            if not d or d in EXCLUDED_DOMAINS:
-                continue
-            if target and d != target:
-                continue
-            services = entry.get("services") or {}
-            if not isinstance(services, dict):
-                continue
-            svc_list = []
-            for sname, sdef in services.items():
-                if not match(sname, sdef):
-                    continue
-                item = {"service": sname}
-                if isinstance(sdef, dict):
-                    if sdef.get("name"):
-                        item["name"] = sdef["name"]
-                    if sdef.get("description"):
-                        item["description"] = sdef["description"]
-                    if detailed:
-                        fields = sdef.get("fields") or {}
-                        if isinstance(fields, dict) and fields:
-                            item["fields"] = [_field_brief(fn, fd) for fn, fd in fields.items()]
-                svc_list.append(item)
-            if svc_list:
-                svc_list.sort(key=lambda x: x["service"])
-                service_total += len(svc_list)
-                domains_out.append({
-                    "domain": d,
-                    "service_count": len(svc_list),
-                    "services": svc_list if detailed else [x["service"] for x in svc_list],
-                })
-
-        if target and not domains_out:
-            return {"ok": False, "code": "no_services",
-                    "message": "没有找到 domain=『" + str(target) + "』的服务（或该设备类型无可用服务）。"}
-        domains_out.sort(key=lambda x: x["domain"])
-        if target:
-            msg = "domain=「" + str(target) + "」共 " + str(service_total) + " 个服务。"
-        else:
-            msg = "共 " + str(len(domains_out)) + " 个 domain、" + str(service_total) + " 个服务。"
-        return {"ok": True, "domain": target, "domain_count": len(domains_out),
-                "service_count": service_total, "domains": domains_out, "message": msg}
-    except HAError as e:
-        return {"ok": False, **e.to_dict(), "hint": _hint()}
-    except Exception as e:  # noqa: BLE001
-        return {"ok": False, "code": "internal_error", "message": "查询服务列表失败：" + str(e)}
-
+    return await get_device_service().list_services(**locals())
 
 @mcp.tool()
 @_log_tool("call_service")
@@ -911,66 +301,7 @@ async def call_service(entity: str, service: str, data: Optional[dict] = None,
       status=accepted_pending HA 返回 null（新版 HA），回读窗口内仍未完全匹配预期
     适用场景：「把空调设成制热模式」「灯切成暖光」「设置风扇风速」「执行自定义脚本」。
     """
-    try:
-        ha = get_ha()
-        st, error = await _resolve_entity_or_error(ha, entity, "调用服务")
-        if error is not None:
-            return error
-        eid = str(st.get("entity_id"))
-        spec = (service or "").strip()
-        if not spec:
-            return {"ok": False, "code": "invalid_service", "message": "service 不能为空。"}
-        if "." in spec:
-            service_domain, svc = spec.split(".", 1)
-            service_domain = service_domain.strip()
-            svc = svc.strip()
-        else:
-            service_domain = _domain_of(eid)
-            svc = spec
-        if not service_domain or not svc:
-            return {"ok": False, "code": "invalid_service",
-                    "message": "服务名格式应为 'service' 或 'domain.service'，收到：" + str(service)}
-        if data is None:
-            extra = {}
-        elif isinstance(data, dict):
-            extra = dict(data)
-        else:
-            return {"ok": False, "code": "invalid_data",
-                    "message": "data 必须是 JSON 对象（键值对），收到：" + str(type(data).__name__)}
-        # 目标选择器只允许来自 entity 参数。否则调用方可在 data 里用 target/device_id
-        # 等字段把服务作用到门锁、车库门等另一批实体，绕过 _danger_block 的主实体判定。
-        blocked_keys = sorted(set(extra) & _TARGET_SELECTOR_KEYS)
-        if blocked_keys:
-            return {"ok": False, "code": "invalid_data",
-                    "message": "data 不应包含目标选择器 " + "、".join(blocked_keys)
-                    + "；目标实体只能由 entity 参数指定，避免绕过危险操作校验。"}
-        payload = {"entity_id": eid}
-        payload.update(extra)
-        guard = _danger_block(st, service_domain, svc, payload, confirm_token)
-        if guard is not None:
-            return guard
-        result = await _apply_and_confirm(ha, st, service_domain, svc, payload, spec)
-        result["ok"] = True
-        result["device_action"] = svc
-        direct = (service_domain in DOMAIN_ACTIONS
-                  and service_domain not in ("script", "scene", "automation")
-                  and svc in DIRECT_RESPONSE_SERVICES) or (
-            service_domain == "homeassistant" and svc == "toggle")
-        if direct:
-            result["action"] = "RESPONSE"
-            result["response"] = result.get("voice") or result.get("message") or "操作已完成。"
-        return result
-    except HAError as e:
-        out = {"ok": False, **e.to_dict()}
-        if e.code in ("not_found", "http_error", "upstream_error", "invalid_data", "invalid_value"):
-            out["hint"] = ("该服务可能不存在或参数不匹配。可先用 list_services(domain=…) 查询支持的服"
-                           "务与字段，再核对 data 参数名。")
-        else:
-            out["hint"] = _hint()
-        return out
-    except Exception as e:  # noqa: BLE001
-        return {"ok": False, "code": "internal_error", "message": "调用服务失败：" + str(e)}
-
+    return await get_device_service().call_service(**locals())
 
 @mcp.tool()
 @_log_tool("list_domains")
@@ -981,56 +312,7 @@ async def list_domains() -> dict:
     同时返回危险设备明细（含 garage/door 类 cover），便于确认哪些操作需要二次确认。
     适用场景：用户问「家里都有哪些类型的设备」「哪些设备操作要确认」。
     """
-    try:
-        ha = get_ha()
-        states, reg = await asyncio.gather(ha.get_states(), ha.get_registries(), return_exceptions=True)
-        if isinstance(states, BaseException):
-            raise states
-        if isinstance(reg, asyncio.CancelledError):
-            raise reg
-        if isinstance(reg, BaseException):
-            reg = None
-        devices_map, ents_map, _ = _registry_maps(reg)
-        states = [s for s in states if not is_excluded_entity(s, devices_map, ents_map)]
-        states, hidden_switches, _ = _drop_redundant_switches(states, devices_map, ents_map)
-        counts: dict = {}
-        dangerous_entities: list = []
-        for s in states:
-            eid = str(s.get("entity_id", ""))
-            d = _domain_of(eid)
-            if d:
-                counts[d] = counts.get(d, 0) + 1
-            is_danger, reason = _danger_flags(eid, s.get("attributes") or {})
-            if is_danger:
-                dangerous_entities.append({
-                    "entity_id": eid,
-                    "name": _friendly_name(s),
-                    "domain": d,
-                    "state": s.get("state"),
-                    "reason": reason,
-                })
-        counts = dict(sorted(counts.items(), key=lambda kv: -kv[1]))
-        ctrl = [d for d in counts if DOMAIN_ACTIONS.get(d)]
-        danger = sorted({str(e.get("domain") or "") for e in dangerous_entities if e.get("domain")})
-        msg = "共 " + str(len(counts)) + " 种设备类型：" + ", ".join(k + "(" + str(v) + ")" for k, v in counts.items())
-        if ctrl:
-            msg += "；可控类型：" + ", ".join(ctrl)
-        if danger:
-            msg += "；需二次确认的危险类型：" + ", ".join(danger)
-        if dangerous_entities:
-            msg += "（共 " + str(len(dangerous_entities)) + " 个危险实体）"
-        if hidden_switches:
-            msg += "；已自动隐藏 " + str(len(hidden_switches)) + " 个与灯具重复的开关"
-        return {"ok": True, "domains": counts, "controllable_domains": ctrl,
-                "dangerous_domains": danger,
-                "dangerous_entities": dangerous_entities[:50],
-                "dangerous_entity_count": len(dangerous_entities),
-                "deduplicated_switch_count": len(hidden_switches),
-                "message": msg}
-    except HAError as e:
-        return {"ok": False, **e.to_dict(), "hint": _hint()}
-    except Exception as e:  # noqa: BLE001
-        return {"ok": False, "code": "internal_error", "message": "查询设备类型失败：" + str(e)}
+    return await get_device_service().list_domains(**locals())
 
 
 def main() -> None:
@@ -1045,12 +327,8 @@ def main() -> None:
         log.error("HA 客户端初始化失败，拒绝启动：%s", e)
         raise SystemExit(2) from e
     log.info(
-        "HA config url=%s token=set timeout=%ss verify_ssl=%s ws_enabled=%s ws_url=%s",
-        _safe_url(ha.base_url),
-        ha.timeout,
-        ha.verify_ssl,
-        ha.ws_enabled,
-        _safe_url(ha.ws_url),
+        "startup HA base_url=%s ws_url=%s verify_ssl=%s",
+        _safe_url(ha.base_url), _safe_url(ha.ws_url), ha.verify_ssl,
     )
     mcp.run(transport="stdio")
 

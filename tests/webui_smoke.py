@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""WebUI 冒烟测试：无独立密码、状态、配置掩码、工具白名单，不需要真实 HA。
+"""WebUI 冒烟测试：WEBUI_TOKEN 登录、状态、配置掩码、工具白名单，不需要真实 HA。
 
 用法：python tests/webui_smoke.py
 HA_URL/HA_TOKEN 若已导出则顺带验证真实工具调用，否则只验证未配置分支。
@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from fastapi.testclient import TestClient  # noqa: E402
 
 from homeassistant_xiaozhiserver import __version__  # noqa: E402
+from homeassistant_xiaozhiserver.config import WEBUI_TOKEN  # noqa: E402
 from homeassistant_xiaozhiserver.webui import _TOOLS, _mask_endpoint, create_app  # noqa: E402
 
 client = TestClient(create_app(), base_url="http://127.0.0.1:8099")
@@ -34,6 +35,22 @@ def check(name: str, cond: bool, extra: str = "") -> None:
         print("[FAIL] " + name + ("" if not extra else " -> " + extra))
         sys.exit(1)
 
+
+anon = TestClient(create_app(), base_url="http://127.0.0.1:8099")
+r = anon.get("/api/status")
+check("未登录访问 API 返回 401", r.status_code == 401 and r.json().get("code") == "unauthorized",
+      str(r.status_code) + " " + r.text[:200])
+r = anon.get("/", follow_redirects=False)
+check("未登录访问首页跳转登录页", r.status_code in (302, 303, 307) and "/login" in r.headers.get("location", ""),
+      str(r.status_code) + " " + str(r.headers.get("location")))
+r = anon.get("/metrics")
+check("未登录可访问 /metrics", r.status_code == 200 and r.headers.get("content-type", "").startswith("text/plain"),
+      str(r.status_code) + " " + r.headers.get("content-type", ""))
+
+r = post("/login", data={"token": "bad-token"})
+check("错误令牌登录失败", r.status_code == 401 and "不正确" in r.text, str(r.status_code))
+r = post("/login", data={"token": WEBUI_TOKEN})
+check("正确令牌登录成功", r.status_code in (200, 303), str(r.status_code))
 
 r = client.get("/")
 check("无需登录访问首页 200", r.status_code == 200, str(r.status_code))

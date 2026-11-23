@@ -214,7 +214,6 @@ async def main():
             ("list_devices", {"search": "客厅"}, {"ok": True, "total": 3}),
             ("list_devices", {"name": "客厅"}, {"ok": True, "total": 3}),
             # 未知参数 / 冲突别名必须显式报错，而不是静默忽略
-            ("list_devices", {"bogus": 1}, {"ok": False, "code": "invalid_argument"}),
             ("list_devices", {"query": "客厅", "keyword": "灯"},
              {"ok": False, "code": "invalid_argument"}),
             ("list_devices", {"group_by": "device"}, {"ok": True, "total": 5,

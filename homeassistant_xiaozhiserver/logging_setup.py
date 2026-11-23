@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
-"""统一日志配置：带 call_id 的文本日志，并写入共享文件供 WebUI 查看。
+"""统一日志配置：分进程文件、可选 JSON 结构化输出，WebUI 可读取全部日志文件。
 
-为什么需要文件日志：
-- WebUI 与 MCP bridge 是同一容器内的两个进程；
-- 仅用 stderr 时，WebUI 只能看到自己的内存日志，看不到 bridge 与 MCP server 的日志；
-- 两个进程都把日志追加到同一个文件，WebUI 读取文件尾部即可看到完整服务日志。
+- WebUI 与 MCP bridge 是两个进程，各自写自己的文件，避免同一 RotatingFileHandler 轮转竞争；
+- 设置 LOG_SPLIT=false 可退回两进程共用一个文件（保留旧行为）；
+- read_recent_logs 读取所有日志文件尾部，按时间排序后返回。
 """
 from __future__ import annotations
 
 import contextvars
+import json
 import logging
 import os
 import re
@@ -17,7 +17,7 @@ import tempfile
 from logging.handlers import RotatingFileHandler, WatchedFileHandler
 
 from . import __version__
-from .config import LOG_BACKUP_COUNT, LOG_FILE, LOG_LEVEL, LOG_MAX_BYTES
+from .settings import settings
 
 _CALL_ID = contextvars.ContextVar("call_id", default="-")
 _VERSION_LOGGED = False
@@ -38,58 +38,71 @@ class _VersionFilter(logging.Filter):
         return True
 
 
-def log_file_path() -> str:
-    """返回共享日志文件路径；LOG_FILE 为空时使用系统临时目录。"""
-    return LOG_FILE or os.path.join(tempfile.gettempdir(), "homeassistant-xiaozhiserver.log")
+class _JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "time": self.formatTime(record, "%Y-%m-%d %H:%M:%S"),
+            "level": record.levelname,
+            "version": getattr(record, "version", __version__),
+            "logger": record.name,
+            "call_id": getattr(record, "call_id", "-"),
+            "message": record.getMessage(),
+        }
+        if record.exc_info:
+            payload["exc_info"] = self.formatException(record.exc_info)
+        return json.dumps(payload, ensure_ascii=False)
+
+
+def log_file_path(role: str | None = None) -> str:
+    """返回本进程（或指定角色）日志文件路径。"""
+    return settings.log_file_for(role)
+
+
+def log_files() -> tuple[str, ...]:
+    return settings.log_files
 
 
 def _formatter() -> logging.Formatter:
+    if settings.log_format == "json":
+        return _JsonFormatter()
     return logging.Formatter(
         "%(asctime)s %(levelname)-5s v%(version)s %(name)s [%(call_id)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
 
-def setup_logging() -> None:
-    """安装一次根 logger handler；重复调用只更新级别。"""
-    level_name = (LOG_LEVEL or "INFO").upper()
-    level = getattr(logging, level_name, logging.INFO)
+def setup_logging(role: str | None = None) -> None:
+    """安装根 logger handler；不同进程写不同文件，重复调用只补缺失的 handler。"""
+    level = getattr(logging, settings.log_level.upper(), logging.INFO)
     root = logging.getLogger()
     root.setLevel(level)
     for name in ("httpx", "httpx2", "httpcore"):
         logging.getLogger(name).setLevel(max(level, logging.WARNING))
 
     if not any(getattr(h, "_homeassistant_xiaozhiserver", False) for h in root.handlers):
-        handler = logging.StreamHandler(sys.stderr)
-        handler.setFormatter(_formatter())
-        handler.addFilter(_CallIdFilter())
-        handler.addFilter(_VersionFilter())
-        handler._homeassistant_xiaozhiserver = True  # type: ignore[attr-defined]
-        root.addHandler(handler)
+        stream = logging.StreamHandler(sys.stderr)
+        stream.setFormatter(_formatter())
+        stream.addFilter(_CallIdFilter())
+        stream.addFilter(_VersionFilter())
+        stream._homeassistant_xiaozhiserver = True  # type: ignore[attr-defined]
+        root.addHandler(stream)
 
     if not any(getattr(h, "_homeassistant_xiaozhiserver_file", False) for h in root.handlers):
-        path = log_file_path()
+        path = log_file_path(role)
         try:
             parent = os.path.dirname(path)
             if parent:
                 os.makedirs(parent, exist_ok=True)
-            if LOG_MAX_BYTES > 0:
-                # 两个进程共享同一文件；轮转以单进程为主，极端并发下可能竞争，
-                # 因此优先在容器外使用 logrotate，或保持默认较小上限。
+            if settings.log_max_bytes > 0:
                 handler = RotatingFileHandler(
                     path,
-                    maxBytes=LOG_MAX_BYTES,
-                    backupCount=LOG_BACKUP_COUNT,
+                    maxBytes=settings.log_max_bytes,
+                    backupCount=settings.log_backup_count,
                     encoding="utf-8",
                     delay=True,
                 )
             else:
-                handler = WatchedFileHandler(
-                    path,
-                    encoding="utf-8",
-                    errors="replace",
-                    delay=True,
-                )
+                handler = WatchedFileHandler(path, encoding="utf-8", errors="replace", delay=True)
         except OSError as exc:
             logging.getLogger("homeassistant_xiaozhiserver.logging").warning(
                 "无法创建日志文件 %s：%s", path, exc
@@ -103,26 +116,13 @@ def setup_logging() -> None:
 
     global _VERSION_LOGGED
     if not _VERSION_LOGGED:
-        logging.getLogger("homeassistant_xiaozhiserver").info("version=%s", __version__)
+        logging.getLogger("homeassistant_xiaozhiserver").info(
+            "version=%s role=%s", __version__, role or os.environ.get("LOG_ROLE", "bridge")
+        )
         _VERSION_LOGGED = True
 
 
-def read_recent_logs(limit: int = 200, level: str | None = None) -> list[dict[str, str]]:
-    """读取共享日志文件尾部，按行解析为结构化记录。
-
-    多行异常堆栈会合并到上一条记录；无法解析的行直接跳过。
-    """
-    try:
-        limit = max(1, min(int(limit), 1000))
-    except (TypeError, ValueError):
-        limit = 200
-    wanted = (level or "").strip().upper()
-    if wanted == "ALL":
-        wanted = ""
-
-    path = log_file_path()
-    # 只读文件尾部固定窗口：日志无限增长时也不会把整个文件读进内存。
-    max_bytes = 256 * 1024
+def _tail(path: str, max_bytes: int = 256 * 1024) -> list[str]:
     try:
         with open(path, "rb") as fh:
             fh.seek(0, os.SEEK_END)
@@ -135,27 +135,61 @@ def read_recent_logs(limit: int = 200, level: str | None = None) -> list[dict[st
     text = raw.decode("utf-8", errors="replace")
     lines = text.splitlines()
     if start > 0 and lines:
-        lines = lines[1:]  # 丢掉被截断的第一行
+        lines = lines[1:]
     if lines and not raw.endswith(b"\n"):
-        lines = lines[:-1]  # 正在写入的半行不参与解析
+        lines = lines[:-1]
+    return lines
+
+
+def _parse_line(line: str) -> dict[str, str] | None:
+    if line.startswith("{"):
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(obj, dict):
+            return None
+        return {
+            "time": str(obj.get("time", "")),
+            "level": str(obj.get("level", "")).upper(),
+            "version": str(obj.get("version", "")),
+            "logger": str(obj.get("logger", "")),
+            "call_id": str(obj.get("call_id", "-")),
+            "message": str(obj.get("message", "")),
+        }
+    match = _LINE_RE.match(line)
+    if not match:
+        return None
+    return {
+        "time": match.group(1),
+        "level": match.group(2).upper(),
+        "version": match.group(3) or "",
+        "logger": match.group(4),
+        "call_id": match.group(5),
+        "message": match.group(6),
+    }
+
+
+def read_recent_logs(limit: int = 200, level: str | None = None) -> list[dict[str, str]]:
+    """读取全部日志文件尾部，合并后按时间返回最后 limit 条。"""
+    try:
+        limit = max(1, min(int(limit), 1000))
+    except (TypeError, ValueError):
+        limit = 200
+    wanted = (level or "").strip().upper()
+    if wanted == "ALL":
+        wanted = ""
 
     entries: list[dict[str, str]] = []
-    # 窗口最多 256KB，逐行解析全部内容，避免 level 过滤前先截断导致凑不满 limit。
-    for raw_line in lines:
-        line = raw_line.rstrip("\r\n")
-        match = _LINE_RE.match(line)
-        if match:
-            entries.append({
-                "time": match.group(1),
-                "level": match.group(2).upper(),
-                "version": match.group(3) or "",
-                "logger": match.group(4),
-                "call_id": match.group(5),
-                "message": match.group(6),
-            })
-        elif entries and line:
-            entries[-1]["message"] += "\n" + line
-
+    for path in log_files():
+        for raw_line in _tail(path):
+            line = raw_line.rstrip("\r\n")
+            parsed = _parse_line(line)
+            if parsed:
+                entries.append(parsed)
+            elif entries and line and not line.startswith("{"):
+                entries[-1]["message"] += "\n" + line
+    entries.sort(key=lambda item: item.get("time", ""))
     if wanted:
         entries = [e for e in entries if e["level"] == wanted]
     return entries[-limit:]

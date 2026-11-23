@@ -93,5 +93,8 @@ echo "===== state cache unit ====="
 echo "===== confirm window unit ====="
 "$PY" tests/confirm_window.py
 
+echo "===== env consistency ====="
+"$PY" tests/env_consistency.py
+
 echo "===== webui smoke ====="
 "$PY" tests/webui_smoke.py

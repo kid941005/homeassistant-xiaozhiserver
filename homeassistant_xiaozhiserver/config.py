@@ -1,144 +1,48 @@
 # -*- coding: utf-8 -*-
-"""集中解析环境变量与运行常量。
+"""兼容导出层：所有常量都由 settings.Settings 统一解析。
 
-设计目标：
-- 所有环境变量只在这里解析，避免 server.py / client.py 各自实现一套。
-- 非法数值不直接让进程在 import 阶段崩溃：记录 warning 并回退默认值/边界值。
-- 布尔值统一支持 1/true/yes/on/y 与 0/false/no/off/n；无法识别的值记录 warning 并回退默认值。
+保留本模块是为了不破坏已有 import（server/client/service/danger/views/webui 等）。
+新增代码应直接使用 settings；这里仅做只读转发。
 """
 from __future__ import annotations
 
-import logging
-import math
-import os
+from .settings import env_bool, env_float, env_int, env_set, env_str, settings
 
-log = logging.getLogger("homeassistant-xiaozhiserver.config")
+LOG_LEVEL = settings.log_level
+LOG_FILE = settings.log_file
+LOG_FILE_WEBUI = settings.log_file_webui
+LOG_FILE_BRIDGE = settings.log_file_bridge
+LOG_SPLIT = settings.log_split
+LOG_FORMAT = settings.log_format
+LOG_MAX_BYTES = settings.log_max_bytes
+LOG_BACKUP_COUNT = settings.log_backup_count
 
-_TRUE = ("1", "true", "yes", "on", "y")
-_FALSE = ("0", "false", "no", "off", "n")
+DEFAULT_LIST_LIMIT = settings.default_list_limit
+MAX_LIST_LIMIT = settings.max_list_limit
+EXCLUDED_DOMAINS = set(settings.excluded_domains)
+EXCLUDED_DEVICE_KEYWORDS = set(settings.excluded_device_keywords)
 
+SERVICE_CONFIRM_DELAY = settings.service_confirm_delay
+SERVICE_CONFIRM_RETRIES = settings.service_confirm_retries
+SERVICE_CONFIRM_INTERVAL = settings.service_confirm_interval
+SERVICE_CONFIRM_TIMEOUT = settings.service_confirm_timeout
 
-def env_str(name: str, default: str) -> str:
-    raw = os.environ.get(name)
-    if raw is None or raw.strip() == "":
-        return default
-    return raw.strip()
+HA_STATE_WS_ENABLED = settings.ha_state_ws_enabled
+HA_STATE_CACHE_TTL = settings.ha_state_cache_ttl
+HA_SERVICES_CACHE_TTL = settings.ha_services_cache_ttl
+HA_STATE_WS_MAX_FAILURES = settings.ha_state_ws_max_failures
 
+DANGER_CONFIRM_ENABLED = settings.danger_confirm_enabled
+DANGER_CONFIRM_TTL = settings.danger_confirm_ttl
+DANGEROUS_DOMAINS = set(settings.dangerous_domains)
+DANGEROUS_COVER_CLASSES = set(settings.dangerous_cover_classes)
+DANGEROUS_SERVICE_DOMAINS = set(settings.dangerous_service_domains)
 
-def env_bool(name: str, default: bool) -> bool:
-    raw = os.environ.get(name)
-    if raw is None or raw.strip() == "":
-        return default
-    value = raw.strip().lower()
-    if value in _TRUE:
-        return True
-    if value in _FALSE:
-        return False
-    log.warning("环境变量 %s=%r 不是布尔值，使用默认值 %s", name, raw, default)
-    return default
-
-
-def env_int(name: str, default: int, minimum: int | None = None,
-            maximum: int | None = None) -> int:
-    raw = os.environ.get(name)
-    if raw is None or raw.strip() == "":
-        return default
-    try:
-        value = int(raw.strip())
-    except (TypeError, ValueError):
-        log.warning("环境变量 %s=%r 不是整数，使用默认值 %s", name, raw, default)
-        return default
-    if minimum is not None and value < minimum:
-        log.warning("环境变量 %s=%s 小于最小值 %s，按 %s 使用", name, value, minimum, minimum)
-        value = minimum
-    if maximum is not None and value > maximum:
-        log.warning("环境变量 %s=%s 大于最大值 %s，按 %s 使用", name, value, maximum, maximum)
-        value = maximum
-    return value
-
-
-def env_float(name: str, default: float, minimum: float | None = None,
-              maximum: float | None = None) -> float:
-    raw = os.environ.get(name)
-    if raw is None or raw.strip() == "":
-        return default
-    try:
-        value = float(raw.strip())
-    except (TypeError, ValueError):
-        log.warning("环境变量 %s=%r 不是数字，使用默认值 %s", name, raw, default)
-        return default
-    if not math.isfinite(value):
-        log.warning("环境变量 %s=%r 不是有限数字，使用默认值 %s", name, raw, default)
-        return default
-    if minimum is not None and value < minimum:
-        log.warning("环境变量 %s=%s 小于最小值 %s，按 %s 使用", name, value, minimum, minimum)
-        value = minimum
-    if maximum is not None and value > maximum:
-        log.warning("环境变量 %s=%s 大于最大值 %s，按 %s 使用", name, value, maximum, maximum)
-        value = maximum
-    return value
-
-
-def env_set(name: str, default: str) -> set[str]:
-    raw = os.environ.get(name)
-    if raw is None:
-        raw = default
-    return {x.strip().lower() for x in raw.split(",") if x.strip()}
-
-
-# 日志（服务固定 stdio，不解析 HTTP 监听参数）
-LOG_LEVEL = env_str("LOG_LEVEL", "INFO").upper()
-if LOG_LEVEL not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
-    log.warning("环境变量 LOG_LEVEL=%r 非法，使用 INFO", LOG_LEVEL)
-    LOG_LEVEL = "INFO"
-
-# 共享日志文件（WebUI 与 bridge 两个进程都写入，WebUI 读取尾部展示）
-# 留空时使用系统临时目录，通常不需要设置。
-LOG_FILE = env_str("LOG_FILE", "")
-# 文件日志轮转：单个文件上限与保留份数；设为 0 关闭轮转。
-LOG_MAX_BYTES = env_int("LOG_MAX_BYTES", 5 * 1024 * 1024, 0, 1024 * 1024 * 1024)
-LOG_BACKUP_COUNT = env_int("LOG_BACKUP_COUNT", 3, 0, 50)
-
-# 设备列表
-DEFAULT_LIST_LIMIT = env_int("DEFAULT_LIST_LIMIT", 50, 1, 10000)
-MAX_LIST_LIMIT = env_int("MAX_LIST_LIMIT", 500, 1, 10000)
-if DEFAULT_LIST_LIMIT > MAX_LIST_LIMIT:
-    log.warning("DEFAULT_LIST_LIMIT=%s 大于 MAX_LIST_LIMIT=%s，按上限使用", DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT)
-    DEFAULT_LIST_LIMIT = MAX_LIST_LIMIT
-
-# 不向 MCP 暴露的设备类型/设备名称关键字（默认隐藏：门铃、自动化、热水壶、中枢网关、媒体）
-# 设备名称关键字会同时匹配实体名、entity_id 与设备注册表名称。
-EXCLUDED_DOMAINS = env_set("EXCLUDED_DOMAINS", "automation,media_player")
-EXCLUDED_DEVICE_KEYWORDS = env_set("EXCLUDED_DEVICE_KEYWORDS", "门铃,水壶,中枢网关")
-
-# 控制后回读：默认自适应短轮询；HA WebSocket 可用时优先事件驱动，通常首个事件即确认。
-SERVICE_CONFIRM_DELAY = env_float("SERVICE_CONFIRM_DELAY", 0.15, 0.0, 30.0)
-SERVICE_CONFIRM_RETRIES = env_int("SERVICE_CONFIRM_RETRIES", 3, 0, 20)
-SERVICE_CONFIRM_INTERVAL = env_float("SERVICE_CONFIRM_INTERVAL", SERVICE_CONFIRM_DELAY, 0.0, 30.0)
-SERVICE_CONFIRM_TIMEOUT = env_float("SERVICE_CONFIRM_TIMEOUT", 4.0, 0.0, 300.0)
-
-# 状态/服务缓存与 WebSocket state_changed 事件流
-HA_STATE_WS_ENABLED = env_bool("HA_STATE_WS_ENABLED", True)
-HA_STATE_CACHE_TTL = env_float("HA_STATE_CACHE_TTL", 1.0, 0.0, 60.0)
-HA_SERVICES_CACHE_TTL = env_float("HA_SERVICES_CACHE_TTL", 300.0, 0.0, 3600.0)
-# 事件流连续失败达到该次数后暂停自动重连 60s，避免 HA 长期不可用时每 30s 刷一次告警；
-# 下一次工具调用会重新尝试启动事件流。
-HA_STATE_WS_MAX_FAILURES = env_int("HA_STATE_WS_MAX_FAILURES", 5, 1, 100)
-
-# 危险设备二次确认
-DANGER_CONFIRM_ENABLED = env_bool("DANGER_CONFIRM_ENABLED", True)
-DANGER_CONFIRM_TTL = env_float("DANGER_CONFIRM_TTL", 120.0, 1.0, 86400.0)
-DANGEROUS_DOMAINS = env_set("DANGEROUS_DOMAINS", "lock,alarm_control_panel")
-DANGEROUS_COVER_CLASSES = env_set("DANGEROUS_COVER_CLASSES", "garage,door,gate,window")
-# 这些服务域即使目标实体本身不危险，也可能执行脚本/系统级动作，同样需要二次确认。
-DANGEROUS_SERVICE_DOMAINS = env_set(
-    "DANGEROUS_SERVICE_DOMAINS",
-    "lock,alarm_control_panel,script,shell_command,python_script",
-)
-
-# WebUI 监听地址与端口；默认保持 0.0.0.0:8099 以兼容容器端口映射，无独立密码。
-# 只允许本机访问时可设为 127.0.0.1（容器内需 network_mode: host 或反向代理）。
-WEBUI_HOST = env_str("WEBUI_HOST", "0.0.0.0")
-WEBUI_PORT = env_int("WEBUI_PORT", 8099, 1, 65535)
-# 额外允许的 Host（逗号分隔域名）；本机地址、回环地址与私有网段始终允许。
-WEBUI_ALLOWED_HOSTS = env_set("WEBUI_ALLOWED_HOSTS", "")
+WEBUI_HOST = settings.webui_host
+WEBUI_PORT = settings.webui_port
+WEBUI_ALLOWED_HOSTS = set(settings.webui_allowed_hosts)
+WEBUI_TOKEN = settings.webui_token
+WEBUI_TOKEN_GENERATED = settings.webui_token_generated
+WEBUI_CACHE_TTL = settings.webui_cache_ttl
+CONTROL_CONCURRENCY = settings.control_concurrency
+METRICS_ENABLED = settings.metrics_enabled

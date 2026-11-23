@@ -1,10 +1,10 @@
 # homeassistant-xiaozhiserver — 小智 MCP 接入点 bridge + WebUI
 # 用法：
-#   cp .env.example .env，填写 MCP_ENDPOINT / HA_URL / HA_TOKEN
+#   cp .env.example .env，填写 MCP_ENDPOINT / HA_URL / HA_TOKEN / WEBUI_TOKEN
 #   mkdir -p ./xiaozhi-logs && sudo chown -R "$(id -u):$(id -g)" ./xiaozhi-logs
 #   如宿主机 UID/GID 不是 1000，在 .env 中设置 PUID/PGID（compose 的 user 会使用）
 #   docker compose pull && docker compose up -d
-# 一个容器同时运行 MCP 桥接和 WebUI；使用 host 网络，WebUI 通过 WEBUI_PORT 暴露到宿主机，无独立密码。
+# 一个容器同时运行 MCP 桥接和 WebUI；使用 host 网络，WebUI 通过 WEBUI_HOST:WEBUI_PORT 暴露到宿主机。
 services:
   homeassistant-xiaozhiserver:
     image: ghcr.io/kid941005/homeassistant-xiaozhiserver:latest
@@ -16,18 +16,21 @@ services:
     restart: unless-stopped
     init: true
     stop_grace_period: 15s
-    # 以宿主机日志目录所有者运行；默认 1000:1000，可由 .env 的 PUID/PGID 覆盖
     user: "${PUID:-1000}:${PGID:-1000}"
     # 直接使用宿主机网络栈，WebUI 监听宿主机 WEBUI_HOST:WEBUI_PORT，无需 ports 映射。
     network_mode: host
     env_file:
       - .env
     environment:
-      # 默认写入宿主机的 ./xiaozhi-logs；可在 .env 中用 LOG_FILE 覆盖
       LOG_FILE: ${LOG_FILE:-/app/logs/homeassistant-xiaozhiserver.log}
-      # host 网络下 WebUI 直接监听宿主机端口；默认 0.0.0.0:8099
+      LOG_SPLIT: ${LOG_SPLIT:-true}
+      LOG_FORMAT: ${LOG_FORMAT:-text}
       WEBUI_HOST: ${WEBUI_HOST:-0.0.0.0}
       WEBUI_PORT: ${WEBUI_PORT:-8099}
+      WEBUI_TOKEN: ${WEBUI_TOKEN:-}
+      WEBUI_CACHE_TTL: ${WEBUI_CACHE_TTL:-3.0}
+      CONTROL_CONCURRENCY: ${CONTROL_CONCURRENCY:-5}
+      METRICS_ENABLED: ${METRICS_ENABLED:-true}
     volumes:
       - ./xiaozhi-logs:/app/logs
     security_opt:

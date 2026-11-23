@@ -1,12 +1,13 @@
 #!/bin/sh
 # 单容器入口：WebUI 后台运行，MCP WebSocket bridge 前台运行。
+# 两个进程写不同日志文件（LOG_ROLE 决定），避免 RotatingFileHandler 轮转竞争。
 # 任一进程退出都会结束容器，交给 restart 策略重建；退出时最多等 10 秒再强杀。
 set -eu
 
-python -m homeassistant_xiaozhiserver.webui &
+LOG_ROLE=webui python -m homeassistant_xiaozhiserver.webui &
 WEBUI_PID=$!
 
-python /app/mcp_pipe.py /app/server.py &
+LOG_ROLE=bridge python /app/mcp_pipe.py /app/server.py &
 BRIDGE_PID=$!
 
 cleanup() {
@@ -47,7 +48,6 @@ if ! kill -0 "$BRIDGE_PID" 2>/dev/null; then
 else
     wait "$WEBUI_PID" || STATUS=$?
 fi
-# 任一子进程异常退出都以非 0 结束，交给 restart 策略重建；0 会被视为正常结束。
 if [ "$STATUS" -eq 0 ]; then
     STATUS=1
 fi

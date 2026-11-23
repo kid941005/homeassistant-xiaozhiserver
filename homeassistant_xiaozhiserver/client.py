@@ -80,6 +80,8 @@ class HAClient:
         self._state_entities: dict[str, dict] = {}
         self._states_cache: list[dict] | None = None
         self._states_ts: float = 0.0
+        # 事件只标脏，读取时再一次性生成 list，避免每条 state_changed 都重建全量列表。
+        self._states_dirty: bool = True
         self._services_cache: list[dict] | None = None
         self._services_ts: float = 0.0
         self._state_ws_task: asyncio.Task | None = None
@@ -227,12 +229,20 @@ class HAClient:
             for s in states
             if isinstance(s, dict) and s.get("entity_id")
         }
-        self._states_cache = list(self._state_entities.values())
+        self._states_dirty = True
         self._states_ts = time.time()
+
+    def _states_snapshot(self) -> list[dict]:
+        """按需生成全量 list：只在事件更新/失效后重建一次。"""
+        if self._states_dirty or self._states_cache is None:
+            self._states_cache = list(self._state_entities.values())
+            self._states_dirty = False
+        return self._states_cache
 
     def invalidate_states(self) -> None:
         """服务调用后让状态缓存失效；事件流就绪时保留内存快照，由事件增量更新。"""
         self._states_ts = 0.0
+        self._states_dirty = True
         if not self._state_ws_ready.is_set():
             self._states_cache = None
             self._state_entities = {}
@@ -388,7 +398,7 @@ class HAClient:
                     self._state_entities[eid] = new_state
                 else:
                     self._state_entities.pop(eid, None)
-                self._states_cache = list(self._state_entities.values())
+                self._states_dirty = True
                 self._states_ts = time.time()
                 self._notify_state(eid, new_state)
             raise HAError("ws_closed", "Home Assistant 状态事件连接已关闭。")
@@ -398,13 +408,13 @@ class HAClient:
         """返回全量实体状态；事件流就绪时直接读内存，否则按短 TTL 缓存，避免重复拉全量。"""
         self._ensure_state_stream()
         if self._state_ws_ready.is_set() and not force:
-            return list(self._state_entities.values())
+            return list(self._states_snapshot())
         now = time.time()
         if (not force and self._states_cache is not None
                 and now - self._states_ts < self.state_cache_ttl):
-            return list(self._states_cache)
+            return list(self._states_snapshot())
         self._store_states(await self._fetch_states_rest())
-        return list(self._states_cache or [])
+        return list(self._states_snapshot())
 
     async def get_services(self, force: bool = False) -> list:
         """GET /api/services，返回服务目录（每个 domain 及其服务与参数字段），带 TTL 缓存。"""
@@ -436,7 +446,7 @@ class HAClient:
             raise HAError("invalid_response", "Home Assistant 返回的实体状态不是 JSON 对象。")
         self._state_entities[eid] = data
         if self._states_cache is not None:
-            self._states_cache = list(self._state_entities.values())
+            self._states_dirty = True
             self._states_ts = time.time()
         return data
 
