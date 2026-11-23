@@ -13,10 +13,8 @@ services:
     restart: unless-stopped
     init: true
     stop_grace_period: 15s
-    # 依赖一次性目录初始化，保证 bind mount 对容器用户可写
-    depends_on:
-      init-logs:
-        condition: service_completed_successfully
+    # 以宿主机日志目录所有者运行，避免 bind mount 写入权限问题
+    user: "1000:1000"
     # 直接使用宿主机网络栈，WebUI 监听宿主机 WEBUI_HOST:WEBUI_PORT，无需 ports 映射。
     network_mode: host
     env_file:
@@ -35,13 +33,3 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-
-  # 一次性修正宿主机目录所有权；bind mount 目录由 Docker 创建时可能是 root:root
-  init-logs:
-    image: ghcr.io/kid941005/homeassistant-xiaozhiserver:latest
-    container_name: homeassistant-xiaozhiserver-init-logs
-    user: "0:0"
-    entrypoint: ["/bin/sh", "-c", "mkdir -p /app/logs && chown -R 10001:10001 /app/logs"]
-    volumes:
-      - ./xiaozhi-logs:/app/logs
-    restart: "no"

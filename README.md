@@ -268,7 +268,7 @@ WebUI 与 MCP bridge 在同一个容器内运行：WebUI 后台常驻，bridge �
 
 WebUI 使用 `.env` 中的 `HA_URL` / `HA_TOKEN`，**没有独立登录口令**，请只绑定可信内网。远程访问建议 SSH 隧道或带鉴权的反向代理。WebUI 会独立拦截危险设备与高风险服务（不受 `DANGER_CONFIRM_ENABLED` 影响；查询设备安全性失败时按拒绝处理，失败关闭），写请求必须同源并校验 Host/Origin，所有响应附带 `X-Content-Type-Options`、`X-Frame-Options`、`CSP` 等安全头；但这只是纵深防御，不是访问控制。允许的 Host 默认是 localhost/内网 IP，跨网段或域名访问可通过 `WEBUI_ALLOWED_HOSTS` 追加。
 
-日志默认写入系统临时目录的 `homeassistant-xiaozhiserver.log`，可用 `LOG_FILE` 指定，并按 `LOG_MAX_BYTES` / `LOG_BACKUP_COUNT` 轮转。项目根 `docker-compose.yml` 已把 `/app/logs` 挂到宿主机 `./xiaozhi-logs` 目录，并设置 json-file 日志上限。compose 会先运行一次性 `init-logs` 服务，把该目录调整为容器用户（uid 10001）可写；如果手动运行容器，需自行执行 `sudo chown -R 10001:10001 ./xiaozhi-logs`。非 compose 部署如需长期保留，建议挂载目录：
+日志默认写入系统临时目录的 `homeassistant-xiaozhiserver.log`，可用 `LOG_FILE` 指定，并按 `LOG_MAX_BYTES` / `LOG_BACKUP_COUNT` 轮转。项目根 `docker-compose.yml` 已把 `/app/logs` 挂到宿主机 `./xiaozhi-logs` 目录，并设置 json-file 日志上限。容器以宿主机用户 `1000:1000` 运行，需确保该目录归 `1000:1000` 所有；如果手动运行容器，需自行执行 `sudo chown -R 1000:1000 ./xiaozhi-logs`。非 compose 部署如需长期保留，建议挂载目录：
 
 ```bash
 docker run -v ./logs:/var/log/homeassistant-xiaozhiserver \
