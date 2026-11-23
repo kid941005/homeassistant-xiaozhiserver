@@ -2,7 +2,7 @@
 
 > 把 **Home Assistant** 的实体与服务封装成标准 **MCP（Model Context Protocol）** 工具，供 **小智（xiaozhi-server）** 通过 **MCP 接入点** 用自然语言查询和控制智能家居设备。
 
-**当前版本：v1.13.7** · Python 3.12 · 传输方式：**stdio MCP server + WebSocket bridge** · 单容器部署（MCP bridge + WebUI）
+**当前版本：v1.13.8** · Python 3.12 · 传输方式：**stdio MCP server + WebSocket bridge** · 单容器部署（MCP bridge + WebUI）
 
 ---
 
@@ -29,7 +29,7 @@
 `homeassistant-xiaozhiserver` 不是 Home Assistant 插件，而是一个**独立的 MCP 服务**：
 
 - 对内连接 Home Assistant 的 REST API 与 WebSocket API；
-- 对外暴露 6 个面向智能家居场景的 MCP 工具；
+- 对外暴露 7 个面向智能家居场景的 MCP 工具；
 - 通过 `mcp_pipe.py` 以**主动出站**的 WebSocket 方式接入小智 `mcp-endpoint-server`；
 - 同一个容器内同时运行 MCP bridge 与 WebUI，部署只需要一条 compose 命令。
 
@@ -176,13 +176,24 @@ HA_TOKEN=你的HomeAssistant长期访问令牌
 
 `HA_URL` 结尾不要带 `/`。其余变量都有默认值，可按需覆盖。
 
-### 4.4 Docker Compose 启动
+### 4.4 准备日志目录与 Docker Compose 启动
+
+日志目录是宿主机 bind mount，compose 默认以 `user: "1000:1000"` 运行（可用 `.env` 的 `PUID` / `PGID` 覆盖）；首次启动前先创建目录并确保所有者与容器用户一致，否则容器会因无法写日志而报 `PermissionError`：
 
 ```bash
+mkdir -p ./xiaozhi-logs
+sudo chown -R "$(id -u):$(id -g)" ./xiaozhi-logs
+
+# 当前用户不是 UID/GID 1000 时，在 .env 中设置实际数字：
+# PUID=<id -u 的输出>
+# PGID=<id -g 的输出>
+
 docker compose pull
 docker compose up -d
 docker compose logs -f homeassistant-xiaozhiserver
 ```
+
+> 如果宿主机登录用户不是 UID 1000，请在 `.env` 中设置 `PUID=` / `PGID=`（实际 `id -u` / `id -g` 数字），compose 会用它覆盖默认的 `1000:1000`；并用同一组 UID/GID `chown` 日志目录。仓库已保留 `xiaozhi-logs/.gitkeep`，但 `.gitkeep` 不能替代目录所有者检查。
 
 默认镜像：`ghcr.io/kid941005/homeassistant-xiaozhiserver:latest`。国内网络也可改用 Docker Hub 同步镜像：`kid941005/homeassistant-xiaozhiserver:latest`。
 
@@ -227,6 +238,11 @@ python -m homeassistant_xiaozhiserver
 # 容器状态
 docker compose ps
 
+# 运行用户与日志目录权限；应看到 uid=1000 gid=1000，且最后输出 logs-writable
+docker inspect homeassistant-xiaozhiserver --format 'user={{.Config.User}}'
+docker compose exec homeassistant-xiaozhiserver id
+docker compose exec homeassistant-xiaozhiserver sh -c 'touch /app/logs/.write-test && rm -f /app/logs/.write-test && echo logs-writable'
+
 # WebUI 状态
 curl -s http://127.0.0.1:${WEBUI_PORT:-8099}/api/status
 
@@ -268,16 +284,21 @@ WebUI 与 MCP bridge 在同一个容器内运行：WebUI 后台常驻，bridge �
 
 WebUI 使用 `.env` 中的 `HA_URL` / `HA_TOKEN`，**没有独立登录口令**，请只绑定可信内网。远程访问建议 SSH 隧道或带鉴权的反向代理。WebUI 会独立拦截危险设备与高风险服务（不受 `DANGER_CONFIRM_ENABLED` 影响；查询设备安全性失败时按拒绝处理，失败关闭），写请求必须同源并校验 Host/Origin，所有响应附带 `X-Content-Type-Options`、`X-Frame-Options`、`CSP` 等安全头；但这只是纵深防御，不是访问控制。允许的 Host 默认是 localhost/内网 IP，跨网段或域名访问可通过 `WEBUI_ALLOWED_HOSTS` 追加。
 
-日志默认写入系统临时目录的 `homeassistant-xiaozhiserver.log`，可用 `LOG_FILE` 指定，并按 `LOG_MAX_BYTES` / `LOG_BACKUP_COUNT` 轮转。项目根 `docker-compose.yml` 已把 `/app/logs` 挂到宿主机 `./xiaozhi-logs` 目录，并设置 json-file 日志上限。容器以宿主机用户 `1000:1000` 运行，需确保该目录归 `1000:1000` 所有；如果手动运行容器，需自行执行 `sudo chown -R 1000:1000 ./xiaozhi-logs`。非 compose 部署如需长期保留，建议挂载目录：
+日志默认写入系统临时目录的 `homeassistant-xiaozhiserver.log`，可用 `LOG_FILE` 指定，并按 `LOG_MAX_BYTES` / `LOG_BACKUP_COUNT` 轮转。项目根 `docker-compose.yml` 把容器 `/app/logs` 挂到宿主机 `./xiaozhi-logs`，默认写入 `/app/logs/homeassistant-xiaozhiserver.log`，并设置 json-file 日志上限。容器以宿主机用户 `1000:1000`（可由 `PUID` / `PGID` 覆盖）运行，必须保证该目录归同一 UID/GID 所有；首次启动前执行 `mkdir -p ./xiaozhi-logs && sudo chown -R "$(id -u):$(id -g)" ./xiaozhi-logs`。非 compose 部署如需长期保留，建议同样挂载目录：
 
 ```bash
-docker run -v ./logs:/var/log/homeassistant-xiaozhiserver \
-  -e LOG_FILE=/var/log/homeassistant-xiaozhiserver/app.log ...
+mkdir -p ./xiaozhi-logs
+sudo chown -R "$(id -u):$(id -g)" ./xiaozhi-logs
+docker run --user "${PUID:-1000}:${PGID:-1000}" \
+  -v "$PWD/xiaozhi-logs:/app/logs" \
+  -e LOG_FILE=/app/logs/homeassistant-xiaozhiserver.log ...
 ```
 
 ---
 
 ## 6. 环境变量
+
+> 只有 `MCP_ENDPOINT` / `HA_URL` / `HA_TOKEN` 必须显式设置；`.env.example` 已把其余可选项全部注释并标注默认值，取消注释即可覆盖。`docker-compose.yml` 额外为 `LOG_FILE`、`WEBUI_HOST`、`WEBUI_PORT` 提供容器默认值，`PUID` / `PGID` 供 compose 的 user 插值（默认 1000:1000）。
 
 ### 6.1 必填
 
@@ -346,6 +367,8 @@ docker run -v ./logs:/var/log/homeassistant-xiaozhiserver \
 | `WEBUI_HOST` | `0.0.0.0` | WebUI 监听地址；只允许本机访问可设 `127.0.0.1`（容器内需配合 host 网络或反向代理） |
 | `WEBUI_PORT` | `8099` | WebUI 监听端口；host 网络下直接作为宿主机端口，同时用于健康检查 |
 | `WEBUI_ALLOWED_HOSTS` | 空 | 额外允许访问 WebUI 的 Host（逗号分隔，不含端口）；默认已允许 localhost 与内网 IP |
+| `PUID` | `1000` | compose 容器运行 UID；宿主机用户不是 1000 时覆盖，并同步 chown `./xiaozhi-logs` |
+| `PGID` | `1000` | compose 容器运行 GID；同上 |
 
 ---
 
@@ -671,7 +694,7 @@ bash tests/run_local_test.sh
 - `HA_TOKEN` / `MCP_ENDPOINT` 只通过环境变量注入，不写入镜像、代码或 Git；`.env` 已被 `.gitignore` 忽略。
 - bridge 主动出站，不要为它暴露入站端口；WebUI 的 `WEBUI_PORT`（默认 8099）只建议绑定可信内网。
 - WebUI 无独立密码，远程访问请使用 SSH 隧道或带鉴权的反向代理；页面和 API 只展示掩码后的敏感值。
-- 容器以非 root 用户（uid 10001）运行，并带 `/healthz` 健康检查；`/readyz` 可反映 HA 就绪状态。
+- 容器以非 root 用户运行：compose 默认 `user: "1000:1000"`，可通过 `PUID` / `PGID` 覆盖（镜像内置的 `appuser` uid 10001 仅在未覆盖 user 时生效）；带 `/healthz` 健康检查，`/readyz` 可反映 HA 就绪状态。
 - 危险操作确认只用于防误操作，不是权限控制；真正权限由 HA 长期令牌决定。
 - 建议为 HA 使用专用长期令牌，只授予必要设备权限；公网接入使用 `wss://` 并保护 token。
 
@@ -681,6 +704,7 @@ bash tests/run_local_test.sh
 
 | 版本 | 主要变化 |
 |---|---|
+| v1.13.8 | 部署配置整理：`.env.example` 收敛为 3 个必填项并补充默认值说明；`docker-compose.yml` 支持 `PUID`/`PGID` 覆盖运行用户、补充日志目录权限步骤；README 同步 host 网络、日志目录与 `.env` 说明 |
 | v1.13.7 | 修复慢设备回读窗口被 `min_attempts` 提前截断、`compact` 设备分组丢设备名、注册表瞬时失败清空旧缓存；WebUI 危险闸门失败关闭、`call_service` 目标选择器防绕过；补充真实事件流、慢设备回读与批量上限测试；新增 `WEBUI_HOST` / `WEBUI_PORT`、事件流失败熔断、`set_brightness 0` 映射关闭、Origin 默认端口归一化、日志尾部全量解析 |
 | v1.13.6 | 去重前校验灯具可用性、注册表不可用兜底；WebUI Host/Origin 白名单、安全响应头、64KB 请求体上限、`/healthz`/`/readyz`、生效配置展示；日志轮转与 compose 日志卷；CI 增加 PR 测试与版本一致性校验；新增 `HA state_changed` 事件流与状态/服务缓存、自适应回读确认、批量 `control_devices`、`list_devices compact`、小智侧 MCP 重连与 action 白名单、首次连接失败自动重试、状态流退避重置、同实体控制串行化 |
 | v1.13.5 | 同一设备下与灯具同名且唯一的开关自动去重，只保留灯具；新增 `duplicate_switch` 错误与 `deduplicated_switch_count` / `ambiguous_switch_groups` |
@@ -688,7 +712,7 @@ bash tests/run_local_test.sh
 | v1.13.3 | 全面审计修复：输入校验、脚本/系统级服务确认、回读与重试修正、日志脱敏与尾部读取、WebUI 同源校验、bridge 重连与 SIGTERM、健康检查、CI 测试 |
 | v1.13.2 | WebUI 页头、日志面板与日志行显示版本号；日志格式加入版本号；`/api/logs` 返回版本 |
 | v1.13.1 | 控制结果改为 `action=RESPONSE` + 中文 `response`，修复 `turn_off` 被播报；WebUI 去重、设备总览与共享日志 |
-| v1.13.0 | WebUI 与 bridge 合并为单容器；WebUI 去掉密码与 `WEBUI_*` 变量，固定 8099，复用 `HA_URL` / `HA_TOKEN` |
+| v1.13.0 | WebUI 与 bridge 合并为单容器；WebUI 去掉密码与 `WEBUI_*` 变量，当时固定 8099（v1.13.7 起可用 `WEBUI_HOST` / `WEBUI_PORT` 配置），复用 `HA_URL` / `HA_TOKEN` |
 | v1.12.0 | 新增可选 WebUI：状态页、工具调试台、配置只读 |
 | v1.11.1 | 修复 `list_devices` 无过滤时忽略 `DEFAULT_LIST_LIMIT` 的问题 |
 | v1.11.0 | `list_devices` 支持关键字别名、未知参数报错、默认只列可控设备 |
