@@ -88,7 +88,7 @@
 4. `tools/call` 经 bridge 传给 MCP server，再由 server 调用 HA REST/WS；
 5. 结构化结果原路返回，小智直接播报或交给 LLM 组织回复。
 
-> MCP bridge 不监听端口；只有 WebUI 在容器内监听 `8099`（可用 `WEBUI_PORT` 覆盖）。
+> MCP bridge 不监听端口；容器使用 `network_mode: host`，WebUI 直接监听宿主机 `WEBUI_HOST:WEBUI_PORT`（默认 `0.0.0.0:8099`）。
 
 ### 3.2 目录结构
 
@@ -193,7 +193,9 @@ docker compose logs -f homeassistant-xiaozhiserver
 2026-01-01 12:00:00 INFO  v1.13.7 MCP_PIPE [-] 已启动 MCP server：...
 ```
 
-WebUI 地址：`http://<宿主机IP>:8099/`（端口由 `WEBUI_PORT` 决定），无需账号密码。
+WebUI 地址：`http://<宿主机IP>:8099/`（端口由 `WEBUI_PORT` 决定），无需账号密码。compose 使用 `network_mode: host`，因此没有 `ports` 映射；如需只允许本机访问，把 `.env` 的 `WEBUI_HOST` 设为 `127.0.0.1`。
+
+> host 网络下容器直接使用宿主机网络栈；HA 与容器在同一台机器时，`HA_URL` 可用 `http://127.0.0.1:8123`。Docker Desktop 需使用支持并启用 host networking 的版本。
 
 需要本地构建时，注释 `docker-compose.yml` 的 `image:`，启用 `build:` 两行后执行：
 
@@ -266,7 +268,7 @@ WebUI 与 MCP bridge 在同一个容器内运行：WebUI 后台常驻，bridge �
 
 WebUI 使用 `.env` 中的 `HA_URL` / `HA_TOKEN`，**没有独立登录口令**，请只绑定可信内网。远程访问建议 SSH 隧道或带鉴权的反向代理。WebUI 会独立拦截危险设备与高风险服务（不受 `DANGER_CONFIRM_ENABLED` 影响；查询设备安全性失败时按拒绝处理，失败关闭），写请求必须同源并校验 Host/Origin，所有响应附带 `X-Content-Type-Options`、`X-Frame-Options`、`CSP` 等安全头；但这只是纵深防御，不是访问控制。允许的 Host 默认是 localhost/内网 IP，跨网段或域名访问可通过 `WEBUI_ALLOWED_HOSTS` 追加。
 
-日志默认写入系统临时目录的 `homeassistant-xiaozhiserver.log`，可用 `LOG_FILE` 指定，并按 `LOG_MAX_BYTES` / `LOG_BACKUP_COUNT` 轮转。项目根 `docker-compose.yml` 已把 `/app/logs` 挂到命名卷并设置 json-file 日志上限；非 compose 部署如需长期保留，建议挂载目录：
+日志默认写入系统临时目录的 `homeassistant-xiaozhiserver.log`，可用 `LOG_FILE` 指定，并按 `LOG_MAX_BYTES` / `LOG_BACKUP_COUNT` 轮转。项目根 `docker-compose.yml` 已把 `/app/logs` 挂到宿主机 `./xiaozhi-logs` 目录，并设置 json-file 日志上限。compose 会先运行一次性 `init-logs` 服务，把该目录调整为容器用户（uid 10001）可写；如果手动运行容器，需自行执行 `sudo chown -R 10001:10001 ./xiaozhi-logs`。非 compose 部署如需长期保留，建议挂载目录：
 
 ```bash
 docker run -v ./logs:/var/log/homeassistant-xiaozhiserver \
@@ -342,7 +344,7 @@ docker run -v ./logs:/var/log/homeassistant-xiaozhiserver \
 | `LOG_MAX_BYTES` | `5242880` | 单个日志文件轮转阈值（字节），`0` 表示不按大小轮转 |
 | `LOG_BACKUP_COUNT` | `3` | 保留的历史日志文件数量 |
 | `WEBUI_HOST` | `0.0.0.0` | WebUI 监听地址；只允许本机访问可设 `127.0.0.1`（容器内需配合 host 网络或反向代理） |
-| `WEBUI_PORT` | `8099` | WebUI 监听端口，同时用于容器端口映射与健康检查 |
+| `WEBUI_PORT` | `8099` | WebUI 监听端口；host 网络下直接作为宿主机端口，同时用于健康检查 |
 | `WEBUI_ALLOWED_HOSTS` | 空 | 额外允许访问 WebUI 的 Host（逗号分隔，不含端口）；默认已允许 localhost 与内网 IP |
 
 ---
@@ -631,7 +633,7 @@ docker run -v ./logs:/var/log/homeassistant-xiaozhiserver \
 | 现象 | 排查 |
 |---|---|
 | 容器反复重启 / 一直重连 | 检查 `MCP_ENDPOINT` 是否为工具端 `ws://` 地址、token 是否有效、bridge 能否访问该主机端口 |
-| WebUI 打不开 | 检查容器是否 Up、`WEBUI_PORT`（默认 `8099`）是否映射到宿主机可达地址、防火墙是否放行 |
+| WebUI 打不开 | 检查容器是否 Up、`WEBUI_PORT`（默认 `8099`）是否被其他进程占用、`WEBUI_HOST` 是否绑定到可达地址、防火墙是否放行 |
 | HA 鉴权失败 | 重新生成长期令牌，更新 `HA_TOKEN` 并重启 |
 | 按设备聚合不可用 | 检查 HA WebSocket 权限；`registry_available:false` 时会自动降级 |
 | 控制返回 `mismatch` | HA 接受了调用但属性未达目标，检查设备能力与 `list_services` 字段 |
