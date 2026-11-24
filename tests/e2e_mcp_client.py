@@ -310,7 +310,7 @@ async def main():
              {"ok": True, "status": "no_change", "action": "RESPONSE",
               "response_contains": "本来就是关着"}),
             ("call_service", {"entity": "switch.fan", "service": "silent"},
-             {"ok": True, "status": "accepted_pending"}),
+             {"ok": False, "status": "accepted_pending", "code": "pending_confirmation"}),
             ("call_service", {"entity": "不存在设备", "service": "turn_on"},
              {"ok": False, "code": "not_found"}),
             ("call_service", {"entity": "客厅灯", "service": "light.turn_on",
@@ -333,7 +333,7 @@ async def main():
              {"ok": True, "status": "confirmed", "after_state": "off"}),
             ("call_service", {"entity": "客厅灯", "service": "light.turn_on_ignore_brightness",
                               "data": {"brightness_pct": 80}},
-             {"ok": True, "status": "mismatch"}),
+             {"ok": False, "status": "mismatch", "code": "not_verified"}),
         ]
         for index, (name, args, expected) in enumerate(cases, 1):
             r = await call(session, name, args)

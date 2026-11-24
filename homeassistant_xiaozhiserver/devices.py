@@ -35,6 +35,7 @@ from .views import (
 
 log = logging.getLogger("homeassistant_xiaozhiserver.devices")
 
+_VERIFIED_OK_STATUSES = ("confirmed", "no_change")
 _TARGET_SELECTOR_KEYS = frozenset({
     "entity_id", "target", "device_id", "area_id", "floor_id", "label_id",
 })
@@ -464,7 +465,11 @@ class DeviceService:
             if guard is not None:
                 return guard
             result = await _apply_and_confirm(ha, st, sd, svc, payload, action_name)
-            result["ok"] = True
+            status = str(result.get("status") or "")
+            result["ok"] = status in _VERIFIED_OK_STATUSES
+            if not result["ok"]:
+                result["code"] = ("not_verified" if status == "mismatch"
+                                  else "pending_confirmation")
             # 注意：xiaozhi MCP 接入点把结果里的 action 当作 Action 枚举名解析；
             # turn_off / turn_on 不是合法枚举，会被转成 Action.ERROR 并把 "turn_off" 直接 TTS。
             # 因此设备动作放在 device_action，成功时用 action=RESPONSE + 中文 response 让助手直接播报，
@@ -570,7 +575,11 @@ class DeviceService:
                     per.append({"ok": False, "entity_id": op["entity_id"], "code": "internal_error",
                                 "message": str(result)})
                     continue
-                result["ok"] = True
+                status = str(result.get("status") or "")
+                result["ok"] = status in _VERIFIED_OK_STATUSES
+                if not result["ok"]:
+                    result["code"] = ("not_verified" if status == "mismatch"
+                                      else "pending_confirmation")
                 result["device_action"] = action_name
                 result["action"] = "RESPONSE"
                 result["response"] = result.get("voice") or result.get("message") or "操作已完成。"
@@ -748,7 +757,11 @@ class DeviceService:
             if guard is not None:
                 return guard
             result = await _apply_and_confirm(ha, st, service_domain, svc, payload, spec)
-            result["ok"] = True
+            status = str(result.get("status") or "")
+            result["ok"] = status in _VERIFIED_OK_STATUSES
+            if not result["ok"]:
+                result["code"] = ("not_verified" if status == "mismatch"
+                                  else "pending_confirmation")
             result["device_action"] = svc
             direct = (service_domain in DOMAIN_ACTIONS
                       and service_domain not in ("script", "scene", "automation")

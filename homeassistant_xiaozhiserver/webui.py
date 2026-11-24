@@ -209,12 +209,17 @@ def create_app() -> FastAPI:
         """比较 Origin 与 Host，并按 scheme 归一化默认端口。"""
         if parts.scheme not in ("http", "https"):
             return False
-        origin_name = (parts.hostname or "").lower()
+        try:
+            origin_name = (parts.hostname or "").lower()
+            origin_port = parts.port
+        except ValueError:
+            # 畸形 Origin（如端口非数字、括号不闭合）必须失败关闭，不能抛 500。
+            return False
         if not origin_name:
             return False
         default_port = 443 if parts.scheme == "https" else 80
         return (origin_name == _host_name(host)
-                and (parts.port or default_port) == (_host_port(host) or default_port))
+                and (origin_port or default_port) == (_host_port(host) or default_port))
 
     def _host_allowed(host: str) -> bool:
         name = _host_name(host)
@@ -286,7 +291,13 @@ def create_app() -> FastAPI:
                     {"ok": False, "code": "cross_origin_blocked", "message": "写请求必须携带同源 Origin。"},
                     status_code=403,
                 ))
-            parts = urlsplit(origin)
+            try:
+                parts = urlsplit(origin)
+            except ValueError:
+                return _harden(JSONResponse(
+                    {"ok": False, "code": "cross_origin_blocked", "message": "拒绝格式非法的 Origin。"},
+                    status_code=403,
+                ))
             if not _origin_allowed(parts, host):
                 return _harden(JSONResponse(
                     {"ok": False, "code": "cross_origin_blocked", "message": "拒绝跨站请求。"},
@@ -300,6 +311,7 @@ def create_app() -> FastAPI:
         return _harden(response)
 
     _status_cache: tuple[float, dict[str, Any]] | None = None
+    _status_lock = asyncio.Lock()
 
     async def _status_data_uncached() -> dict[str, Any]:
         ha_url = _env("HA_URL")
@@ -346,9 +358,13 @@ def create_app() -> FastAPI:
         nonlocal _status_cache
         if not force and _status_cache is not None and time.monotonic() - _status_cache[0] < WEBUI_CACHE_TTL:
             return _status_cache[1]
-        data = await _status_data_uncached()
-        _status_cache = (time.monotonic(), data)
-        return data
+        # 单飞：并发请求只让一个去刷新，其余等待后复用缓存，避免 HA 抖动时缓存击穿。
+        async with _status_lock:
+            if not force and _status_cache is not None and time.monotonic() - _status_cache[0] < WEBUI_CACHE_TTL:
+                return _status_cache[1]
+            data = await _status_data_uncached()
+            _status_cache = (time.monotonic(), data)
+            return data
 
     def _config_data() -> dict[str, Any]:
         try:
@@ -386,10 +402,11 @@ def create_app() -> FastAPI:
                 {"key": "WEBUI_HOST", "value": WEBUI_HOST, "secret": False},
                 {"key": "WEBUI_PORT", "value": str(WEBUI_PORT), "secret": False},
             ],
-            "note": "配置为只读视图，展示实际生效值；WebUI 无独立密码，直接使用 HA_URL / HA_TOKEN 连接 HA；修改请更新 .env 并重启服务。",
+            "note": "配置为只读视图，展示实际生效值；WebUI 使用 WEBUI_TOKEN 登录，HA 连接使用 HA_URL / HA_TOKEN；修改请更新 .env 并重启服务。",
         }
 
     _devices_cache: tuple[float, dict[str, Any]] | None = None
+    _devices_lock = asyncio.Lock()
 
     async def _devices_data_uncached() -> dict[str, Any]:
         """按物理设备聚合可控实体，供首页设备总览使用。"""
@@ -486,9 +503,12 @@ def create_app() -> FastAPI:
         nonlocal _devices_cache
         if not force and _devices_cache is not None and time.monotonic() - _devices_cache[0] < WEBUI_CACHE_TTL:
             return _devices_cache[1]
-        data = await _devices_data_uncached()
-        _devices_cache = (time.monotonic(), data)
-        return data
+        async with _devices_lock:
+            if not force and _devices_cache is not None and time.monotonic() - _devices_cache[0] < WEBUI_CACHE_TTL:
+                return _devices_cache[1]
+            data = await _devices_data_uncached()
+            _devices_cache = (time.monotonic(), data)
+            return data
 
     def _logs_data(limit_raw: str, level_raw: str) -> tuple[dict[str, Any], int]:
         try:
@@ -610,10 +630,12 @@ def create_app() -> FastAPI:
         if str(params.get("confirm_token") or "").strip():
             return {"ok": False, "code": "dangerous_operation_blocked",
                     "message": "WebUI 不执行带确认令牌的危险操作；请通过小智语音确认后再操作。"}
-        service = str(params.get("service") or "").strip().lower()
-        if "." in service:
-            domain, svc = service.split(".", 1)
-            dangerous, reason = service_is_dangerous(domain, svc)
+        service_raw = str(params.get("service") or "").strip().lower()
+        service_name = service_raw
+        explicit_domain = ""
+        if "." in service_raw:
+            explicit_domain, service_name = service_raw.split(".", 1)
+            dangerous, reason = service_is_dangerous(explicit_domain, service_name)
             if dangerous:
                 return {"ok": False, "code": "dangerous_operation_blocked",
                         "message": "WebUI 不执行高风险服务（" + reason + "）；请通过小智语音确认后再操作。"}
@@ -624,7 +646,8 @@ def create_app() -> FastAPI:
         raw_entities = params.get("entities")
         if isinstance(raw_entities, list):
             candidates.extend(str(x).strip() for x in raw_entities if str(x).strip())
-        for ref in candidates:
+
+        async def _check_one(ref: str) -> dict | None:
             # 安全判定必须失败关闭：HA 抖动、实体不存在或返回结构异常时都不能当作“非危险”。
             try:
                 info = await mcp_server.get_device_state(entity=ref)
@@ -644,6 +667,29 @@ def create_app() -> FastAPI:
                 reason = str(view.get("danger_reason") or "该设备属于高风险设备")
                 return {"ok": False, "code": "dangerous_operation_blocked",
                         "message": "WebUI 不执行危险设备操作（" + reason + "）；请通过小智语音确认后再操作。"}
+            if service_name and not explicit_domain:
+                # 裸服务名必须结合目标实体域判断：script/shell_command 等即使目标实体普通也高风险。
+                domain = str(view.get("domain") or "")
+                if not domain:
+                    eid = str(view.get("entity_id") or "")
+                    domain = eid.split(".", 1)[0] if "." in eid else ""
+                if domain:
+                    dangerous, reason = service_is_dangerous(domain, service_name)
+                    if dangerous:
+                        return {"ok": False, "code": "dangerous_operation_blocked",
+                                "message": "WebUI 不执行高风险服务（" + reason + "）；请通过小智语音确认后再操作。"}
+            return None
+
+        if candidates:
+            outcomes = await asyncio.gather(
+                *(_check_one(ref) for ref in candidates), return_exceptions=True
+            )
+            for outcome in outcomes:
+                if isinstance(outcome, BaseException):
+                    return {"ok": False, "code": "dangerous_operation_blocked",
+                            "message": "无法确认设备是否安全（" + str(outcome) + "），已拒绝执行。"}
+                if outcome is not None:
+                    return outcome
         return None
 
     async def _execute_tool(name: str, params: Any) -> tuple[Any, int]:
@@ -673,7 +719,7 @@ def create_app() -> FastAPI:
         except Exception:  # noqa: BLE001
             log.exception("webui tool=%s failed", name)
             return {"ok": False, "code": "internal_error", "message": "工具调用失败，详见服务端日志。"}, 500
-        # WebUI 无独立密码，不复用 MCP 的危险设备确认令牌，避免两次请求即可绕过确认。
+        # WebUI 使用独立登录令牌，不复用 MCP 的危险设备确认令牌，避免两次请求即可绕过确认。
         if isinstance(result, dict) and result.get("requires_confirmation"):
             return {"ok": False, "code": "dangerous_operation_blocked",
                     "message": "WebUI 不执行危险设备操作；请通过小智语音确认后再操作。"}, 403

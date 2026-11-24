@@ -44,6 +44,10 @@ MAX_BACKOFF = 600
 TERMINATE_TIMEOUT = 5
 
 
+class MCPPipeClosed(RuntimeError):
+    """MCP server 管道正常结束（进程退出或连接关闭），需要按断线退避重连。"""
+
+
 def _safe_endpoint(raw: str) -> str:
     """日志脱敏：去掉 token/query 与 userinfo。"""
     try:
@@ -163,6 +167,9 @@ async def connect_to_server(uri: str, script_path: str, target: str) -> None:
                 exc = task.exception()
                 if exc is not None:
                     raise exc
+            # 所有管道任务都正常结束（子进程退出或对端关闭连接）也必须按断线处理，
+            # 否则 connect_with_retry 会立刻无退避重连，形成忙循环。
+            raise MCPPipeClosed("MCP server 管道已结束（进程退出或连接关闭）")
         finally:
             _terminate(process, target)
 

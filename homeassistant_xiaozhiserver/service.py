@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from typing import Any, Optional
 
@@ -551,6 +552,8 @@ def _clamp_pct(value: Any) -> int:
         v = float(value)
     except (TypeError, ValueError) as exc:
         raise HAError("invalid_value", "value 必须是 0-100 的数字，收到：" + str(value)) from exc
+    if not math.isfinite(v):
+        raise HAError("invalid_value", "value 必须是有限数字，收到：" + str(value))
     if v < 0 or v > 100:
         raise HAError("invalid_value", "value 必须在 0-100 之间，收到：" + str(value))
     return int(round(v))
@@ -647,15 +650,21 @@ def build_service(action: str, domain: str, value: Any) -> tuple:
     if a == "set_temperature":
         _need_value(a, value)
         try:
-            return "climate", "set_temperature", {"temperature": float(value)}
+            temp = float(value)
         except (TypeError, ValueError) as exc:
             raise HAError("invalid_value", "温度 value 必须是数字，收到：" + str(value)) from exc
+        if not math.isfinite(temp):
+            raise HAError("invalid_value", "温度 value 必须是有限数字，收到：" + str(value))
+        return "climate", "set_temperature", {"temperature": temp}
     if a == "set_color_temp":
         _need_value(a, value)
         try:
-            return "light", "turn_on", {"color_temp_kelvin": int(float(value))}
+            kelvin = float(value)
         except (TypeError, ValueError) as exc:
             raise HAError("invalid_value", "色温 value 必须是开尔文数字，收到：" + str(value)) from exc
+        if not math.isfinite(kelvin):
+            raise HAError("invalid_value", "色温 value 必须是有限数字，收到：" + str(value))
+        return "light", "turn_on", {"color_temp_kelvin": int(kelvin)}
     if a == "set_color":
         _need_value(a, value)
         return "light", "turn_on", {"rgb_color": _parse_color(value)}

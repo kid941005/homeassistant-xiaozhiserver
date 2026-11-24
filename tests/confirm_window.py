@@ -9,7 +9,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from homeassistant_xiaozhiserver.service import _apply_and_confirm  # noqa: E402
+from homeassistant_xiaozhiserver.service import (  # noqa: E402
+    HAError, _apply_and_confirm, build_service,
+)
 
 
 def check(condition: bool, label: str) -> None:
@@ -44,7 +46,21 @@ class SlowHA:
         return False
 
 
+def check_invalid_number(value, action: str, label: str) -> None:
+    try:
+        build_service(action, "climate" if action == "set_temperature" else "light", value)
+    except HAError as exc:
+        check(exc.code == "invalid_value", label)
+    else:
+        raise AssertionError(label + "（未拒绝 " + repr(value) + "）")
+
+
 async def run() -> None:
+    check_invalid_number(float("nan"), "set_brightness", "set_brightness 拒绝 NaN")
+    check_invalid_number(float("inf"), "set_brightness", "set_brightness 拒绝 Infinity")
+    check_invalid_number(float("nan"), "set_temperature", "set_temperature 拒绝 NaN")
+    check_invalid_number(float("inf"), "set_temperature", "set_temperature 拒绝 Infinity")
+    check_invalid_number(float("inf"), "set_color_temp", "set_color_temp 拒绝 Infinity")
     ha = SlowHA()
     st = {"entity_id": "light.slow", "state": "off", "attributes": {}}
     result = await _apply_and_confirm(

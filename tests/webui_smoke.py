@@ -156,6 +156,10 @@ if os.environ.get("HA_URL") and os.environ.get("HA_TOKEN"):
     r = post("/api/tool/list_domains", json={})
     check("list_domains 调用成功", r.status_code == 200 and r.json().get("ok") is True, str(r.status_code) + " " + r.text[:200])
 
+    r = post("/api/tool/list_domains", json={}, headers={"Origin": "http://localhost:notaport"})
+    check("畸形 Origin 端口被拒绝且不 500", r.status_code == 403 and r.json().get("code") == "cross_origin_blocked",
+          str(r.status_code) + " " + r.text[:200])
+
     r = post("/api/tool/control_device", json={"entity": "大门门锁", "action": "unlock"})
     check("WebUI 拦截危险设备操作", r.status_code == 403 and r.json().get("code") == "dangerous_operation_blocked",
           str(r.status_code) + " " + r.text[:200])
@@ -183,6 +187,18 @@ if os.environ.get("HA_URL") and os.environ.get("HA_TOKEN"):
         finally:
             mcp_server_mod.get_device_state = _real_get_device_state
         check("WebUI 危险闸门查询异常时失败关闭",
+              r.status_code == 403 and r.json().get("code") == "dangerous_operation_blocked",
+              str(r.status_code) + " " + r.text[:200])
+
+        async def _fake_script_state(**kwargs):
+            return {"ok": True, "entity": {"entity_id": "script.test", "domain": "script",
+                                           "name": "测试脚本", "dangerous": False}}
+        mcp_server_mod.get_device_state = _fake_script_state
+        try:
+            r = post("/api/tool/call_service", json={"entity": "客厅灯", "service": "turn_on"})
+        finally:
+            mcp_server_mod.get_device_state = _real_get_device_state
+        check("裸服务名按目标实体域判定脚本风险",
               r.status_code == 403 and r.json().get("code") == "dangerous_operation_blocked",
               str(r.status_code) + " " + r.text[:200])
 

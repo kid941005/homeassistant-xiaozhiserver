@@ -32,6 +32,6 @@ ENV HA_TIMEOUT=10 \
 EXPOSE 8099
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD python -c "import os, urllib.request; port=os.environ.get('WEBUI_PORT','8099'); urllib.request.urlopen('http://127.0.0.1:%s/healthz' % port, timeout=3)" || exit 1
+    CMD python -c "import os, urllib.request; host=os.environ.get('WEBUI_HOST') or '127.0.0.1'; host='127.0.0.1' if host in ('0.0.0.0','::') else host; host='['+host+']' if ':' in host else host; port=os.environ.get('WEBUI_PORT','8099'); urllib.request.urlopen('http://%s:%s/healthz' % (host, port), timeout=3)" || exit 1
 
 ENTRYPOINT ["/app/docker-entrypoint.sh"]

@@ -2,7 +2,7 @@
 
 > 把 **Home Assistant** 的实体与服务封装成标准 **MCP（Model Context Protocol）** 工具，供 **小智（xiaozhi-server）** 通过 **MCP 接入点** 用自然语言查询和控制智能家居设备。
 
-**当前版本：v1.14.1** · Python 3.12 · 传输方式：**stdio MCP server + WebSocket bridge** · 单容器部署（MCP bridge + WebUI）
+**当前版本：v1.14.2** · Python 3.12 · 传输方式：**stdio MCP server + WebSocket bridge** · 单容器部署（MCP bridge + WebUI）
 
 ---
 
@@ -213,8 +213,8 @@ docker compose logs -f homeassistant-xiaozhiserver
 看到以下日志表示 bridge 已连上小智：
 
 ```text
-2026-01-01 12:00:00.123 INFO    v1.14.1 MCP_PIPE [-] MCP接入点连接成功
-2026-01-01 12:00:00.456 INFO    v1.14.1 MCP_PIPE [-] 已启动 MCP server：...
+2026-01-01 12:00:00.123 INFO    v1.14.2 MCP_PIPE [-] MCP接入点连接成功
+2026-01-01 12:00:00.456 INFO    v1.14.2 MCP_PIPE [-] 已启动 MCP server：...
 ```
 
 WebUI 地址：`http://<宿主机IP>:8099/`（端口由 `WEBUI_PORT` 决定），首次打开会跳转登录页，输入 `.env` 的 `WEBUI_TOKEN` 后才能进入。compose 使用 `network_mode: host`，因此没有 `ports` 映射；如需只允许本机访问，把 `.env` 的 `WEBUI_HOST` 设为 `127.0.0.1`。
@@ -534,6 +534,8 @@ docker run --user "${PUID:-1000}:${PGID:-1000}" \
 
 `verification` 会给出 `attempts`、`elapsed_ms`、`expectations`、`checks`、`mismatches`、`readback_errors`。
 
+返回结果的 `ok` 仅在 `status` 为 `confirmed` / `no_change` 时为 `true`；`mismatch` 返回 `ok=false`、`code=not_verified`，`accepted_pending` 返回 `ok=false`、`code=pending_confirmation`，此时应视为“未确认成功”。
+
 ### 7.4 `list_services` — 查询设备能力
 
 | 参数 | 类型 | 必填 | 说明 |
@@ -655,8 +657,10 @@ docker run --user "${PUID:-1000}:${PGID:-1000}" \
 |---|---|---|
 | `config_missing` | 缺少 `HA_URL` / `HA_TOKEN` | 补齐环境变量后重启 |
 | `config_invalid` | `HA_URL` 格式错误 | 修正为 `http://` 或 `https://` 地址 |
-| `invalid_argument` | 工具收到未知或冲突参数 | 按返回的可用参数重试 |
+| `invalid_argument` | 参数类型或格式不合法 | 按工具描述修正参数类型/格式 |
 | `invalid_pagination` | `limit` / `offset` 不是整数 | 传正整数 `limit`、非负整数 `offset` |
+| `not_verified` | 回读得到变化但与预期不符（`status=mismatch`） | 检查设备能力与 `list_services` 字段 |
+| `pending_confirmation` | 已下发但回读窗口内无法确认（`status=accepted_pending`） | 稍后查询状态，或用 `get_device_state` 复核 |
 | `invalid_entity` | `entity_id` 格式错误 | 用 `list_devices` 查正确 ID，或直接传中文名 |
 | `invalid_response` | HA 返回非预期 JSON | 检查 HA 版本或反向代理 |
 | `auth_failed` | 令牌无效/过期/无权限 | 重新生成 HA 长期令牌 |
@@ -740,6 +744,7 @@ bash tests/run_local_test.sh
 
 | 版本 | 主要变化 |
 |---|---|
+| v1.14.2 | 代码审查修复：MCP bridge 子进程正常退出后按退避重连，避免忙循环；`control_device` / `control_devices` / `call_service` 在 `mismatch` / `accepted_pending` 时返回 `ok=false`；WebUI 裸服务名按目标实体域判定高风险服务；拒绝 NaN/Infinity 数值；Docker healthcheck 跟随 `WEBUI_HOST`；畸形 Origin 失败关闭不返回 500；WebUI 状态/设备缓存增加单飞锁、危险检查并发执行 |
 | v1.14.1 | 日志可读性修复：时间戳加入毫秒并默认 `TZ=Asia/Shanghai` 本地时间；日志目录不可写时自动回退到 `/tmp/xiaozhi-logs`，只输出一条带时间戳的告警，不再刷 Python logging Traceback；清理重复 root handler；新增 `TZ` 容器变量与文档，补充日志目录权限说明 |
 | v1.14.0 | 架构重构：抽出 `settings.py` 统一配置、`devices.py`（DeviceService）业务层、`webui_page.py` 页面渲染；`server.py` 只保留 7 个工具薄包装，去掉 MCP 私有 API 依赖；WebUI 新增 `WEBUI_TOKEN` 登录、状态/设备接口短缓存、批量控制并发上限；新增分进程日志、`LOG_FORMAT=json`、`/metrics`；依赖精确锁定、镜像 digest 固定、`.env` 一致性测试 |
 | v1.13.8 | 部署配置整理：`.env.example` 收敛为 3 个必填项并补充默认值说明；`docker-compose.yml` 支持 `PUID`/`PGID` 覆盖运行用户、补充日志目录权限步骤；README 同步 host 网络、日志目录与 `.env` 说明 |
