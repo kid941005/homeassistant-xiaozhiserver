@@ -18,7 +18,6 @@ def main() -> None:
         env = os.environ.copy()
         env.update(
             LOG_FILE=str(blocker / "homeassistant-xiaozhiserver.log"),
-            LOG_SPLIT="true",
             LOG_ROLE="bridge",
             PYTHONPATH=str(ROOT),
             PYTHONDONTWRITEBYTECODE="1",

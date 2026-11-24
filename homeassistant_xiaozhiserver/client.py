@@ -16,6 +16,7 @@ import random
 import re
 import ssl
 import time
+import weakref
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -93,7 +94,7 @@ class HAClient:
         self._state_ws_retry_after = 0.0
         self._state_ws_established = False
         self._state_waiters: dict[str, list[tuple[asyncio.Future, Any]]] = {}
-        self._entity_locks: dict[str, asyncio.Lock] = {}
+        self._entity_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
         self._validate_config()
 
     def _validate_config(self) -> None:

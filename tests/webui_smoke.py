@@ -100,6 +100,8 @@ status = r.json()
 check("status.ok 为 True", status.get("ok") is True)
 check("status 含版本号", isinstance(status.get("version"), str) and bool(status["version"]))
 check("status 工具数为 7", len(status.get("tools") or []) == 7, str(len(status.get("tools") or [])))
+bridge_status = status.get("bridge") or {}
+check("status 含 bridge 连接状态", isinstance(bridge_status, dict) and "connected" in bridge_status, str(bridge_status))
 ha_token_env = os.environ.get("HA_TOKEN", "")
 check("HA_TOKEN 不回传明文", ha_token_env == "" or ha_token_env not in json.dumps(status, ensure_ascii=False))
 

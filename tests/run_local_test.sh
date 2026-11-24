@@ -90,6 +90,9 @@ echo "===== dedupe unit ====="
 echo "===== state cache unit ====="
 "$PY" tests/state_cache.py
 
+echo "===== bridge status unit ====="
+"$PY" tests/bridge_status.py
+
 echo "===== confirm window unit ====="
 "$PY" tests/confirm_window.py
 

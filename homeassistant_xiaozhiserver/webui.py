@@ -38,6 +38,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Red
 from . import __version__
 from . import server as mcp_server
 from .client import HAError
+from .bridge_status import read_status as read_bridge_status
 from .config import (
     DANGEROUS_SERVICE_DOMAINS,
     DEFAULT_LIST_LIMIT,
@@ -186,6 +187,54 @@ def _mask_endpoint(raw: str) -> str:
         for key, value in parse_qsl(parts.query, keep_blank_values=True)
     )
     return urlunsplit((parts.scheme, netloc, parts.path, query, ""))
+
+
+def _bridge_data() -> dict[str, Any]:
+    """读取 bridge 进程写入的状态文件，得到实际连接状态。"""
+    endpoint = _env("MCP_ENDPOINT")
+    if not endpoint:
+        return {
+            "configured": False,
+            "available": False,
+            "connected": False,
+            "stale": False,
+            "message": "未配置 MCP_ENDPOINT",
+        }
+    raw = read_bridge_status()
+    if raw is None:
+        return {
+            "configured": True,
+            "available": False,
+            "connected": False,
+            "stale": False,
+            "message": "bridge 状态文件尚未生成",
+        }
+    connected = bool(raw.get("connected")) and not bool(raw.get("stale"))
+    connected_at = raw.get("connected_at")
+    connected_for = None
+    if isinstance(connected_at, (int, float)):
+        connected_for = max(0, int(time.time() - connected_at))
+    if connected:
+        message = ""
+    elif raw.get("stale"):
+        message = "bridge 心跳超时"
+    else:
+        message = "bridge 未连接"
+    return {
+        "configured": True,
+        "available": True,
+        "connected": connected,
+        "stale": bool(raw.get("stale")),
+        "endpoint": str(raw.get("endpoint") or ""),
+        "connected_at": connected_at,
+        "connected_for_seconds": connected_for,
+        "attempt": int(raw.get("attempt") or 0),
+        "last_error": str(raw.get("last_error") or ""),
+        "age_seconds": raw.get("age_seconds"),
+        "pid": raw.get("pid"),
+        "server_pid": raw.get("server_pid"),
+        "message": message,
+    }
 
 
 def create_app() -> FastAPI:
@@ -347,6 +396,7 @@ def create_app() -> FastAPI:
                 "configured": bool(_env("MCP_ENDPOINT")),
                 "display": _mask_endpoint(_env("MCP_ENDPOINT")),
             },
+            "bridge": _bridge_data(),
             "tools": [
                 {"name": name, "description": desc, "example": example}
                 for name, desc, example in _TOOLS
@@ -564,8 +614,14 @@ def create_app() -> FastAPI:
     @app.get("/readyz")
     async def readyz() -> JSONResponse:
         status = await _status_data()
-        ready = bool(status.get("ha", {}).get("configured") and status.get("ha", {}).get("reachable"))
-        return JSONResponse({"ok": ready, "ha": status.get("ha")}, status_code=200 if ready else 503)
+        ha_ready = bool(status.get("ha", {}).get("configured") and status.get("ha", {}).get("reachable"))
+        bridge = status.get("bridge") or {}
+        bridge_ready = not bridge.get("configured") or bool(bridge.get("connected"))
+        ready = bool(ha_ready and bridge_ready)
+        return JSONResponse(
+            {"ok": ready, "ha": status.get("ha"), "bridge": bridge},
+            status_code=200 if ready else 503,
+        )
 
     @app.get("/", response_class=HTMLResponse)
     async def index() -> HTMLResponse:

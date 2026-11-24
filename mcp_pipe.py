@@ -36,12 +36,17 @@ try:
     from homeassistant_xiaozhiserver import __version__ as _bridge_version
 except Exception:  # pragma: no cover - 独立运行时无包
     _bridge_version = "unknown"
+try:
+    from homeassistant_xiaozhiserver.bridge_status import write_status as _write_bridge_status
+except Exception:  # pragma: no cover - 独立运行时无包
+    _write_bridge_status = None
 logger = logging.getLogger("MCP_PIPE")
 logger.info("bridge version=%s", _bridge_version)
 
 INITIAL_BACKOFF = 1
 MAX_BACKOFF = 600
 TERMINATE_TIMEOUT = 5
+BRIDGE_STATUS_INTERVAL = 5.0
 
 
 class MCPPipeClosed(RuntimeError):
@@ -58,6 +63,42 @@ def _safe_endpoint(raw: str) -> str:
         return "(invalid)"
     netloc = parts.netloc.rsplit("@", 1)[-1]
     return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+
+
+def _new_bridge_state() -> dict:
+    return {
+        "connected": False,
+        "connected_at": None,
+        "attempt": 0,
+        "last_error": None,
+        "server_pid": None,
+    }
+
+
+def _publish_bridge_status(uri: str, state: dict) -> None:
+    """把当前状态写入共享文件；失败只记 debug，不影响桥接。"""
+    if _write_bridge_status is None:
+        return
+    payload = {
+        "pid": os.getpid(),
+        "version": _bridge_version,
+        "endpoint": _safe_endpoint(uri),
+        "connected": bool(state.get("connected")),
+        "connected_at": state.get("connected_at"),
+        "attempt": int(state.get("attempt") or 0),
+        "last_error": str(state.get("last_error") or ""),
+        "server_pid": state.get("server_pid"),
+    }
+    try:
+        _write_bridge_status(payload)
+    except Exception:  # noqa: BLE001 - 状态文件失败不影响主流程
+        logger.debug("写入 bridge 状态失败", exc_info=True)
+
+
+async def _bridge_status_heartbeat(uri: str, state: dict) -> None:
+    while True:
+        _publish_bridge_status(uri, state)
+        await asyncio.sleep(BRIDGE_STATUS_INTERVAL)
 
 
 def build_server_command(script_path: str | None = None):
@@ -128,8 +169,9 @@ async def pipe_process_stderr(process, target: str) -> None:
         raise
 
 
-async def connect_to_server(uri: str, script_path: str, target: str) -> None:
+async def connect_to_server(uri: str, script_path: str, target: str, state: dict | None = None) -> None:
     """连接接入点并启动一次 MCP server；连接断开后由外层重连。"""
+    state = state if state is not None else _new_bridge_state()
     logger.info("[%s] 正在连接 MCP 接入点 %s", target, _safe_endpoint(uri))
     async with websockets.connect(
         uri,
@@ -152,6 +194,8 @@ async def connect_to_server(uri: str, script_path: str, target: str) -> None:
             env=env,
         )
         logger.info("[%s] 已启动 MCP server：%s", target, " ".join(cmd))
+        state.update(connected=True, connected_at=time.time(), last_error=None, server_pid=process.pid)
+        _publish_bridge_status(uri, state)
 
         tasks = [
             asyncio.create_task(pipe_websocket_to_process(websocket, process, target)),
@@ -171,6 +215,8 @@ async def connect_to_server(uri: str, script_path: str, target: str) -> None:
             # 否则 connect_with_retry 会立刻无退避重连，形成忙循环。
             raise MCPPipeClosed("MCP server 管道已结束（进程退出或连接关闭）")
         finally:
+            state.update(connected=False, connected_at=None, server_pid=None)
+            _publish_bridge_status(uri, state)
             _terminate(process, target)
 
 
@@ -178,24 +224,40 @@ async def connect_with_retry(uri: str, script_path: str, target: str) -> None:
     """无限重连；每次重连都会重新启动 MCP server。"""
     attempt = 0
     backoff = INITIAL_BACKOFF
-    while True:
-        # 在 try 外赋值，保证异常路径也能安全计算连接时长。
-        started = time.monotonic()
+    state = _new_bridge_state()
+    heartbeat = asyncio.create_task(_bridge_status_heartbeat(uri, state))
+    try:
+        while True:
+            # 在 try 外赋值，保证异常路径也能安全计算连接时长。
+            started = time.monotonic()
+            try:
+                if attempt > 0:
+                    logger.info("[%s] %ss 后进行第 %s 次重连", target, backoff, attempt)
+                    await asyncio.sleep(backoff * (0.5 + random.random()))
+                state["attempt"] = attempt
+                await connect_to_server(uri, script_path, target, state)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # 连接稳定运行过一段时间后再断开，重置退避，避免长期运行后从 600s 开始重连。
+                if time.monotonic() - started > 60:
+                    attempt = 0
+                    backoff = INITIAL_BACKOFF
+                attempt += 1
+                state.update(connected=False, connected_at=None, server_pid=None)
+                state["attempt"] = attempt
+                state["last_error"] = type(e).__name__
+                _publish_bridge_status(uri, state)
+                logger.warning("[%s] 连接断开（第 %s 次）：%s", target, attempt, e)
+                backoff = min(backoff * 2, MAX_BACKOFF)
+    finally:
+        heartbeat.cancel()
         try:
-            if attempt > 0:
-                logger.info("[%s] %ss 后进行第 %s 次重连", target, backoff, attempt)
-                await asyncio.sleep(backoff * (0.5 + random.random()))
-            await connect_to_server(uri, script_path, target)
+            await heartbeat
         except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            # 连接稳定运行过一段时间后再断开，重置退避，避免长期运行后从 600s 开始重连。
-            if time.monotonic() - started > 60:
-                attempt = 0
-                backoff = INITIAL_BACKOFF
-            attempt += 1
-            logger.warning("[%s] 连接断开（第 %s 次）：%s", target, attempt, e)
-            backoff = min(backoff * 2, MAX_BACKOFF)
+            pass
+        state.update(connected=False, connected_at=None, server_pid=None)
+        _publish_bridge_status(uri, state)
 
 
 def signal_handler(sig, frame) -> None:

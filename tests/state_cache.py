@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import sys
 import time
@@ -71,6 +72,10 @@ async def run() -> None:
     lock_a = ha.entity_lock("light.a")
     check(lock_a is ha.entity_lock("light.a"), "同一实体复用同一把控制锁")
     check(lock_a is not ha.entity_lock("light.b"), "不同实体使用不同控制锁")
+    temp_lock = ha.entity_lock("light.gc")
+    del temp_lock
+    gc.collect()
+    check("light.gc" not in ha._entity_locks, "无强引用的实体锁会被回收，避免无界增长")
     order = []
 
     async def locked_worker(name: str) -> None:

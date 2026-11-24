@@ -2,7 +2,6 @@
 """统一日志配置：分进程文件、可选 JSON 结构化输出，WebUI 可读取全部日志文件。
 
 - WebUI 与 MCP bridge 是两个进程，各自写自己的文件，避免同一 RotatingFileHandler 轮转竞争；
-- 设置 LOG_SPLIT=false 可退回两进程共用一个文件（保留旧行为）；
 - 日志目录不可写时自动回退到临时目录，并且不再刷屏 Python logging 的 Traceback；
 - read_recent_logs 读取所有实际日志文件尾部，按时间排序后返回。
 """
@@ -119,7 +118,7 @@ def log_file_path(role: str | None = None) -> str:
 
 
 def log_files() -> tuple[str, ...]:
-    roles = ("webui", "bridge") if settings.log_split else ("bridge",)
+    roles = ("webui", "bridge")
     paths = [p for p in (_effective_path(role) for role in roles) if p]
     return tuple(dict.fromkeys(paths))
 

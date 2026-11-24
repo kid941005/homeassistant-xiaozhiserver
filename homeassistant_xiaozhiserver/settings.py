@@ -100,7 +100,6 @@ class Settings:
     log_file: str = ""
     log_file_webui: str = ""
     log_file_bridge: str = ""
-    log_split: bool = True
     log_format: str = "text"
     log_max_bytes: int = 5 * 1024 * 1024
     log_backup_count: int = 3
@@ -131,8 +130,6 @@ class Settings:
     metrics_enabled: bool = True
 
     def log_file_for(self, role: str | None = None) -> str:
-        if not self.log_split:
-            return self.log_file
         role = (role or os.environ.get("LOG_ROLE") or "bridge").strip().lower()
         if role == "webui":
             return self.log_file_webui or self.log_file
@@ -140,9 +137,9 @@ class Settings:
 
     @property
     def log_files(self) -> tuple[str, ...]:
-        if not self.log_split:
-            return (self.log_file,)
-        return tuple(dict.fromkeys([self.log_file, self.log_file_webui, self.log_file_bridge]))
+        return tuple(dict.fromkeys(
+            path for path in (self.log_file_for("webui"), self.log_file_for("bridge")) if path
+        ))
 
 
 def _load() -> Settings:
@@ -153,7 +150,6 @@ def _load() -> Settings:
     base_file = env_str("LOG_FILE", "") or os.path.join(
         tempfile.gettempdir(), "homeassistant-xiaozhiserver.log"
     )
-    split = env_bool("LOG_SPLIT", True)
     webui_file = env_str("LOG_FILE_WEBUI", "") or _split_path(base_file, ".webui")
     bridge_file = env_str("LOG_FILE_BRIDGE", "") or _split_path(base_file, ".bridge")
     fmt = env_str("LOG_FORMAT", "text").lower()
@@ -179,7 +175,6 @@ def _load() -> Settings:
         log_file=base_file,
         log_file_webui=webui_file,
         log_file_bridge=bridge_file,
-        log_split=split,
         log_format=fmt,
         log_max_bytes=env_int("LOG_MAX_BYTES", 5 * 1024 * 1024, 0, 1024 * 1024 * 1024),
         log_backup_count=env_int("LOG_BACKUP_COUNT", 3, 0, 50),
@@ -218,7 +213,7 @@ settings = _load()
 
 # 供 .env.example 一致性检查与文档使用：本程序会读取的全部环境变量。
 APP_ENV_KEYS = (
-    "LOG_LEVEL", "LOG_FILE", "LOG_FILE_WEBUI", "LOG_FILE_BRIDGE", "LOG_SPLIT",
+    "LOG_LEVEL", "LOG_FILE", "LOG_FILE_WEBUI", "LOG_FILE_BRIDGE",
     "LOG_FORMAT", "LOG_MAX_BYTES", "LOG_BACKUP_COUNT",
     "DEFAULT_LIST_LIMIT", "MAX_LIST_LIMIT",
     "EXCLUDED_DOMAINS", "EXCLUDED_DEVICE_KEYWORDS",

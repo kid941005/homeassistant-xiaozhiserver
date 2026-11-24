@@ -6,13 +6,12 @@
 """
 from __future__ import annotations
 
-from .settings import env_bool, env_float, env_int, env_set, env_str, settings
+from .settings import env_bool, env_float, settings  # noqa: F401  兼容旧 import
 
 LOG_LEVEL = settings.log_level
 LOG_FILE = settings.log_file
 LOG_FILE_WEBUI = settings.log_file_webui
 LOG_FILE_BRIDGE = settings.log_file_bridge
-LOG_SPLIT = settings.log_split
 LOG_FORMAT = settings.log_format
 LOG_MAX_BYTES = settings.log_max_bytes
 LOG_BACKUP_COUNT = settings.log_backup_count

@@ -150,6 +150,19 @@ def _render_index(status: dict[str, Any], devices: dict[str, Any],
         ha_text = "<span class='muted'>检测中</span> · " + html.escape(str(ha["url"]))
     endpoint = status["mcp_endpoint"]
     endpoint_text = html.escape(endpoint["display"]) if endpoint["configured"] else "<span class='bad'>未配置</span>"
+    bridge = status.get("bridge") or {}
+    if not bridge.get("configured"):
+        bridge_text = "<span class='muted'>未配置</span>"
+    elif bridge.get("connected"):
+        bridge_text = "<span class='ok'>已连接</span>"
+        if bridge.get("connected_for_seconds") is not None:
+            bridge_text += " · " + str(bridge["connected_for_seconds"]) + " 秒"
+    elif bridge.get("available"):
+        bridge_text = "<span class='bad'>未连接</span>"
+        if bridge.get("last_error"):
+            bridge_text += "（" + html.escape(str(bridge["last_error"])) + "）"
+    else:
+        bridge_text = "<span class='muted'>状态未知</span>"
 
     status_rows = "".join(
         "<tr><th>" + html.escape(key) + "</th><td>" + value + "</td></tr>"
@@ -159,6 +172,7 @@ def _render_index(status: dict[str, Any], devices: dict[str, Any],
             ("运行时长", str(status["uptime_seconds"]) + " 秒"),
             ("HA 连通性", ha_text),
             ("MCP 接入点", endpoint_text),
+            ("Bridge 连接", bridge_text),
             ("运行形态", html.escape(status["target"])),
         ]
     )
