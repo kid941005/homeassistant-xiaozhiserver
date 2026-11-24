@@ -2,7 +2,7 @@
 
 > 把 **Home Assistant** 的实体与服务封装成标准 **MCP（Model Context Protocol）** 工具，供 **小智（xiaozhi-server）** 通过 **MCP 接入点** 用自然语言查询和控制智能家居设备。
 
-**当前版本：v1.14.0** · Python 3.12 · 传输方式：**stdio MCP server + WebSocket bridge** · 单容器部署（MCP bridge + WebUI）
+**当前版本：v1.14.1** · Python 3.12 · 传输方式：**stdio MCP server + WebSocket bridge** · 单容器部署（MCP bridge + WebUI）
 
 ---
 
@@ -127,6 +127,7 @@ homeassistant-xiaozhiserver/
 │   ├── state_cache.py               # 状态/服务缓存、事件流与失效单测
 │   ├── confirm_window.py            # 慢设备回读窗口单测
 │   ├── env_consistency.py           # .env.example / .env / 代码读取三方一致性
+│   ├── logging_fallback.py          # 日志目录不可写自动回退、无 Traceback 刷屏
 │   ├── webui_smoke.py               # WebUI 登录与接口冒烟测试
 │   └── run_local_test.sh            # 一键测试入口
 └── README.md
@@ -212,8 +213,8 @@ docker compose logs -f homeassistant-xiaozhiserver
 看到以下日志表示 bridge 已连上小智：
 
 ```text
-2026-01-01 12:00:00 INFO  v1.14.0 MCP_PIPE [-] MCP接入点连接成功
-2026-01-01 12:00:00 INFO  v1.14.0 MCP_PIPE [-] 已启动 MCP server：...
+2026-01-01 12:00:00.123 INFO    v1.14.1 MCP_PIPE [-] MCP接入点连接成功
+2026-01-01 12:00:00.456 INFO    v1.14.1 MCP_PIPE [-] 已启动 MCP server：...
 ```
 
 WebUI 地址：`http://<宿主机IP>:8099/`（端口由 `WEBUI_PORT` 决定），首次打开会跳转登录页，输入 `.env` 的 `WEBUI_TOKEN` 后才能进入。compose 使用 `network_mode: host`，因此没有 `ports` 映射；如需只允许本机访问，把 `.env` 的 `WEBUI_HOST` 设为 `127.0.0.1`。
@@ -300,7 +301,11 @@ WebUI 与 MCP bridge 在同一个容器内运行：WebUI 后台常驻，bridge �
 
 WebUI 使用 `.env` 中的 `WEBUI_TOKEN` 登录，所有页面与 API（除 `/login`、`/healthz`、`/readyz`、`/metrics`）都要求有效会话 Cookie。仍然建议只绑定可信内网或放在带 TLS 的反向代理后面。WebUI 会独立拦截危险设备与高风险服务（不受 `DANGER_CONFIRM_ENABLED` 影响；查询设备安全性失败时按拒绝处理，失败关闭），写请求必须同源并校验 Host/Origin，所有响应附带 `X-Content-Type-Options`、`X-Frame-Options`、`CSP` 等安全头。允许的 Host 默认是 localhost/内网 IP，跨网段或域名访问可通过 `WEBUI_ALLOWED_HOSTS` 追加。
 
-日志默认写入系统临时目录，可用 `LOG_FILE` 指定；默认 `LOG_SPLIT=true`，WebUI 与 bridge 分别写 `*.webui.log` / `*.bridge.log`，避免两个进程同时轮转同一文件。`LOG_FORMAT=json` 可输出结构化日志，`/metrics` 暴露工具与 HTTP 指标。项目根 `docker-compose.yml` 把容器 `/app/logs` 挂到宿主机 `./xiaozhi-logs`，并设置 json-file 日志上限。容器以宿主机用户 `1000:1000`（可由 `PUID` / `PGID` 覆盖）运行，必须保证该目录归同一 UID/GID 所有；首次启动前执行 `mkdir -p ./xiaozhi-logs && sudo chown -R "$(id -u):$(id -g)" ./xiaozhi-logs`。非 compose 部署如需长期保留，建议同样挂载目录：
+日志默认写入系统临时目录，可用 `LOG_FILE` 指定；默认 `LOG_SPLIT=true`，WebUI 与 bridge 分别写 `*.webui.log` / `*.bridge.log`，避免两个进程同时轮转同一文件。日志行格式为 `YYYY-MM-DD HH:MM:SS.mmm LEVEL v版本 模块 [call_id] 消息`，默认 `TZ=Asia/Shanghai`（可用环境变量覆盖），因此容器日志与宿主机本地时间一致。`LOG_FORMAT=json` 可输出结构化日志，`/metrics` 暴露工具与 HTTP 指标。项目根 `docker-compose.yml` 把容器 `/app/logs` 挂到宿主机 `./xiaozhi-logs`，并设置 json-file 日志上限。
+
+> 日志目录不可写时，程序会自动回退到容器内临时目录（`/tmp/xiaozhi-logs`），并用一条带时间戳的告警说明原因，不再输出 Python logging 的整段 Traceback；WebUI 的日志面板会自动读取实际生效的日志文件。要保留宿主机日志，仍需保证 `./xiaozhi-logs` 归容器用户所有。
+
+容器以宿主机用户 `1000:1000`（可由 `PUID` / `PGID` 覆盖）运行，必须保证该目录归同一 UID/GID 所有；首次启动前执行 `mkdir -p ./xiaozhi-logs && sudo chown -R "$(id -u):$(id -g)" ./xiaozhi-logs`。非 compose 部署如需长期保留，建议同样挂载目录：
 
 ```bash
 mkdir -p ./xiaozhi-logs
@@ -383,6 +388,7 @@ docker run --user "${PUID:-1000}:${PGID:-1000}" \
 | `LOG_FILE_WEBUI` | 由 `LOG_FILE` 推导 `*.webui.log` | WebUI 进程日志路径 |
 | `LOG_FILE_BRIDGE` | 由 `LOG_FILE` 推导 `*.bridge.log` | bridge/MCP server 进程日志路径 |
 | `LOG_FORMAT` | `text` | `text` 或 `json`（结构化日志） |
+| `TZ` | `Asia/Shanghai` | 容器与日志时间戳时区；Dockerfile 与 compose 均提供默认值 |
 | `LOG_MAX_BYTES` | `5242880` | 单个日志文件轮转阈值（字节），`0` 表示不按大小轮转 |
 | `LOG_BACKUP_COUNT` | `3` | 保留的历史日志文件数量 |
 | `PUID` | `1000` | compose 容器运行 UID；宿主机用户不是 1000 时覆盖，并同步 chown `./xiaozhi-logs` |
@@ -711,8 +717,9 @@ bash tests/run_local_test.sh
 4. 运行 `tests/dedupe_switch_light.py`，校验同名开关/灯具去重的各边界；
 5. 运行 `tests/state_cache.py`，校验状态/服务缓存命中、强制刷新、服务调用后失效与真实 `state_changed` 事件流；
 6. 运行 `tests/confirm_window.py`，校验慢设备在 `SERVICE_CONFIRM_TIMEOUT` 内回写仍能被确认；
-7. 运行 `tests/webui_smoke.py`，校验 WebUI 无需登录、状态、配置掩码、设备总览、日志、健康探针、安全响应头与工具白名单；
-8. 结束后自动清理。
+7. 运行 `tests/logging_fallback.py`，校验日志目录不可写时回退到临时目录且无 Python logging Traceback；
+8. 运行 `tests/webui_smoke.py`，校验 WebUI 登录、状态、配置掩码、设备总览、日志、健康探针、安全响应头与工具白名单；
+9. 结束后自动清理。
 
 手动运行见 `tests/run_local_test.sh` 内注释；重跑前请重启 fake HA，保证初始状态。
 
@@ -733,6 +740,7 @@ bash tests/run_local_test.sh
 
 | 版本 | 主要变化 |
 |---|---|
+| v1.14.1 | 日志可读性修复：时间戳加入毫秒并默认 `TZ=Asia/Shanghai` 本地时间；日志目录不可写时自动回退到 `/tmp/xiaozhi-logs`，只输出一条带时间戳的告警，不再刷 Python logging Traceback；清理重复 root handler；新增 `TZ` 容器变量与文档，补充日志目录权限说明 |
 | v1.14.0 | 架构重构：抽出 `settings.py` 统一配置、`devices.py`（DeviceService）业务层、`webui_page.py` 页面渲染；`server.py` 只保留 7 个工具薄包装，去掉 MCP 私有 API 依赖；WebUI 新增 `WEBUI_TOKEN` 登录、状态/设备接口短缓存、批量控制并发上限；新增分进程日志、`LOG_FORMAT=json`、`/metrics`；依赖精确锁定、镜像 digest 固定、`.env` 一致性测试 |
 | v1.13.8 | 部署配置整理：`.env.example` 收敛为 3 个必填项并补充默认值说明；`docker-compose.yml` 支持 `PUID`/`PGID` 覆盖运行用户、补充日志目录权限步骤；README 同步 host 网络、日志目录与 `.env` 说明 |
 | v1.13.7 | 修复慢设备回读窗口被 `min_attempts` 提前截断、`compact` 设备分组丢设备名、注册表瞬时失败清空旧缓存；WebUI 危险闸门失败关闭、`call_service` 目标选择器防绕过；补充真实事件流、慢设备回读与批量上限测试；新增 `WEBUI_HOST` / `WEBUI_PORT`、事件流失败熔断、`set_brightness 0` 映射关闭、Origin 默认端口归一化、日志尾部全量解析 |

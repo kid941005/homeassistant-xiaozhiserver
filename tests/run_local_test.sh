@@ -96,5 +96,8 @@ echo "===== confirm window unit ====="
 echo "===== env consistency ====="
 "$PY" tests/env_consistency.py
 
+echo "===== logging fallback ====="
+"$PY" tests/logging_fallback.py
+
 echo "===== webui smoke ====="
 "$PY" tests/webui_smoke.py

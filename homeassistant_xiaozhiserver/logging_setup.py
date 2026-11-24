@@ -3,7 +3,8 @@
 
 - WebUI 与 MCP bridge 是两个进程，各自写自己的文件，避免同一 RotatingFileHandler 轮转竞争；
 - 设置 LOG_SPLIT=false 可退回两进程共用一个文件（保留旧行为）；
-- read_recent_logs 读取所有日志文件尾部，按时间排序后返回。
+- 日志目录不可写时自动回退到临时目录，并且不再刷屏 Python logging 的 Traceback；
+- read_recent_logs 读取所有实际日志文件尾部，按时间排序后返回。
 """
 from __future__ import annotations
 
@@ -14,6 +15,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 from logging.handlers import RotatingFileHandler, WatchedFileHandler
 
 from . import __version__
@@ -21,8 +23,9 @@ from .settings import settings
 
 _CALL_ID = contextvars.ContextVar("call_id", default="-")
 _VERSION_LOGGED = False
+_EFFECTIVE_FILES: dict[str, str] = {}
 _LINE_RE = re.compile(
-    r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) (\w+)\s+(?:v(\d+\.\d+\.\d+\S*)\s+)?(\S+) \[([^\]]*)\] (.*)$"
+    r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:[,.]\d{3})? (\w+)\s+(?:v(\d+\.\d+\.\d+\S*)\s+)?(\S+) \[([^\]]*)\] (.*)$"
 )
 
 
@@ -53,20 +56,79 @@ class _JsonFormatter(logging.Formatter):
         return json.dumps(payload, ensure_ascii=False)
 
 
+class _ConciseFileErrors:
+    """文件 handler 写失败时只打印一条带时间戳的告警，不再输出整段 Traceback。"""
+
+    def handleError(self, record: logging.LogRecord) -> None:  # pragma: no cover - 防御性
+        if getattr(self, "_error_logged", False):
+            return
+        self._error_logged = True  # type: ignore[attr-defined]
+        exc = sys.exc_info()[1]
+        sys.stderr.write(
+            "%s ERROR 日志文件不可写 %s：%s；后续文件日志暂停，请检查 LOG_FILE 目录权限\n"
+            % (time.strftime("%Y-%m-%d %H:%M:%S"), getattr(self, "baseFilename", "?"), exc)
+        )
+
+
+class _SafeRotatingFileHandler(_ConciseFileErrors, RotatingFileHandler):
+    pass
+
+
+class _SafeWatchedFileHandler(_ConciseFileErrors, WatchedFileHandler):
+    pass
+
+
+def _role_name(role: str | None = None) -> str:
+    return (role or os.environ.get("LOG_ROLE") or "bridge").strip().lower()
+
+
+def _probe_writable(path: str) -> bool:
+    if not path:
+        return False
+    parent = os.path.dirname(path)
+    try:
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        os.close(fd)
+        return True
+    except OSError:
+        return False
+
+
+def _effective_path(role: str | None = None) -> str:
+    key = _role_name(role)
+    if key in _EFFECTIVE_FILES:
+        return _EFFECTIVE_FILES[key]
+
+    preferred = settings.log_file_for(key)
+    if _probe_writable(preferred):
+        chosen = preferred
+    else:
+        fallback = os.path.join(
+            tempfile.gettempdir(), "xiaozhi-logs", os.path.basename(preferred) or "homeassistant-xiaozhiserver.log"
+        )
+        chosen = fallback if _probe_writable(fallback) else ""
+    _EFFECTIVE_FILES[key] = chosen
+    return chosen
+
+
 def log_file_path(role: str | None = None) -> str:
-    """返回本进程（或指定角色）日志文件路径。"""
-    return settings.log_file_for(role)
+    """返回本进程（或指定角色）实际可写的日志文件路径；不可写时返回空串。"""
+    return _effective_path(role)
 
 
 def log_files() -> tuple[str, ...]:
-    return settings.log_files
+    roles = ("webui", "bridge") if settings.log_split else ("bridge",)
+    paths = [p for p in (_effective_path(role) for role in roles) if p]
+    return tuple(dict.fromkeys(paths))
 
 
 def _formatter() -> logging.Formatter:
     if settings.log_format == "json":
         return _JsonFormatter()
     return logging.Formatter(
-        "%(asctime)s %(levelname)-5s v%(version)s %(name)s [%(call_id)s] %(message)s",
+        "%(asctime)s.%(msecs)03d %(levelname)-7s v%(version)s %(name)s [%(call_id)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
@@ -79,6 +141,13 @@ def setup_logging(role: str | None = None) -> None:
     for name in ("httpx", "httpx2", "httpcore"):
         logging.getLogger(name).setLevel(max(level, logging.WARNING))
 
+    # 清掉 third-party 或上一次 basicConfig 留下的 handler，避免同一条日志被无格式地重复输出。
+    for handler in list(root.handlers):
+        if not getattr(handler, "_homeassistant_xiaozhiserver", False) and not getattr(
+            handler, "_homeassistant_xiaozhiserver_file", False
+        ):
+            root.removeHandler(handler)
+
     if not any(getattr(h, "_homeassistant_xiaozhiserver", False) for h in root.handlers):
         stream = logging.StreamHandler(sys.stderr)
         stream.setFormatter(_formatter())
@@ -89,35 +158,45 @@ def setup_logging(role: str | None = None) -> None:
 
     if not any(getattr(h, "_homeassistant_xiaozhiserver_file", False) for h in root.handlers):
         path = log_file_path(role)
-        try:
-            parent = os.path.dirname(path)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            if settings.log_max_bytes > 0:
-                handler = RotatingFileHandler(
-                    path,
-                    maxBytes=settings.log_max_bytes,
-                    backupCount=settings.log_backup_count,
-                    encoding="utf-8",
-                    delay=True,
+        preferred = settings.log_file_for(role)
+        if path and path != preferred:
+            logging.getLogger("homeassistant_xiaozhiserver.logging").warning(
+                "日志路径不可写 %s，已回退到 %s", preferred, path
+            )
+        if path:
+            try:
+                if settings.log_max_bytes > 0:
+                    handler = _SafeRotatingFileHandler(
+                        path,
+                        maxBytes=settings.log_max_bytes,
+                        backupCount=settings.log_backup_count,
+                        encoding="utf-8",
+                        delay=True,
+                    )
+                else:
+                    handler = _SafeWatchedFileHandler(path, encoding="utf-8", errors="replace", delay=True)
+            except OSError as exc:
+                logging.getLogger("homeassistant_xiaozhiserver.logging").warning(
+                    "无法创建日志文件 %s：%s；仅输出到 stderr", path, exc
                 )
             else:
-                handler = WatchedFileHandler(path, encoding="utf-8", errors="replace", delay=True)
-        except OSError as exc:
+                handler.setFormatter(_formatter())
+                handler.addFilter(_CallIdFilter())
+                handler.addFilter(_VersionFilter())
+                handler._homeassistant_xiaozhiserver_file = True  # type: ignore[attr-defined]
+                root.addHandler(handler)
+        else:
             logging.getLogger("homeassistant_xiaozhiserver.logging").warning(
-                "无法创建日志文件 %s：%s", path, exc
+                "日志目录不可写，已仅输出到 stderr；请检查 LOG_FILE 目录权限或挂载"
             )
-            return
-        handler.setFormatter(_formatter())
-        handler.addFilter(_CallIdFilter())
-        handler.addFilter(_VersionFilter())
-        handler._homeassistant_xiaozhiserver_file = True  # type: ignore[attr-defined]
-        root.addHandler(handler)
 
     global _VERSION_LOGGED
     if not _VERSION_LOGGED:
         logging.getLogger("homeassistant_xiaozhiserver").info(
-            "version=%s role=%s", __version__, role or os.environ.get("LOG_ROLE", "bridge")
+            "version=%s role=%s log_file=%s",
+            __version__,
+            _role_name(role),
+            log_file_path(role) or "stderr",
         )
         _VERSION_LOGGED = True
 
@@ -171,7 +250,7 @@ def _parse_line(line: str) -> dict[str, str] | None:
 
 
 def read_recent_logs(limit: int = 200, level: str | None = None) -> list[dict[str, str]]:
-    """读取全部日志文件尾部，合并后按时间返回最后 limit 条。"""
+    """读取全部实际日志文件尾部，合并后按时间返回最后 limit 条。"""
     try:
         limit = max(1, min(int(limit), 1000))
     except (TypeError, ValueError):

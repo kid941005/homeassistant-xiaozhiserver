@@ -3,7 +3,8 @@
 # 基础镜像固定 digest，避免上游 tag 漂移；升级时显式更新 digest 并重跑测试。
 FROM python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b
 
-ENV PYTHONUNBUFFERED=1 \
+ENV TZ=Asia/Shanghai \
+    PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 

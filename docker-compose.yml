@@ -25,6 +25,7 @@ services:
       LOG_FILE: ${LOG_FILE:-/app/logs/homeassistant-xiaozhiserver.log}
       LOG_SPLIT: ${LOG_SPLIT:-true}
       LOG_FORMAT: ${LOG_FORMAT:-text}
+      TZ: ${TZ:-Asia/Shanghai}
       WEBUI_HOST: ${WEBUI_HOST:-0.0.0.0}
       WEBUI_PORT: ${WEBUI_PORT:-8099}
       WEBUI_TOKEN: ${WEBUI_TOKEN:-}
