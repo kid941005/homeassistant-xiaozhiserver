@@ -13,7 +13,7 @@ from homeassistant_xiaozhiserver.settings import APP_ENV_KEYS  # noqa: E402
 
 # 仅由 compose / docker-entrypoint.sh 设置，不由应用配置模板管理。
 COMPOSE_ONLY = {"PUID", "PGID", "TZ"}
-INTERNAL_KEYS = {"LOG_ROLE"}
+INTERNAL_KEYS = {"LOG_ROLE", "XIAOZHI_METRICS_DIR"}
 known = set(APP_ENV_KEYS) | COMPOSE_ONLY | INTERNAL_KEYS
 
 

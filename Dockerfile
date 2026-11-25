@@ -32,7 +32,7 @@ ENV HA_TIMEOUT=10 \
 # WebUI 默认监听 8099，可用 WEBUI_PORT 覆盖；EXPOSE 仅作默认声明。
 EXPOSE 8099
 
-HEALTHCHECK --interval=30s --timeout=8s --start-period=20s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=20s --start-period=60s --retries=3 \
     CMD ["python", "/app/healthcheck.py"]
 
 ENTRYPOINT ["/app/docker-entrypoint.sh"]

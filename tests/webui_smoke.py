@@ -22,6 +22,7 @@ os.environ.setdefault("WEBUI_TOKEN", "testtoken")
 from fastapi.testclient import TestClient  # noqa: E402
 
 from homeassistant_xiaozhiserver import __version__  # noqa: E402
+from homeassistant_xiaozhiserver import webui as webui_mod  # noqa: E402
 from homeassistant_xiaozhiserver.config import WEBUI_TOKEN  # noqa: E402
 from homeassistant_xiaozhiserver.webui import _TOOLS, _mask_endpoint, create_app  # noqa: E402
 
@@ -57,6 +58,21 @@ r = post("/login", data={"token": "bad-token"})
 check("错误令牌登录失败", r.status_code == 401 and "不正确" in r.text, str(r.status_code))
 r = post("/login", data={"token": WEBUI_TOKEN})
 check("正确令牌登录成功", r.status_code in (200, 303), str(r.status_code))
+
+# 登录失败限速：直接构造失败记录，避免影响后续用例，同时验证伪造 X-Forwarded-For 不能绕过。
+_saved_failures = dict(webui_mod._LOGIN_FAILURES)
+webui_mod._LOGIN_FAILURES.clear()
+try:
+    for _ in range(5):
+        r = post("/login", data={"token": "bad-token"}, headers={"X-Forwarded-For": "203.0.113.7"})
+    check("连续登录失败达到阈值", r.status_code == 401, str(r.status_code))
+    r = post("/login", data={"token": WEBUI_TOKEN}, headers={"X-Forwarded-For": "203.0.113.8"})
+finally:
+    webui_mod._LOGIN_FAILURES.clear()
+    webui_mod._LOGIN_FAILURES.update(_saved_failures)
+check("超过失败阈值后返回 429 且带 Retry-After",
+      r.status_code == 429 and int(r.headers.get("Retry-After", "0")) > 0,
+      str(r.status_code) + " " + str(r.headers.get("Retry-After")))
 
 r = client.get("/")
 check("无需登录访问首页 200", r.status_code == 200, str(r.status_code))
@@ -218,10 +234,25 @@ if os.environ.get("HA_URL") and os.environ.get("HA_TOKEN"):
               r.status_code == 403 and r.json().get("code") == "dangerous_operation_blocked",
               str(r.status_code) + " " + r.text[:200])
 
+        mcp_server_mod.get_device_state = _fake_script_state
+        try:
+            r = post("/api/tool/control_device", json={"entity": "客厅灯", "action": "turn_on"})
+        finally:
+            mcp_server_mod.get_device_state = _real_get_device_state
+        check("control_device 动作映射后仍判定脚本风险",
+              r.status_code == 403 and r.json().get("code") == "dangerous_operation_blocked",
+              str(r.status_code) + " " + r.text[:200])
+
     examples = {name: example for name, _, example in _TOOLS}
     r = post("/api/tool/call_service", json=json.loads(examples["call_service"]))
     check("工具调试台示例可执行", r.status_code == 200 and r.json().get("ok") is True,
           str(r.status_code) + " " + r.text[:200])
+
+    r = client.get("/metrics")
+    check("工具调用指标已暴露",
+          r.status_code == 200 and 'ha_mcp_tool_calls_total{' in r.text
+          and 'tool="list_domains"' in r.text and 'tool="call_service"' in r.text,
+          r.text[:300])
 else:
     print("[skip] 未配置 HA_URL/HA_TOKEN，跳过真实工具调用")
 

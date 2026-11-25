@@ -15,6 +15,7 @@ from .config import (
     CONTROL_BATCH_TIMEOUT,
     CONTROL_CONCURRENCY,
     DEFAULT_LIST_LIMIT,
+    EXCLUDED_DEVICE_KEYWORDS,
     EXCLUDED_DOMAINS,
     MAX_LIST_LIMIT,
 )
@@ -43,7 +44,10 @@ from .views import (
 
 log = logging.getLogger("homeassistant_xiaozhiserver.devices")
 
-_VERIFIED_OK_STATUSES = ("confirmed", "accepted", "no_change")
+
+class _BatchNotDispatched(Exception):
+    """批量总时限耗尽，指令尚未下发（不能按“已发送待确认”播报）。"""
+
 
 def _result_ok(result: dict) -> bool:
     """只有 confirmed、accepted 或 verified 的 no_change 才算真正成功；
@@ -111,7 +115,13 @@ async def _excluded_entity_error(ha: HAClient, st: dict) -> Optional[dict]:
     """实体属于隐藏类型/设备时返回错误结构，否则返回 None。"""
     try:
         reg = await ha.get_registries()
-    except HAError:
+    except HAError as exc:
+        # 配置了设备名排除关键字时，注册表不可用就无法检查设备名，必须失败关闭。
+        if EXCLUDED_DEVICE_KEYWORDS:
+            log.warning("读取 HA 注册表失败，无法校验设备名排除规则：%s", exc)
+            return {"ok": False, "code": "registry_unavailable",
+                    "message": "暂时无法读取设备注册表，无法确认该设备是否在开放范围内，已拒绝执行。",
+                    "entity_id": str(st.get("entity_id") or "")}
         reg = None
     devices_map, ents_map, _ = _registry_maps(reg)
     if not is_excluded_entity(st, devices_map, ents_map):
@@ -624,7 +634,7 @@ class DeviceService:
                 async with sem:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        raise asyncio.TimeoutError()
+                        raise _BatchNotDispatched()
                     return await asyncio.wait_for(
                         _apply_and_confirm(ha, op["st"], op["service_domain"],
                                            op["service"], op["payload"], action_name),
@@ -639,11 +649,19 @@ class DeviceService:
             for op, result in zip(resolved, raw_results, strict=True):
                 if isinstance(result, asyncio.CancelledError):
                     raise result
+                if isinstance(result, _BatchNotDispatched):
+                    per.append({"ok": False, "entity_id": op["entity_id"],
+                                "status": "not_sent", "code": "batch_timeout",
+                                "device_action": action_name,
+                                "message": "批量控制超时，指令未下发。"})
+                    failed.append(op["entity_id"])
+                    failed_names.append(_friendly_name(op["st"]))
+                    continue
                 if isinstance(result, asyncio.TimeoutError):
                     per.append({"ok": False, "entity_id": op["entity_id"],
                                 "status": "accepted_pending", "code": "pending_confirmation",
                                 "device_action": action_name,
-                                "message": "批量控制超时，指令已发送但未在时限内确认。"})
+                                "message": "批量控制超时，指令可能已下发但未在时限内确认。"})
                     failed.append(op["entity_id"])
                     failed_names.append(_friendly_name(op["st"]))
                     continue

@@ -39,8 +39,12 @@ services:
     cap_drop:
       - ALL
     read_only: true
+    # 资源上限：防止日志/指标异常或死循环拖垮宿主机；tmpfs 限制避免 /tmp 无界增长。
+    pids_limit: 256
+    mem_limit: 512m
+    cpus: 2.0
     tmpfs:
-      - /tmp
+      - /tmp:size=64m,mode=1777
     logging:
       driver: json-file
       options:

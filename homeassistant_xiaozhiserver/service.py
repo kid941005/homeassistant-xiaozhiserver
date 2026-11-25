@@ -237,8 +237,12 @@ _EXPECTED_STATE = {
     "lock": "locked", "unlock": "unlocked",
 }
 
-# 这些 domain 的 turn_on/turn_off 目标状态由设备能力决定，不能只用单一字符串判定。
-_NON_BINARY_TURN_DOMAINS = {"climate", "media_player", "vacuum", "scene", "script"}
+# turn_on/turn_off 在多数二元 domain 上可直接预期 on/off；其余 domain 由设备能力决定。
+_BINARY_TURN_DOMAINS = {
+    "light", "switch", "fan", "input_boolean", "siren", "humidifier", "remote", "automation",
+}
+# cover/valve 的 turn_on/turn_off 语义是 open/closed，不能按 on/off 回读。
+_OPEN_CLOSE_TURN_DOMAINS = {"cover", "valve"}
 
 # 即发即忘型服务：HA 通常返回 null 且不保证实体状态变化，不能因为回读无变化就判失败。
 FIRE_AND_FORGET_SERVICES = frozenset({
@@ -261,9 +265,11 @@ def _expected_state(service: str, before_state: Optional[str],
             return "on"
         return None
     if svc in ("turn_on", "turn_off"):
-        if dom in _NON_BINARY_TURN_DOMAINS:
-            return None
-        return "on" if svc == "turn_on" else "off"
+        if dom in _OPEN_CLOSE_TURN_DOMAINS:
+            return "open" if svc == "turn_on" else "closed"
+        if dom in _BINARY_TURN_DOMAINS:
+            return "on" if svc == "turn_on" else "off"
+        return None
     return _EXPECTED_STATE.get(svc)
 
 
@@ -297,8 +303,9 @@ def _value_matches(actual: Any, expected: Any, tolerance: float = 0.0) -> bool:
             return False
         return all(_value_matches(a, e, tolerance) for a, e in zip(actual, expected, strict=True))
     if isinstance(expected, bool) or isinstance(actual, bool):
+        # 属性缺失不能当作 expected=False 的匹配：那会把“没读到”误判成“已确认关闭/静音”。
         if actual is None:
-            return expected is False
+            return False
         return bool(actual) == bool(expected)
     na, ne = _num(actual), _num(expected)
     if na is not None and ne is not None:
@@ -445,12 +452,13 @@ async def _apply_and_confirm_unlocked(ha: "HAClient", st: dict, service_domain: 
       confirmed        回读确认状态/属性已达到预期（且确有变化）
       no_change        HA 已接受但无变化；若校验通过表示「本来就是目标状态」
       mismatch         回读观察到变化，但状态或属性与预期不符（设备能力/参数问题）
+      accepted          即发即忘服务（场景/脚本/停止等）HA 已接受调用，不保证状态变化
       accepted_pending HA 返回 null（新版 HA 常见），回读窗口内仍未完全匹配预期
     """
     eid = str(st.get("entity_id"))
     before = snapshot(st)
     before_state = st.get("state") if st else None
-    expected = _expected_state(service, before_state, service_domain)
+    expected = _expected_state(service, before_state, _domain_of(eid))
     # set_hvac_mode 等服务的预期状态来自参数
     if isinstance(payload, dict) and payload.get("hvac_mode"):
         expected = str(payload["hvac_mode"])
@@ -485,8 +493,8 @@ async def _apply_and_confirm_unlocked(ha: "HAClient", st: dict, service_domain: 
     if callable(ensure_stream):
         try:
             ensure_stream()
-        except Exception:  # noqa: BLE001 事件流只是加速手段，失败继续轮询
-            pass
+        except Exception as exc:  # noqa: BLE001 事件流只是加速手段，失败继续轮询
+            log.warning("HA 事件流启动失败，回退 REST 轮询：%s", exc)
 
     while True:
         attempts += 1
@@ -552,10 +560,6 @@ async def _apply_and_confirm_unlocked(ha: "HAClient", st: dict, service_domain: 
         # 场景/脚本/停止等即发即忘服务：HA 已接受调用即可，不能因无状态变化判失败。
         status = "accepted"
         verified = False
-    elif not has_expectation and resp_kind in ("empty", "states"):
-        # 无预期语义的动作（如 cover.stop_cover）HA 已返回受影响状态，视为执行成功。
-        status = "confirmed"
-        verified = True
     elif changed:
         # 无明确预期时只能确认「有变化」，不能判为 mismatch
         status = "mismatch" if has_expectation else "confirmed"
@@ -740,7 +744,7 @@ def build_service(action: str, domain: str, value: Any) -> tuple:
             raise HAError("invalid_value", "色温 value 必须是开尔文数字，收到：" + str(value)) from exc
         if not math.isfinite(kelvin):
             raise HAError("invalid_value", "色温 value 必须是有限数字，收到：" + str(value))
-        return "light", "turn_on", {"color_temp_kelvin": int(kelvin)}
+        return "light", "turn_on", {"color_temp_kelvin": int(round(kelvin))}
     if a == "set_color":
         _need_value(a, value)
         return "light", "turn_on", {"rgb_color": _parse_color(value)}

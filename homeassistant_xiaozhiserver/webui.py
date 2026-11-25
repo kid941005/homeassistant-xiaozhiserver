@@ -65,6 +65,7 @@ from .config import (
 from .danger import service_is_dangerous
 from .logging_setup import log_file_path, read_recent_logs, setup_logging
 from .metrics import metrics
+from .service import build_service
 
 log = logging.getLogger("homeassistant_xiaozhiserver.webui")
 
@@ -76,6 +77,11 @@ _SESSION_TTL = 7 * 24 * 3600
 _PUBLIC_PATHS = frozenset({"/login", "/healthz", "/readyz", "/metrics"})
 # 登录后签发随机 session id，服务端内存校验；重启即失效，避免固定 cookie 值长期可用。
 _SESSIONS: dict[str, float] = {}
+_MAX_SESSIONS = 512
+# 登录失败限速：同一来源 5 分钟内失败 5 次后暂时拒绝，避免在线爆破 WEBUI_TOKEN。
+_LOGIN_FAILURES: dict[str, list[float]] = {}
+_LOGIN_MAX_FAILURES = 5
+_LOGIN_WINDOW = 300.0
 
 
 def _token_ok(raw: str) -> bool:
@@ -87,6 +93,11 @@ def _new_session() -> str:
     # 顺带清理已过期会话，避免只登录不访问时内存表无界增长。
     for stale in [key for key, expiry in _SESSIONS.items() if expiry < now]:
         _SESSIONS.pop(stale, None)
+    # 上限保护：异常登录刷量时淘汰最早过期的会话，避免内存无界增长。
+    overflow = len(_SESSIONS) - _MAX_SESSIONS
+    if overflow > 0:
+        for stale in sorted(_SESSIONS, key=lambda key: _SESSIONS[key])[:overflow]:
+            _SESSIONS.pop(stale, None)
     token = secrets.token_urlsafe(24)
     _SESSIONS[token] = now + _SESSION_TTL
     return token
@@ -107,6 +118,42 @@ def _cookie_ok(raw: str) -> bool:
 def _drop_session(raw: str) -> None:
     if raw:
         _SESSIONS.pop(str(raw), None)
+
+
+def _client_ip(request: Request) -> str:
+    # 只使用 ASGI 服务器解析出的对端地址；不直接信任客户端可伪造的 X-Forwarded-For，
+    # 否则攻击者可以轮换该头绕过登录限速。反向代理场景由 uvicorn 的 proxy_headers 处理。
+    client = request.client
+    return str(getattr(client, "host", "") or "unknown")
+
+
+def _login_guard(ip: str) -> int:
+    """返回需要等待的秒数；0 表示允许尝试。"""
+    now = time.time()
+    recent = [ts for ts in _LOGIN_FAILURES.get(ip, []) if now - ts < _LOGIN_WINDOW]
+    if recent:
+        _LOGIN_FAILURES[ip] = recent
+    else:
+        _LOGIN_FAILURES.pop(ip, None)
+    if len(recent) >= _LOGIN_MAX_FAILURES:
+        return max(1, int(_LOGIN_WINDOW - (now - recent[0])))
+    return 0
+
+
+def _record_login_failure(ip: str) -> None:
+    now = time.time()
+    recent = [ts for ts in _LOGIN_FAILURES.get(ip, []) if now - ts < _LOGIN_WINDOW]
+    recent.append(now)
+    _LOGIN_FAILURES[ip] = recent
+
+
+def _clear_login_failures(ip: str) -> None:
+    _LOGIN_FAILURES.pop(ip, None)
+
+
+def _request_proto(request: Request) -> str:
+    # 同理，协议由 ASGI 服务器在信任代理时重写，避免客户端伪造 X-Forwarded-Proto。
+    return (request.url.scheme or "").lower()
 
 
 def _metric_path(path: str) -> str:
@@ -368,41 +415,46 @@ def create_app() -> FastAPI:
     @app.middleware("http")
     async def _same_origin(request: Request, call_next):
         """安全中间件：Host/Origin 校验、WEBUI_TOKEN 登录校验、安全响应头与访问指标。"""
+        started = time.perf_counter()
+        path = request.url.path
         host = request.headers.get("host", "")
+        response = None
         if not _host_allowed(host):
-            return _harden(JSONResponse(
+            response = JSONResponse(
                 {"ok": False, "code": "host_not_allowed", "message": "Host 不在允许范围内。"},
                 status_code=403,
-            ))
-        path = request.url.path
-        if path not in _PUBLIC_PATHS and not _cookie_ok(request.cookies.get(_AUTH_COOKIE, "")):
+            )
+        if response is None and path not in _PUBLIC_PATHS and not _cookie_ok(
+                request.cookies.get(_AUTH_COOKIE, "")):
             if path.startswith("/api/") or path.startswith("/tool"):
-                return _harden(JSONResponse(
+                response = JSONResponse(
                     {"ok": False, "code": "unauthorized", "message": "请先登录。"},
                     status_code=401,
-                ))
-            return _harden(RedirectResponse("/login"))
-        if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+                )
+            else:
+                response = RedirectResponse("/login")
+        if response is None and request.method in ("POST", "PUT", "PATCH", "DELETE"):
             origin = request.headers.get("origin")
             if not origin:
-                return _harden(JSONResponse(
+                response = JSONResponse(
                     {"ok": False, "code": "cross_origin_blocked", "message": "写请求必须携带同源 Origin。"},
                     status_code=403,
-                ))
-            try:
-                parts = urlsplit(origin)
-            except ValueError:
-                return _harden(JSONResponse(
-                    {"ok": False, "code": "cross_origin_blocked", "message": "拒绝格式非法的 Origin。"},
-                    status_code=403,
-                ))
-            if not _origin_allowed(parts, host):
-                return _harden(JSONResponse(
-                    {"ok": False, "code": "cross_origin_blocked", "message": "拒绝跨站请求。"},
-                    status_code=403,
-                ))
-        started = time.perf_counter()
-        response = await call_next(request)
+                )
+            else:
+                try:
+                    parts = urlsplit(origin)
+                except ValueError:
+                    response = JSONResponse(
+                        {"ok": False, "code": "cross_origin_blocked", "message": "拒绝格式非法的 Origin。"},
+                        status_code=403,
+                    )
+                if response is None and not _origin_allowed(parts, host):
+                    response = JSONResponse(
+                        {"ok": False, "code": "cross_origin_blocked", "message": "拒绝跨站请求。"},
+                        status_code=403,
+                    )
+        if response is None:
+            response = await call_next(request)
         if METRICS_ENABLED:
             metrics.record_http(request.method, _metric_path(path), response.status_code,
                                 time.perf_counter() - started)
@@ -418,8 +470,12 @@ def create_app() -> FastAPI:
         reachable: bool | None = None
         error: str | None = None
         if configured:
+            # 冷启动时首次 DNS/TLS 握手可能接近 HA_TIMEOUT；固定 3s 会反复取消请求，
+            # 连接池无法预热，/readyz 会长期误报未就绪。这里跟随 HA_TIMEOUT 并设上限。
+            ha = mcp_server.get_ha()
+            ping_timeout = min(max(3.0, float(getattr(ha, "timeout", 10.0) or 10.0)), 10.0)
             try:
-                reachable = await asyncio.wait_for(mcp_server.get_ha().ping(), timeout=3.0)
+                reachable = await asyncio.wait_for(ha.ping(), timeout=ping_timeout)
             except asyncio.TimeoutError:
                 reachable = False
                 error = "timeout"
@@ -640,12 +696,25 @@ def create_app() -> FastAPI:
 
     @app.post("/login")
     async def login(request: Request):
+        ip = _client_ip(request)
+        retry_after = _login_guard(ip)
+        if retry_after > 0:
+            log.warning("webui login rate limited ip=%s retry_after=%ss", ip, retry_after)
+            return HTMLResponse(
+                _login_html("登录失败次数过多，请稍后再试。"),
+                status_code=429,
+                headers={"Retry-After": str(retry_after)},
+            )
         form = await _read_form_limited(request, 16 * 1024)
         if form is None:
             return HTMLResponse(_login_html("登录请求格式不正确或体积过大。"), status_code=413)
         token = str((form.get("token") or [""])[0])
         if not _token_ok(token):
+            _record_login_failure(ip)
+            log.warning("webui login failed ip=%s", ip)
             return HTMLResponse(_login_html("访问令牌不正确，请重试。"), status_code=401)
+        _clear_login_failures(ip)
+        log.info("webui login success ip=%s", ip)
         response = RedirectResponse("/", status_code=303)
         response.set_cookie(
             _AUTH_COOKIE,
@@ -653,7 +722,7 @@ def create_app() -> FastAPI:
             max_age=_SESSION_TTL,
             httponly=True,
             samesite="lax",
-            secure=(request.url.scheme == "https"),
+            secure=(_request_proto(request) == "https"),
             path="/",
         )
         return response
@@ -784,17 +853,32 @@ def create_app() -> FastAPI:
                 reason = str(view.get("danger_reason") or "该设备属于高风险设备")
                 return {"ok": False, "code": "dangerous_operation_blocked",
                         "message": "WebUI 不执行危险设备操作（" + reason + "）；请通过小智语音确认后再操作。"}
-            if service_name and not explicit_domain:
-                # 裸服务名必须结合目标实体域判断：script/shell_command 等即使目标实体普通也高风险。
-                domain = str(view.get("domain") or "")
-                if not domain:
-                    eid = str(view.get("entity_id") or "")
-                    domain = eid.split(".", 1)[0] if "." in eid else ""
-                if domain:
-                    dangerous, reason = service_is_dangerous(domain, service_name)
+            domain = str(view.get("domain") or "")
+            if not domain:
+                eid = str(view.get("entity_id") or "")
+                domain = eid.split(".", 1)[0] if "." in eid else ""
+            action_raw = str(params.get("action") or "").strip().lower()
+            if action_raw and name in ("control_device", "control_devices") and domain:
+                # control_device/control_devices 只传 action，必须映射成实际服务后再判定。
+                try:
+                    service_domain, service_value, _extra = build_service(
+                        action_raw, domain, params.get("value"))
+                except HAError:
+                    service_domain, service_value = "", ""
+                if service_domain:
+                    if (service_domain, service_value) == ("scene", "turn_on"):
+                        return {"ok": False, "code": "dangerous_operation_blocked",
+                                "message": "WebUI 不执行可能包含门锁等高风险动作的场景；请通过小智语音确认后再操作。"}
+                    dangerous, reason = service_is_dangerous(service_domain, service_value)
                     if dangerous:
                         return {"ok": False, "code": "dangerous_operation_blocked",
                                 "message": "WebUI 不执行高风险服务（" + reason + "）；请通过小智语音确认后再操作。"}
+            if service_name and not explicit_domain and domain:
+                # 裸服务名必须结合目标实体域判断：script/shell_command 等即使目标实体普通也高风险。
+                dangerous, reason = service_is_dangerous(domain, service_name)
+                if dangerous:
+                    return {"ok": False, "code": "dangerous_operation_blocked",
+                            "message": "WebUI 不执行高风险服务（" + reason + "）；请通过小智语音确认后再操作。"}
             return None
 
         if candidates:
@@ -816,6 +900,7 @@ def create_app() -> FastAPI:
         return None
 
     async def _execute_tool(name: str, params: Any) -> tuple[Any, int]:
+        started = time.perf_counter()
         fn = _TOOL_FUNCS.get(name)
         if fn is None:
             return {"ok": False, "code": "unknown_tool",
@@ -836,16 +921,25 @@ def create_app() -> FastAPI:
         if name in _DANGER_GATED_TOOLS:
             blocked = await _webui_danger_block(name, params)
             if blocked is not None:
+                metrics.record_tool(name, False, time.perf_counter() - started,
+                                    "dangerous_operation_blocked")
                 return blocked, 403
         try:
             result = await fn(**params)
         except Exception:  # noqa: BLE001
+            metrics.record_tool(name, False, time.perf_counter() - started, "internal_error")
             log.exception("webui tool=%s failed", name)
             return {"ok": False, "code": "internal_error", "message": "工具调用失败，详见服务端日志。"}, 500
         # WebUI 使用独立登录令牌，不复用 MCP 的危险设备确认令牌，避免两次请求即可绕过确认。
         if isinstance(result, dict) and result.get("requires_confirmation"):
+            metrics.record_tool(name, False, time.perf_counter() - started,
+                                "dangerous_operation_blocked")
             return {"ok": False, "code": "dangerous_operation_blocked",
                     "message": "WebUI 不执行危险设备操作；请通过小智语音确认后再操作。"}, 403
+        ok = not (isinstance(result, dict) and result.get("ok") is False)
+        code = str(result.get("code") or "") if isinstance(result, dict) else ""
+        metrics.record_tool(name, ok, time.perf_counter() - started,
+                            code or ("ok" if ok else "error"))
         return result, 200
 
     return app

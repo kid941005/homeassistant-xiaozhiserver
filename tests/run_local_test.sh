@@ -13,6 +13,9 @@ export FAKE_HA_TOKEN="$TEST_TOKEN"
 # 注册表走 WebSocket（fake 的 WS 端口默认 8124）
 export HA_WS_URL=ws://127.0.0.1:8124/api/websocket
 export FAKE_HA_WS_PORT=8124
+# 指标共享目录隔离到临时目录，避免测试进程与开发机残留互相污染。
+export XIAOZHI_METRICS_DIR="${TMPDIR:-/tmp}/xiaozhi-metrics-test"
+rm -rf "$XIAOZHI_METRICS_DIR"
 
 FAKE=""
 cleanup() {
@@ -92,6 +95,8 @@ echo "===== state cache unit ====="
 
 echo "===== bridge status unit ====="
 "$PY" tests/bridge_status.py
+echo "== metrics shared =="
+"$PY" tests/metrics_shared.py
 
 echo "===== confirm window unit ====="
 "$PY" tests/confirm_window.py
@@ -101,6 +106,9 @@ echo "===== env consistency ====="
 
 echo "===== logging fallback ====="
 "$PY" tests/logging_fallback.py
+
+echo "===== healthcheck unit ====="
+"$PY" tests/healthcheck_probe.py
 
 echo "===== webui smoke ====="
 "$PY" tests/webui_smoke.py

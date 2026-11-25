@@ -8,6 +8,29 @@
 
 暂无计划中的变更。
 
+## [1.15.2] - 2026-11-25
+
+指标、危险闸门与部署加固版本。
+
+### 修复
+
+- `/metrics` 合并 WebUI 进程与 stdio MCP server 子进程的指标（共享临时目录），工具调用指标不再因进程隔离丢失。
+- WebUI 危险闸门按 `control_device`/`control_devices` 的 `action` 映射实际 HA 服务后再判定，`script.turn_on` 等不再因只传 action 而绕过；`scene.turn_on` 视为可能包含门锁动作的高风险操作。
+- 批量控制超时区分“尚未下发”（`status=not_sent`、`code=batch_timeout`）与“已下发但未确认”（`accepted_pending`/`pending_confirmation`），不再对未下发指令播报已发送。
+- 删除“无预期且 HA 返回空响应即视为 confirmed”的判定；`cover`/`valve` 的 `turn_on`/`turn_off` 按 `open`/`closed` 回读，bool 属性缺失不再当作 `expected=false` 匹配。
+- 确认令牌意图对目标列表排序后再生成，实体顺序或批量顺序变化不再导致 `confirm_token_mismatch`。
+- 注册表不可用且配置了设备关键词排除时，控制入口失败关闭并返回 `registry_unavailable`。
+- `set_color_temp` 色温改为四舍五入，避免边界值差 1K。
+
+### 安全
+
+- WebUI 登录失败限速：同一来源 5 分钟内失败 5 次后返回 429 与 `Retry-After`；会话表上限 512，异常刷量时淘汰最早过期会话。
+- 登录 Cookie 仅在 HTTPS 直连时加 `Secure`（反向代理场景由 uvicorn `proxy_headers` 处理）；登录成功/失败写入日志。
+- 所有请求（含 401/403 提前返回）都计入 HTTP 指标。
+- 容器健康检查改用 `/readyz`，覆盖 HA 与 bridge 就绪状态；`/readyz` 按 `HA_TIMEOUT` 探测 HA，避免冷启动慢请求被 3s 固定超时误判，`HEALTHCHECK` 超时放宽到 20s，`start-period` 60s。
+- compose 增加 `pids_limit`、`mem_limit`、`cpus`，`/tmp` tmpfs 限制为 64MB；`.dockerignore` 排除日志目录。
+- CI 在 pull request 上也构建镜像但不推送；新增 `tests/healthcheck_probe.py` 覆盖 `/readyz` 200/503 与候选主机顺序。
+
 ## [1.15.1] - 2026-11-25
 
 控制链路语义、能力过滤与批量控制修复版本。

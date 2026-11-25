@@ -73,9 +73,37 @@ def _prune_confirm_tokens() -> None:
             _CONFIRM_TOKENS.pop(token, None)
 
 
+_TARGET_LIST_KEYS = frozenset({
+    "entity_id", "entities", "device_id", "area_id", "floor_id", "label_id",
+})
+
+
+def _normalize_confirm_payload(payload: dict) -> dict:
+    """确认令牌只关心“控制哪些目标、做什么”，目标列表顺序不应改变 intent。
+
+    批量控制里实体顺序变化、重复项顺序变化时，用户确认后重试不应被判为令牌不匹配。
+    """
+    if not isinstance(payload, dict):
+        return payload
+    out: dict = {}
+    for key, value in payload.items():
+        if key in _TARGET_LIST_KEYS and isinstance(value, (list, tuple)):
+            out[key] = sorted(str(item) for item in value)
+        elif key == "batch" and isinstance(value, list):
+            normalized = [_normalize_confirm_payload(item) for item in value]
+            out[key] = sorted(
+                normalized,
+                key=lambda item: json.dumps(item, sort_keys=True, ensure_ascii=False, default=str),
+            )
+        else:
+            out[key] = value
+    return out
+
+
 def _confirm_intent(service_domain: str, service: str, payload: dict) -> str:
     try:
-        body = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+        body = json.dumps(_normalize_confirm_payload(payload), sort_keys=True,
+                          ensure_ascii=False, default=str)
     except Exception:  # noqa: BLE001
         body = str(payload)
     return str(service_domain) + "." + str(service) + "|" + body

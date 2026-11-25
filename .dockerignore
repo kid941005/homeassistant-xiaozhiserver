@@ -10,4 +10,5 @@ __pycache__/
 .dsh-project-memory/
 .learnings/
 tests/
+xiaozhi-logs/
 *.md
