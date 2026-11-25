@@ -30,6 +30,7 @@ services:
       WEBUI_TOKEN: ${WEBUI_TOKEN:-}
       WEBUI_CACHE_TTL: ${WEBUI_CACHE_TTL:-3.0}
       CONTROL_CONCURRENCY: ${CONTROL_CONCURRENCY:-5}
+      CONTROL_BATCH_TIMEOUT: ${CONTROL_BATCH_TIMEOUT:-8.0}
       METRICS_ENABLED: ${METRICS_ENABLED:-true}
     volumes:
       - ./xiaozhi-logs:/app/logs

@@ -7,10 +7,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Optional
 
 from .client import HAError, HAClient
-from .config import CONTROL_CONCURRENCY, DEFAULT_LIST_LIMIT, EXCLUDED_DOMAINS, MAX_LIST_LIMIT
+from .config import (
+    CONTROL_BATCH_TIMEOUT,
+    CONTROL_CONCURRENCY,
+    DEFAULT_LIST_LIMIT,
+    EXCLUDED_DOMAINS,
+    MAX_LIST_LIMIT,
+)
 from .danger import _danger_block, _danger_flags, _service_is_dangerous
 from .service import (
     DIRECT_RESPONSE_SERVICES,
@@ -21,6 +28,7 @@ from .service import (
     _friendly_name,
     _hint,
     build_service,
+    validate_action_attributes,
 )
 from .views import (
     _brief_attributes,
@@ -35,15 +43,25 @@ from .views import (
 
 log = logging.getLogger("homeassistant_xiaozhiserver.devices")
 
-_VERIFIED_OK_STATUSES = ("confirmed", "no_change")
+_VERIFIED_OK_STATUSES = ("confirmed", "accepted", "no_change")
 
 def _result_ok(result: dict) -> bool:
-    """只有 confirmed 或 verified 的 no_change 才算真正成功；
+    """只有 confirmed、accepted 或 verified 的 no_change 才算真正成功；
     no_change 但 verified=false 说明服务已接受但没看到预期变化，不能报成功。"""
     status = str(result.get("status") or "")
-    if status == "confirmed":
+    if status in ("confirmed", "accepted"):
         return True
     return status == "no_change" and bool(result.get("verified"))
+
+
+def _failure_code(result: dict) -> str:
+    """失败时区分“回读不符”与“还没确认”，避免把 no_change 一律当 pending。"""
+    status = str(result.get("status") or "")
+    if status == "mismatch":
+        return "not_verified"
+    if status == "no_change" and not bool(result.get("verified")):
+        return "not_verified"
+    return "pending_confirmation"
 _TARGET_SELECTOR_KEYS = frozenset({
     "entity_id", "target", "device_id", "area_id", "floor_id", "label_id",
 })
@@ -130,17 +148,23 @@ def _duplicate_switch_error(st: dict, light_id: str) -> dict:
     }
 
 
-async def _resolve_entity_or_error(ha: HAClient, entity: str, verb: str) -> tuple:
-    """统一实体解析失败结构，避免四处复制歧义/未找到分支。"""
-    st, cands, states = await ha.resolve_entity(entity)
+async def _resolve_entity_or_error(ha: HAClient, entity: str, verb: str,
+                                  states: Optional[list] = None,
+                                  hidden: Optional[dict] = None) -> tuple:
+    """统一实体解析失败结构，避免四处复制歧义/未找到分支。
+
+    states/hidden 可由批量入口预加载，避免逐设备重复拉取全量状态与重算重复开关映射。
+    """
+    st, cands, states = await ha.resolve_entity(entity, states)
     switch_ids = []
     if st is not None:
         switch_ids = [str(st.get("entity_id") or "")]
     elif cands:
         switch_ids = [str(c.get("entity_id") or "") for c in cands]
-    hidden = {}
-    if any(_domain_of(eid) == "switch" for eid in switch_ids):
-        hidden, _ = await _redundant_switch_context(ha, states)
+    if hidden is None:
+        hidden = {}
+        if any(_domain_of(eid) == "switch" for eid in switch_ids):
+            hidden, _ = await _redundant_switch_context(ha, states)
     if st is not None:
         eid = str(st.get("entity_id") or "")
         blocked = await _excluded_entity_error(ha, st)
@@ -427,6 +451,10 @@ class DeviceService:
             open/close/stop/pause/continue/resume/play  按设备能力映射到对应服务
             lock/unlock        上锁 / 解锁（仅 lock）
             set_brightness     value=亮度百分比 0-100（仅 light，0 表示关闭）
+            set_percentage     value=风速百分比 0-100（fan）
+            set_position       value=开合百分比 0-100（cover）
+            set_hvac_mode      value=模式名（climate，如 heat/cool/auto）
+            set_fan_mode       value=风速名（climate，如 low/high/auto）
             set_volume         value=音量百分比 0-100（media_player）
             volume_mute/volume_unmute  静音/取消静音
             set_temperature    value=目标温度（摄氏度，climate）
@@ -451,7 +479,7 @@ class DeviceService:
                 return error
             eid = str(st.get("entity_id"))
             domain = _domain_of(eid)
-            info = _controllability(eid, st.get("state"))
+            info = _controllability(eid, st.get("state"), st.get("attributes"))
             if not info["controllable"]:
                 return {
                     "ok": False, "code": "not_controllable",
@@ -470,17 +498,16 @@ class DeviceService:
                     "hint": "control_device 只做常用动作封装；任意 HA 服务请用 call_service。",
                 }
             sd, svc, extra = build_service(action_name, domain, value)
+            validate_action_attributes(domain, extra, st.get("attributes"))
             payload = {"entity_id": eid}
             payload.update(extra)
             guard = _danger_block(st, sd, svc, payload, confirm_token)
             if guard is not None:
                 return guard
             result = await _apply_and_confirm(ha, st, sd, svc, payload, action_name)
-            status = str(result.get("status") or "")
             result["ok"] = _result_ok(result)
             if not result["ok"]:
-                result["code"] = ("not_verified" if status == "mismatch"
-                                  else "pending_confirmation")
+                result["code"] = _failure_code(result)
             # 注意：xiaozhi MCP 接入点把结果里的 action 当作 Action 枚举名解析；
             # turn_off / turn_on 不是合法枚举，会被转成 Action.ERROR 并把 "turn_off" 直接 TTS。
             # 因此设备动作放在 device_action，成功时用 action=RESPONSE + 中文 response 让助手直接播报，
@@ -519,17 +546,32 @@ class DeviceService:
             resolved: list = []
             errors: list = []
             seen: set[str] = set()
+            deduped: list = []
+            # 批量入口只拉一次全量状态与重复开关映射，避免每个设备各扫一遍（N+1）。
+            batch_states = None
+            batch_hidden: Optional[dict] = {}
+            try:
+                batch_states = await ha.get_states()
+                batch_hidden, _ = await _redundant_switch_context(ha, batch_states)
+            except HAError:
+                batch_states = None
+                batch_hidden = None
             for ref in refs:
-                st, error = await _resolve_entity_or_error(ha, ref, "控制")
+                st, error = await _resolve_entity_or_error(
+                    ha, ref, "控制", batch_states, batch_hidden)
                 if error is not None:
                     errors.append({"entity": ref, "error": error})
                     continue
                 eid = str(st.get("entity_id"))
-                if not eid or eid in seen:
+                if not eid:
+                    continue
+                if eid in seen:
+                    if eid not in deduped:
+                        deduped.append(eid)
                     continue
                 seen.add(eid)
                 domain = _domain_of(eid)
-                info = _controllability(eid, st.get("state"))
+                info = _controllability(eid, st.get("state"), st.get("attributes"))
                 if not info["controllable"]:
                     errors.append({"entity": ref, "entity_id": eid, "code": "not_controllable",
                                    "message": "『" + _friendly_name(st) + "』不可控制：" + info["controllable_reason"]})
@@ -541,6 +583,7 @@ class DeviceService:
                     continue
                 try:
                     sd, svc, extra = build_service(action_name, domain, value)
+                    validate_action_attributes(domain, extra, st.get("attributes"))
                 except HAError as exc:
                     errors.append({"entity": ref, "entity_id": eid, "code": exc.code,
                                    "message": _friendly_name(st) + " 动作参数无效：" + exc.message})
@@ -575,30 +618,44 @@ class DeviceService:
                     return guard
 
             sem = asyncio.Semaphore(CONTROL_CONCURRENCY)
+            deadline = time.monotonic() + CONTROL_BATCH_TIMEOUT
 
             async def _run_one(op):
                 async with sem:
-                    return await _apply_and_confirm(ha, op["st"], op["service_domain"],
-                                                    op["service"], op["payload"], action_name)
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise asyncio.TimeoutError()
+                    return await asyncio.wait_for(
+                        _apply_and_confirm(ha, op["st"], op["service_domain"],
+                                           op["service"], op["payload"], action_name),
+                        timeout=remaining)
 
             tasks = [_run_one(op) for op in resolved]
             raw_results = await asyncio.gather(*tasks, return_exceptions=True)
             per: list = []
             voices: list = []
             failed: list = []
+            failed_names: list = []
             for op, result in zip(resolved, raw_results, strict=True):
                 if isinstance(result, asyncio.CancelledError):
                     raise result
+                if isinstance(result, asyncio.TimeoutError):
+                    per.append({"ok": False, "entity_id": op["entity_id"],
+                                "status": "accepted_pending", "code": "pending_confirmation",
+                                "device_action": action_name,
+                                "message": "批量控制超时，指令已发送但未在时限内确认。"})
+                    failed.append(op["entity_id"])
+                    failed_names.append(_friendly_name(op["st"]))
+                    continue
                 if isinstance(result, BaseException):
                     per.append({"ok": False, "entity_id": op["entity_id"], "code": "internal_error",
                                 "message": str(result)})
                     failed.append(op["entity_id"])
+                    failed_names.append(_friendly_name(op["st"]))
                     continue
-                status = str(result.get("status") or "")
                 result["ok"] = _result_ok(result)
                 if not result["ok"]:
-                    result["code"] = ("not_verified" if status == "mismatch"
-                                      else "pending_confirmation")
+                    result["code"] = _failure_code(result)
                 result["device_action"] = action_name
                 if result["ok"]:
                     result["action"] = "RESPONSE"
@@ -608,6 +665,7 @@ class DeviceService:
                     result.pop("action", None)
                     result.pop("response", None)
                     failed.append(op["entity_id"])
+                    failed_names.append(_friendly_name(op["st"]))
                 per.append(result)
 
             ok = bool(per) and all(bool(item.get("ok")) for item in per) and not errors
@@ -615,13 +673,21 @@ class DeviceService:
                    "response": "；".join(voices) if voices else "", "results": per}
             if errors:
                 out["errors"] = errors
+            if deduped:
+                out["deduplicated"] = deduped
             failed_count = len(errors) + len(failed)
             if failed_count:
+                labels = [str(item.get("entity") or item.get("entity_id") or "") for item in errors]
+                labels.extend(failed_names)
+                labels = [x for x in labels if x]
+                detail = ""
+                if labels:
+                    detail = "：" + "、".join(labels[:5]) + ("等" if len(labels) > 5 else "")
                 out["partial"] = ok is False and bool(voices)
-                out["message"] = "部分设备未成功，共 " + str(failed_count) + " 个。"
+                out["message"] = "部分设备未成功，共 " + str(failed_count) + " 个" + detail + "。"
                 if voices:
                     # 直出播报必须把未成功数量说出来，避免只播成功项造成“全部成功”的错觉。
-                    out["response"] = out["response"] + "；另有 " + str(failed_count) + " 个设备未成功。"
+                    out["response"] = out["response"] + "；另有 " + str(failed_count) + " 个设备未成功" + detail + "。"
             if not out["response"]:
                 out.pop("response", None)
             return out
@@ -779,17 +845,16 @@ class DeviceService:
                 return {"ok": False, "code": "invalid_data",
                         "message": "data 不应包含目标选择器 " + "、".join(blocked_keys)
                         + "；目标实体只能由 entity 参数指定，避免绕过危险操作校验。"}
+            validate_action_attributes(service_domain, extra, st.get("attributes"))
             payload = {"entity_id": eid}
             payload.update(extra)
             guard = _danger_block(st, service_domain, svc, payload, confirm_token)
             if guard is not None:
                 return guard
             result = await _apply_and_confirm(ha, st, service_domain, svc, payload, spec)
-            status = str(result.get("status") or "")
-            result["ok"] = status in _VERIFIED_OK_STATUSES
+            result["ok"] = _result_ok(result)
             if not result["ok"]:
-                result["code"] = ("not_verified" if status == "mismatch"
-                                  else "pending_confirmation")
+                result["code"] = _failure_code(result)
             result["device_action"] = svc
             direct = (service_domain in DOMAIN_ACTIONS
                       and service_domain not in ("script", "scene", "automation")

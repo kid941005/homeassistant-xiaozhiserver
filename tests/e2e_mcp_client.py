@@ -267,6 +267,8 @@ async def main():
               "response_contains": "已关闭", "response_not_contains": "turn_off"}),
             ("control_device", {"entity": "空调", "action": "set_temperature", "value": 26},
              {"ok": True}),
+            ("control_device", {"entity": "空调", "action": "set_hvac_mode", "value": "heat"},
+             {"ok": True, "status": "confirmed", "device_action": "set_hvac_mode"}),
             ("control_device", {"entity": "窗帘", "action": "turn_on"},
              {"ok": True, "after_state": "open"}),
             ("control_device", {"entity": "窗帘", "action": "stop"},

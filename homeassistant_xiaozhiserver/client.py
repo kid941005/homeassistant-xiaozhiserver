@@ -606,16 +606,17 @@ class HAClient:
         except Exception as e:  # noqa: BLE001
             raise HAError("ws_error", "连接 Home Assistant WebSocket 失败：" + str(e), str(e)) from e
 
-    async def resolve_entity(self, ref: str) -> tuple:
+    async def resolve_entity(self, ref: Any, states: Any = None) -> tuple:
         """把 entity_id 或友好名解析成一个实体。
 
         返回 (entity, candidates, states)：
         - entity 非空：唯一命中
         - entity 为空且 candidates 非空：多个候选（歧义），需调用方消歧
         - 两者皆空：未找到
-        - states 为按名称解析时已拉取的全量状态，供调用方复用；直接 entity_id 命中时为 None
+        - states 为按名称解析时已拉取的全量状态，供调用方复用；直接 entity_id 命中时为 None。
+          调用方可传入已加载的 states，避免批量解析时重复拉取。
         """
-        ref = (ref or "").strip()
+        ref = str(ref or "").strip()
         if not ref:
             return None, [], None
         # 1) 直接当作 entity_id；只接受合法格式，避免把用户输入拼进 URL 路径
@@ -623,7 +624,8 @@ class HAClient:
             st = await self.get_state(ref)
             if st is not None:
                 return st, [], None
-        states = await self.get_states()
+        if states is None:
+            states = await self.get_states()
         low = ref.lower()
 
         def fname(s: dict) -> str:

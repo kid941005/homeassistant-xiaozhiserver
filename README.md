@@ -2,7 +2,7 @@
 
 > 把 **Home Assistant** 的实体与服务封装成标准 **MCP（Model Context Protocol）** 工具，供 **小智（xiaozhi-server）** 通过 **MCP 接入点** 用自然语言查询和控制智能家居设备。
 
-**当前版本：v1.15.0** · Python 3.12 · 传输方式：**stdio MCP server + WebSocket bridge** · 单容器部署（MCP bridge + WebUI）
+**当前版本：v1.15.1** · Python 3.12 · 传输方式：**stdio MCP server + WebSocket bridge** · 单容器部署（MCP bridge + WebUI）
 
 ---
 
@@ -52,7 +52,7 @@
 | 设备查询 | 支持名称、`entity_id`、`domain`、`area` 组合过滤，支持分页与按物理设备聚合 |
 | 常用控制 | 开关、亮度、音量、温度、色温、颜色、窗帘、门锁等按 domain 自动映射 HA 服务 |
 | 能力自描述 | `list_services` 先查设备支持的服务与字段，再用 `call_service` 精确调用 |
-| 回读校验 | 控制后轮询状态与属性，返回 `confirmed` / `no_change` / `mismatch` / `accepted_pending` |
+| 回读校验 | 控制后轮询状态与属性，返回 `confirmed` / `accepted` / `no_change` / `mismatch` / `accepted_pending` |
 | 危险操作确认 | 门锁、安防面板、车库门/门窗 cover 及脚本类服务首次只返回 `confirm_token`，确认后才执行 |
 | 按物理设备聚合 | 通过 HA WebSocket 注册表把同一设备的多个实体合并；注册表不可用时自动降级 |
 | 设备范围收敛 | 默认隐藏门铃、自动化、热水壶、中枢网关、媒体五类设备，可通过环境变量调整 |
@@ -213,8 +213,8 @@ docker compose logs -f homeassistant-xiaozhiserver
 看到以下日志表示 bridge 已连上小智：
 
 ```text
-2026-01-01 12:00:00.123 INFO    v1.15.0 MCP_PIPE [-] MCP接入点连接成功
-2026-01-01 12:00:00.456 INFO    v1.15.0 MCP_PIPE [-] 已启动 MCP server：...
+2026-01-01 12:00:00.123 INFO    v1.15.1 MCP_PIPE [-] MCP接入点连接成功
+2026-01-01 12:00:00.456 INFO    v1.15.1 MCP_PIPE [-] 已启动 MCP server：...
 ```
 
 WebUI 地址：`http://<宿主机IP>:8099/`（端口由 `WEBUI_PORT` 决定），首次打开会跳转登录页，输入 `.env` 的 `WEBUI_TOKEN` 后才能进入。compose 使用 `network_mode: host`，因此没有 `ports` 映射；如需只允许本机访问，把 `.env` 的 `WEBUI_HOST` 设为 `127.0.0.1`。
@@ -403,6 +403,7 @@ docker run --user "${PUID:-1000}:${PGID:-1000}" \
 | `WEBUI_ALLOWED_HOSTS` | 空 | 额外允许访问 WebUI 的 Host（逗号分隔，不含端口）；默认已允许 localhost 与内网 IP |
 | `WEBUI_CACHE_TTL` | `3.0` | WebUI 状态/设备接口短缓存秒数；`0` 关闭 |
 | `CONTROL_CONCURRENCY` | `5` | 批量控制并发上限（1–20），避免一次批量请求压垮 HA |
+| `CONTROL_BATCH_TIMEOUT` | `8.0` | 批量控制总时限（秒，1–60）；超时条目返回 `pending_confirmation`，避免语音请求被拖死 |
 | `METRICS_ENABLED` | `true` | 是否暴露 `/metrics`；关闭后该端点返回 404 |
 
 ---
@@ -502,9 +503,13 @@ docker run --user "${PUID:-1000}:${PGID:-1000}" \
 | `open` / `close` / `stop` / `pause` / `continue` / `resume` / `play` | 按设备能力映射 | — |
 | `lock` / `unlock` | 上锁 / 解锁（lock） | — |
 | `set_brightness` | 设置亮度（light）；`0` 等价于关闭 | 0–100 |
+| `set_percentage` | 设置风速百分比（fan） | 0–100 |
+| `set_position` | 设置开合位置（cover） | 0–100 |
 | `set_volume` | 设置音量（media_player） | 0–100 |
 | `volume_mute` / `volume_unmute` | 静音 / 取消静音 | — |
 | `set_temperature` | 设置温度（climate） | 摄氏度 |
+| `set_hvac_mode` | 切换空调模式（climate） | `heat` / `cool` / `auto` 等 |
+| `set_fan_mode` | 切换风速模式（climate） | 设备支持的模式名 |
 | `set_color_temp` | 设置色温（light） | 开尔文 |
 | `set_color` | 设置颜色（light） | `#RRGGBB`、`r,g,b` 或 `[r,g,b]` |
 
@@ -513,28 +518,29 @@ docker run --user "${PUID:-1000}:${PGID:-1000}" \
 | domain | 内置动作 |
 |---|---|
 | light | turn_on, turn_off, toggle, set_brightness, set_color_temp, set_color |
-| switch / fan / input_boolean / automation | turn_on, turn_off, toggle |
-| cover | open, close, stop, turn_on, turn_off |
-| climate | turn_on, turn_off, set_temperature |
+| switch / fan / input_boolean / automation | turn_on, turn_off, toggle；fan 另支持 set_percentage |
+| cover | open, close, stop, set_position, turn_on, turn_off |
+| climate | turn_on, turn_off, set_temperature, set_hvac_mode, set_fan_mode |
 | media_player | turn_on, turn_off, play, pause, stop, continue, resume, set_volume, volume_mute, volume_unmute |
 | vacuum | turn_on, turn_off, stop, pause, continue, resume |
 | lock | lock, unlock |
 | scene / script | turn_on |
 
-`control_devices` 参数为 `entities`（string 列表，最多 20 个）、`action`、`value`、`confirm_token`；同一 `action` 批量执行，返回 `count`、合并后的中文 `response` 与逐设备 `results`，单个设备失败会收集到 `errors` 而不中断其余设备。
+`control_devices` 参数为 `entities`（string 列表，最多 20 个）、`action`、`value`、`confirm_token`；同一 `action` 批量执行，返回 `count`、合并后的中文 `response` 与逐设备 `results`，单个设备失败会收集到 `errors` 而不中断其余设备。重复目标自动去重并在 `deduplicated` 返回；整批受 `CONTROL_BATCH_TIMEOUT` 总时限约束，超时条目返回 `status=accepted_pending`、`code=pending_confirmation`。
 
 控制后回读状态：
 
 | status | 含义 |
 |---|---|
 | `confirmed` | 回读确认状态/属性已达到预期，且确有变化 |
+| `accepted` | scene / script / `stop_cover` 等无状态服务已下发，HA 无状态可回读，按接受处理 |
 | `no_change` | HA 已接受但无变化；`verified=true` 表示设备本来就是目标状态 |
 | `mismatch` | 回读看到变化，但状态或属性与预期不符 |
 | `accepted_pending` | HA 返回 null 或回读失败，已下发但窗口内无法确认 |
 
 `verification` 会给出 `attempts`、`elapsed_ms`、`expectations`、`checks`、`mismatches`、`readback_errors`。
 
-返回结果的 `ok` 仅在 `status` 为 `confirmed` / `no_change` 时为 `true`；`mismatch` 返回 `ok=false`、`code=not_verified`，`accepted_pending` 返回 `ok=false`、`code=pending_confirmation`，此时应视为“未确认成功”。
+返回结果的 `ok` 仅在 `status` 为 `confirmed` / `accepted`，或 `no_change` 且 `verified=true` 时为 `true`；`mismatch` 与未验证的 `no_change` 返回 `ok=false`、`code=not_verified`，`accepted_pending` 返回 `ok=false`、`code=pending_confirmation`，此时应视为“未确认成功”。
 
 ### 7.4 `list_services` — 查询设备能力
 
@@ -659,8 +665,8 @@ docker run --user "${PUID:-1000}:${PGID:-1000}" \
 | `config_invalid` | `HA_URL` 格式错误 | 修正为 `http://` 或 `https://` 地址 |
 | `invalid_argument` | 参数类型或格式不合法 | 按工具描述修正参数类型/格式 |
 | `invalid_pagination` | `limit` / `offset` 不是整数 | 传正整数 `limit`、非负整数 `offset` |
-| `not_verified` | 回读得到变化但与预期不符（`status=mismatch`） | 检查设备能力与 `list_services` 字段 |
-| `pending_confirmation` | 已下发但回读窗口内无法确认（`status=accepted_pending`） | 稍后查询状态，或用 `get_device_state` 复核 |
+| `not_verified` | 回读得到变化但与预期不符（`status=mismatch`），或 `no_change` 但未验证 | 检查设备能力与 `list_services` 字段 |
+| `pending_confirmation` | 已下发但回读窗口内无法确认（`status=accepted_pending`），含批量总时限超时 | 稍后查询状态，或用 `get_device_state` 复核 |
 | `invalid_entity` | `entity_id` 格式错误 | 用 `list_devices` 查正确 ID，或直接传中文名 |
 | `invalid_response` | HA 返回非预期 JSON | 检查 HA 版本或反向代理 |
 | `auth_failed` | 令牌无效/过期/无权限 | 重新生成 HA 长期令牌 |
@@ -744,6 +750,7 @@ bash tests/run_local_test.sh
 
 | 版本 | 主要变化 |
 |---|---|
+| v1.15.1 | 控制链路修复：`call_service` 与 `control_device` 统一成功语义（`confirmed`/`accepted`/已验证 `no_change`）；scene/script/`stop_cover` 等无状态服务返回 `accepted` 不再误判失败；按 `supported_features`、颜色模式和温度范围过滤动作；新增 `set_percentage`/`set_position`/`set_hvac_mode`/`set_fan_mode` 并校验参数范围；批量控制预加载状态、去重、失败含设备名并受 `CONTROL_BATCH_TIMEOUT` 总时限约束；回读 REST 回退降频；移除 `homeassistant.*` 危险兜底；`resolve_entity` 兼容非字符串输入 |
 | v1.15.0 | 安全与健壮性修复：WebUI 登录改为随机会话 Cookie（重启失效）、登录表单 16KB/工具 JSON 64KB 体积限制、`/readyz` 脱敏为仅 `{ok}`、响应加 `Cache-Control: no-store` 与更严格 CSP；`/api/devices` 加载失败返回 503；HA 3xx 与非数组响应显式报错、状态/服务/注册表请求加单飞锁；控制结果仅 `confirmed`（或 `no_change` 且已验证）为成功，批量部分失败返回 `ok=false` 并播报未成功数，`stop_cover` 等无预期动作按 HA 返回判定；补 `stop_cover`、区域注册表不可用显式降级；MCP server 独立 `*.mcp.log`（`LOG_FILE_MCP`）；健康检查脚本支持 `WEBUI_HOST` 与 127.0.0.1 回退；compose 增加 `cap_drop: ALL`/`read_only`；镜像支持 `linux/arm64`；WebUI 冒烟测试与真实 `.env` 隔离 |
 | v1.14.3 | 新增 MCP bridge 实际连接状态：`mcp_pipe` 定期写入 `.bridge-status.json`，`/api/status` 与首页展示 bridge 连接，配置 `MCP_ENDPOINT` 时 `/readyz` 同时校验 bridge；`_entity_locks` 改为弱引用字典避免无界增长；移除 `LOG_SPLIT`，固定 WebUI/bridge 分文件日志 |
 | v1.14.2 | 代码审查修复：MCP bridge 子进程正常退出后按退避重连，避免忙循环；`control_device` / `control_devices` / `call_service` 在 `mismatch` / `accepted_pending` 时返回 `ok=false`；WebUI 裸服务名按目标实体域判定高风险服务；拒绝 NaN/Infinity 数值；Docker healthcheck 跟随 `WEBUI_HOST`；畸形 Origin 失败关闭不返回 500；WebUI 状态/设备缓存增加单飞锁、危险检查并发执行 |

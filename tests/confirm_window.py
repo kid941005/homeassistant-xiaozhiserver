@@ -10,8 +10,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from homeassistant_xiaozhiserver.service import (  # noqa: E402
-    HAError, _apply_and_confirm, build_service,
+    HAError, _apply_and_confirm, build_service, validate_action_attributes,
 )
+from homeassistant_xiaozhiserver.views import _filter_actions  # noqa: E402
 
 
 def check(condition: bool, label: str) -> None:
@@ -46,6 +47,56 @@ class SlowHA:
         return False
 
 
+class StaticHA:
+    """模拟即发即忘服务：调用返回 null，实体状态始终不变。"""
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self.reads = 0
+
+    def entity_lock(self, entity_id: str) -> asyncio.Lock:
+        return self._lock
+
+    async def call_service(self, domain: str, service: str, payload: dict):
+        return None
+
+    async def get_state(self, entity_id: str, force: bool = False):
+        self.reads += 1
+        return {"entity_id": entity_id, "state": "open", "attributes": {}}
+
+    def state_stream_ready(self) -> bool:
+        return False
+
+
+def check_invalid_attributes() -> None:
+    cases = [
+        ({"temperature": 35}, {"min_temp": 16, "max_temp": 30}, "温度超上限被拒绝"),
+        ({"color_temp_kelvin": 7000},
+         {"min_color_temp_kelvin": 2000, "max_color_temp_kelvin": 6500}, "色温超上限被拒绝"),
+        ({"hvac_mode": "dry"}, {"hvac_modes": ["off", "heat", "cool"]}, "不支持的空调模式被拒绝"),
+        ({"fan_mode": "turbo"}, {"fan_modes": ["low", "high"]}, "不支持的风速被拒绝"),
+    ]
+    for extra, attrs, label in cases:
+        try:
+            validate_action_attributes("climate", extra, attrs)
+        except HAError as exc:
+            check(exc.code == "invalid_value", label)
+        else:
+            raise AssertionError(label + "（未拒绝 " + repr(extra) + "）")
+
+
+def check_filter_actions() -> None:
+    onoff = _filter_actions("light", ["turn_on", "set_brightness", "set_color_temp", "set_color"],
+                            {"supported_color_modes": ["onoff"]})
+    check(onoff == ["turn_on"], "onoff 灯不暴露亮度/色温/颜色动作")
+    basic_cover = _filter_actions("cover", ["open", "close", "stop", "set_position"],
+                                  {"supported_features": 3})
+    check(basic_cover == ["open", "close"], "不支持 stop/position 的窗帘被过滤")
+    full_cover = _filter_actions("cover", ["open", "close", "stop", "set_position"],
+                                 {"supported_features": 15})
+    check(len(full_cover) == 4, "能力完整的窗帘保留全部动作")
+
+
 def check_invalid_number(value, action: str, label: str) -> None:
     try:
         build_service(action, "climate" if action == "set_temperature" else "light", value)
@@ -61,6 +112,8 @@ async def run() -> None:
     check_invalid_number(float("nan"), "set_temperature", "set_temperature 拒绝 NaN")
     check_invalid_number(float("inf"), "set_temperature", "set_temperature 拒绝 Infinity")
     check_invalid_number(float("inf"), "set_color_temp", "set_color_temp 拒绝 Infinity")
+    check_invalid_attributes()
+    check_filter_actions()
     ha = SlowHA()
     st = {"entity_id": "light.slow", "state": "off", "attributes": {}}
     result = await _apply_and_confirm(
@@ -68,6 +121,12 @@ async def run() -> None:
     check(result.get("status") == "confirmed", "慢设备 1s 回写仍被确认")
     check((result.get("after") or {}).get("state") == "on", "慢设备回读状态为 on")
     check(ha.reads >= 4, "回读次数超过旧的 4 次上限（窗口确实延长）")
+    static = StaticHA()
+    accepted = await _apply_and_confirm(
+        static, {"entity_id": "cover.c", "state": "open", "attributes": {}},
+        "cover", "stop_cover", {"entity_id": "cover.c"}, "停止")
+    check(accepted.get("status") == "accepted", "即发即忘服务返回 accepted 而非失败")
+    check(static.reads <= 6, "即发即忘服务不会等满回读超时")
     print("CONFIRM WINDOW OK")
 
 

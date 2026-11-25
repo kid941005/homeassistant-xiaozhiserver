@@ -230,9 +230,13 @@ async def control_device(entity: str, action: str, value: Optional[Any] = None,
         open/close/stop/pause/continue/resume/play  按设备能力映射到对应服务
         lock/unlock        上锁 / 解锁（仅 lock）
         set_brightness     value=亮度百分比 0-100（仅 light，0 表示关闭）
+        set_percentage     value=百分比 0-100（fan）
+        set_position       value=位置百分比 0-100（cover）
         set_volume         value=音量百分比 0-100（media_player）
         volume_mute/volume_unmute  静音/取消静音
         set_temperature    value=目标温度（摄氏度，climate）
+        set_hvac_mode      value=模式名（climate，如 heat/cool/auto）
+        set_fan_mode       value=风速名（climate）
         set_color_temp     value=色温（开尔文，light）
         set_color          value=颜色 #RRGGBB、"r,g,b" 或 [r,g,b]（light）
       value   动作参数，按 action 需要提供：数字（亮度/音量百分比、温度、色温）、
@@ -243,7 +247,8 @@ async def control_device(entity: str, action: str, value: Optional[Any] = None,
 
     控制后会在超时窗口内轮询回读，校验状态 + 亮度/温度/音量/颜色等属性是否达到预期，
     返回 verified 与 verification（attempts/checks/mismatches/elapsed_ms）。
-    若 HA 接受调用但未达预期会明确返回 mismatch 或 no_change，避免静默假成功。
+    若 HA 接受调用但未达预期会明确返回 mismatch 或 no_change；scene/script 等无状态
+    服务无法回读时返回 accepted，避免误判失败。
     适用场景：「把客厅灯亮度调到 50」「关掉风扇」「空调设到 26 度」「电视音量 30」。
     设备名称能直接匹配时不需要先调 list_devices；只有名称不明确或设备不存在时才先查询。
     """
@@ -258,7 +263,8 @@ async def control_devices(entities: list[str], action: str, value: Optional[Any]
     entities 传多个 entity_id 或中文名称；action 与 control_device 相同。
     对每个设备分别回读确认，返回 results 列表与合并后的中文 response。
     任一目标属于危险设备或本次服务高风险时，整批只申请一次 confirm_token；
-    用户确认后带同一 token 重试整批即可。单次最多 20 个设备。
+    用户确认后带同一 token 重试整批即可。单次最多 20 个设备，重复目标自动去重；
+    整批受 CONTROL_BATCH_TIMEOUT 总时限约束，超时条目返回 pending_confirmation。
     """
     return await get_device_service().control_devices(**locals())
 
@@ -299,6 +305,7 @@ async def call_service(entity: str, service: str, data: Optional[dict] = None,
 
     返回状态回读校验结果（verified / verification）：
       status=confirmed        回读确认状态/属性已达到预期
+      status=accepted         scene/script/stop_cover 等无状态服务已下发，无需回读确认
       status=no_change        HA 已接受但无变化（verified=true 表示本来就是目标状态）
       status=mismatch         回读有变化，但状态/属性与预期不符
       status=accepted_pending HA 返回 null（新版 HA），回读窗口内仍未完全匹配预期

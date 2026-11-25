@@ -23,8 +23,8 @@ log = logging.getLogger("homeassistant_xiaozhiserver.service")
 
 SUPPORTED_ACTIONS = [
     "turn_on", "turn_off", "toggle", "open", "close", "stop", "pause", "continue", "resume", "play",
-    "set_brightness", "set_volume", "volume_mute", "volume_unmute",
-    "set_temperature", "set_color_temp", "set_color", "lock", "unlock",
+    "set_brightness", "set_percentage", "set_position", "set_volume", "volume_mute", "volume_unmute",
+    "set_temperature", "set_hvac_mode", "set_fan_mode", "set_color_temp", "set_color", "lock", "unlock",
 ]
 
 # 各设备类型内置支持的控制动作（与 build_service 对齐）。不在表内的类型视为“无内置控制”，
@@ -32,11 +32,11 @@ SUPPORTED_ACTIONS = [
 DOMAIN_ACTIONS = {
     "light": ["turn_on", "turn_off", "toggle", "set_brightness", "set_color_temp", "set_color"],
     "switch": ["turn_on", "turn_off", "toggle"],
-    "fan": ["turn_on", "turn_off", "toggle"],
+    "fan": ["turn_on", "turn_off", "toggle", "set_percentage"],
     "input_boolean": ["turn_on", "turn_off", "toggle"],
     "automation": ["turn_on", "turn_off", "toggle"],
-    "cover": ["open", "close", "stop", "turn_on", "turn_off"],
-    "climate": ["turn_on", "turn_off", "set_temperature"],
+    "cover": ["open", "close", "stop", "set_position", "turn_on", "turn_off"],
+    "climate": ["turn_on", "turn_off", "set_temperature", "set_hvac_mode", "set_fan_mode"],
     "media_player": ["turn_on", "turn_off", "play", "pause", "stop", "continue", "resume",
                      "set_volume", "volume_mute", "volume_unmute"],
     "vacuum": ["turn_on", "turn_off", "stop", "pause", "continue", "resume"],
@@ -185,6 +185,9 @@ def _voice_message(name: str, action: str, status: str, after: Optional[dict],
         if label == "解锁":
             return name + "已解锁。"
         return name + "已" + label + "。"
+    if status == "accepted":
+        # 即发即忘型服务：HA 已接受调用，但没有可验证的状态变化。
+        return name + "已" + label + "。"
     if status == "no_change":
         if verified:
             if state == "on":
@@ -236,6 +239,14 @@ _EXPECTED_STATE = {
 
 # 这些 domain 的 turn_on/turn_off 目标状态由设备能力决定，不能只用单一字符串判定。
 _NON_BINARY_TURN_DOMAINS = {"climate", "media_player", "vacuum", "scene", "script"}
+
+# 即发即忘型服务：HA 通常返回 null 且不保证实体状态变化，不能因为回读无变化就判失败。
+FIRE_AND_FORGET_SERVICES = frozenset({
+    ("scene", "turn_on"),
+    ("script", "turn_on"),
+    ("automation", "trigger"),
+    ("cover", "stop_cover"),
+})
 
 
 def _expected_state(service: str, before_state: Optional[str],
@@ -306,6 +317,37 @@ def _rgb_components(value: Any, code: str = "invalid_value", label: str = "颜�
     if any(c < 0 or c > 255 for c in rgb):
         raise HAError(code, label + " 每个分量必须在 0-255，收到：" + str(value))
     return rgb
+
+
+def validate_action_attributes(domain: str, extra: dict, attributes: Any) -> None:
+    """按实体属性校验参数范围/枚举，避免把明显越界的值发给 HA 再等 400。"""
+    if not isinstance(extra, dict):
+        return
+    attrs = attributes if isinstance(attributes, dict) else {}
+    if "temperature" in extra:
+        value = _num(extra.get("temperature"))
+        low, high = _num(attrs.get("min_temp")), _num(attrs.get("max_temp"))
+        if value is not None and ((low is not None and value < low) or (high is not None and value > high)):
+            raise HAError("invalid_value", "温度 " + str(value) + " 超出设备允许范围 "
+                          + str(low if low is not None else "?") + "-"
+                          + str(high if high is not None else "?") + "。")
+    if "color_temp_kelvin" in extra:
+        value = _num(extra.get("color_temp_kelvin"))
+        low, high = _num(attrs.get("min_color_temp_kelvin")), _num(attrs.get("max_color_temp_kelvin"))
+        if value is not None and ((low is not None and value < low) or (high is not None and value > high)):
+            raise HAError("invalid_value", "色温 " + str(value) + "K 超出设备允许范围 "
+                          + str(low if low is not None else "?") + "-"
+                          + str(high if high is not None else "?") + "K。")
+    if "hvac_mode" in extra:
+        modes = attrs.get("hvac_modes")
+        if isinstance(modes, list) and modes and extra.get("hvac_mode") not in modes:
+            raise HAError("invalid_value", "设备不支持模式 " + str(extra.get("hvac_mode"))
+                          + "；可用模式：" + ", ".join(str(m) for m in modes) + "。")
+    if "fan_mode" in extra:
+        modes = attrs.get("fan_modes")
+        if isinstance(modes, list) and modes and extra.get("fan_mode") not in modes:
+            raise HAError("invalid_value", "设备不支持风速 " + str(extra.get("fan_mode"))
+                          + "；可用风速：" + ", ".join(str(m) for m in modes) + "。")
 
 
 def _expected_attributes(payload: dict) -> dict:
@@ -426,6 +468,7 @@ async def _apply_and_confirm_unlocked(ha: "HAClient", st: dict, service_domain: 
     attempts = 0
     after = None
     changed = False
+    last_force = 0.0
     readback_errors: list = []
     check = {"verified": False, "checks": [], "mismatches": []}
 
@@ -455,9 +498,16 @@ async def _apply_and_confirm_unlocked(ha: "HAClient", st: dict, service_domain: 
                 log.debug("wait_for_state 失败，回退轮询：%s", e)
                 after_st = None
             if after_st is None:
-                # 事件流未命中（含 fake HA 的延迟服务：读取才推进状态）时，回退一次 REST 读。
+                # 事件流未命中（含 fake HA 的延迟服务：读取才推进状态）时回退读状态。
+                # 事件流就绪时缓存通常已由 WS 更新，因此 REST 最多每 0.5s 一次；
+                # 最后一轮强制 REST，确保拿到最终状态，避免每 0.15s 轰击 HA。
+                now = time.monotonic()
+                force = ((now - last_force) >= max(0.5, interval)
+                         or attempts >= max_attempts)
                 try:
-                    after_st = await ha.get_state(eid, force=True)
+                    after_st = await ha.get_state(eid, force=force)
+                    if force:
+                        last_force = now
                 except HAError as e:
                     after_st = None
                     if e.code not in readback_errors:
@@ -484,6 +534,10 @@ async def _apply_and_confirm_unlocked(ha: "HAClient", st: dict, service_domain: 
                 break
         elif changed:
             break
+        # 即发即忘服务通常不会有状态变化，读满最小次数即返回，避免白等整个超时窗口。
+        if ((service_domain, service) in FIRE_AND_FORGET_SERVICES
+                and not has_expectation and not changed and attempts >= min_attempts):
+            break
         # 至少回读 min_attempts 次，但最多到 TIMEOUT 对应的次数；
         # 旧写法 attempts>=min_attempts 先退出，使 TIMEOUT 形同虚设。
         if attempts >= max_attempts:
@@ -494,6 +548,10 @@ async def _apply_and_confirm_unlocked(ha: "HAClient", st: dict, service_domain: 
     verified = bool(check["verified"]) if has_expectation else bool(changed)
     if has_expectation and check["verified"]:
         status = "confirmed" if changed else "no_change"
+    elif (service_domain, service) in FIRE_AND_FORGET_SERVICES and not changed:
+        # 场景/脚本/停止等即发即忘服务：HA 已接受调用即可，不能因无状态变化判失败。
+        status = "accepted"
+        verified = False
     elif not has_expectation and resp_kind in ("empty", "states"):
         # 无预期语义的动作（如 cover.stop_cover）HA 已返回受影响状态，视为执行成功。
         status = "confirmed"
@@ -622,21 +680,35 @@ def build_service(action: str, domain: str, value: Any) -> tuple:
             return "vacuum", "stop", {}
         if domain == "media_player":
             return "media_player", "media_stop", {}
-        return "homeassistant", "stop", {}
+        raise HAError("unsupported_action", "设备类型 " + domain + " 不支持动作 stop。")
     if a == "pause":
         if domain == "media_player":
             return "media_player", "media_pause", {}
         if domain == "vacuum":
             return "vacuum", "pause", {}
-        return "homeassistant", "pause", {}
+        raise HAError("unsupported_action", "设备类型 " + domain + " 不支持动作 pause。")
     if a in ("continue", "resume"):
         if domain == "media_player":
             return "media_player", "media_play", {}
         if domain == "vacuum":
             return "vacuum", "start", {}
-        return "homeassistant", "start", {}
+        raise HAError("unsupported_action", "设备类型 " + domain + " 不支持动作 " + a + "。")
     if a == "play":
+        if domain != "media_player":
+            raise HAError("unsupported_action", "设备类型 " + domain + " 不支持动作 play。")
         return "media_player", "media_play", {}
+    if a == "set_percentage":
+        _need_value(a, value)
+        return "fan", "set_percentage", {"percentage": _clamp_pct(value)}
+    if a == "set_position":
+        _need_value(a, value)
+        return "cover", "set_position", {"position": _clamp_pct(value)}
+    if a == "set_hvac_mode":
+        _need_value(a, value)
+        return "climate", "set_hvac_mode", {"hvac_mode": str(value).strip()}
+    if a == "set_fan_mode":
+        _need_value(a, value)
+        return "climate", "set_fan_mode", {"fan_mode": str(value).strip()}
     if a == "set_brightness":
         _need_value(a, value)
         pct = _clamp_pct(value)

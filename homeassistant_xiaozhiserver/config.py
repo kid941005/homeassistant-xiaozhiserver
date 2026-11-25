@@ -45,4 +45,5 @@ WEBUI_TOKEN = settings.webui_token
 WEBUI_TOKEN_GENERATED = settings.webui_token_generated
 WEBUI_CACHE_TTL = settings.webui_cache_ttl
 CONTROL_CONCURRENCY = settings.control_concurrency
+CONTROL_BATCH_TIMEOUT = settings.control_batch_timeout
 METRICS_ENABLED = settings.metrics_enabled

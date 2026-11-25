@@ -128,6 +128,7 @@ class Settings:
     webui_token_generated: bool = False
     webui_cache_ttl: float = 3.0
     control_concurrency: int = 5
+    control_batch_timeout: float = 8.0
     metrics_enabled: bool = True
 
     def log_file_for(self, role: str | None = None) -> str:
@@ -216,6 +217,7 @@ def _load() -> Settings:
         webui_token_generated=generated,
         webui_cache_ttl=env_float("WEBUI_CACHE_TTL", 3.0, 0.0, 60.0),
         control_concurrency=env_int("CONTROL_CONCURRENCY", 5, 1, 20),
+        control_batch_timeout=env_float("CONTROL_BATCH_TIMEOUT", 8.0, 1.0, 60.0),
         metrics_enabled=env_bool("METRICS_ENABLED", True),
     )
 
@@ -235,7 +237,7 @@ APP_ENV_KEYS = (
     "DANGER_CONFIRM_ENABLED", "DANGER_CONFIRM_TTL", "DANGEROUS_DOMAINS",
     "DANGEROUS_COVER_CLASSES", "DANGEROUS_SERVICE_DOMAINS",
     "WEBUI_HOST", "WEBUI_PORT", "WEBUI_ALLOWED_HOSTS", "WEBUI_TOKEN",
-    "WEBUI_CACHE_TTL", "CONTROL_CONCURRENCY", "METRICS_ENABLED",
+    "WEBUI_CACHE_TTL", "CONTROL_CONCURRENCY", "CONTROL_BATCH_TIMEOUT", "METRICS_ENABLED",
     "HA_URL", "HA_TOKEN", "HA_TIMEOUT", "HA_VERIFY_SSL", "HA_TRUST_ENV",
     "HA_WS_ENABLED", "HA_WS_URL", "HA_REGISTRY_TTL", "HA_REGISTRY_ERROR_TTL",
     "MCP_ENDPOINT",

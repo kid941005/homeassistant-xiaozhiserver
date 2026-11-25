@@ -41,11 +41,77 @@ def summarize(st: dict) -> dict:
         "device_class": a.get("device_class"),
     }
 
-def _controllability(entity_id: str, state: Any) -> dict:
-    """判断一个实体是否可控制，并给出内置动作列表。"""
+def _supported_features(attributes: dict) -> Optional[int]:
+    raw = attributes.get("supported_features") if isinstance(attributes, dict) else None
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _filter_actions(domain: str, actions: list, attributes: dict) -> list:
+    """按 supported_features / supported_color_modes 过滤动作。
+
+    属性缺失时保持原动作列表（兼容不报告能力的集成）；只有明确报告“不支持”
+    时才移除，避免把 set_color_temp 暴露给纯色温灯等明显不支持的动作。
+    """
+    attrs = attributes if isinstance(attributes, dict) else {}
+    features = _supported_features(attrs)
+    out = list(actions)
+    if domain == "light":
+        modes = attrs.get("supported_color_modes")
+        modes = [str(m).lower() for m in modes] if isinstance(modes, list) else None
+        if "set_brightness" in out:
+            if modes is not None:
+                if modes and all(m == "onoff" for m in modes):
+                    out.remove("set_brightness")
+            elif features is not None and not (features & 1) and "brightness" not in attrs:
+                out.remove("set_brightness")
+        if "set_color_temp" in out:
+            if modes is not None:
+                if modes and "color_temp" not in modes and "min_color_temp_kelvin" not in attrs:
+                    out.remove("set_color_temp")
+            elif features is not None and not (features & 2):
+                out.remove("set_color_temp")
+        if "set_color" in out:
+            color_modes = {"hs", "xy", "rgb", "rgbw", "rgbww"}
+            if modes is not None:
+                if modes and not (set(modes) & color_modes):
+                    out.remove("set_color")
+            elif features is not None and not (features & 16):
+                out.remove("set_color")
+    elif domain == "cover":
+        if features is not None:
+            mapping = {"open": 1, "close": 2, "stop": 8, "set_position": 4,
+                       "turn_on": 1, "turn_off": 2}
+            out = [a for a in out if not (a in mapping and not (features & mapping[a]))]
+    elif domain == "climate":
+        if features is not None:
+            if "set_temperature" in out and not (features & 3):
+                out.remove("set_temperature")
+            if "set_fan_mode" in out and not (features & 8) and not attrs.get("fan_modes"):
+                out.remove("set_fan_mode")
+    elif domain == "media_player":
+        if features is not None:
+            mapping = {"play": 16384, "pause": 1, "stop": 4096, "set_volume": 4,
+                       "volume_mute": 8, "volume_unmute": 8, "turn_on": 128, "turn_off": 256}
+            out = [a for a in out if not (a in mapping and not (features & mapping[a]))]
+    elif domain == "fan":
+        if features is not None and "set_percentage" in out and not (features & 16):
+            out.remove("set_percentage")
+    return out
+
+
+def _controllability(entity_id: str, state: Any, attributes: Optional[dict] = None) -> dict:
+    """判断一个实体是否可控制，并给出按设备能力过滤后的内置动作列表。"""
     domain = _domain_of(entity_id)
-    actions = list(DOMAIN_ACTIONS.get(domain, []))
+    actions = _filter_actions(domain, list(DOMAIN_ACTIONS.get(domain, [])), attributes or {})
     if not actions:
+        if domain in DOMAIN_ACTIONS:
+            return {"controllable": False, "actions": [],
+                    "controllable_reason": "设备未报告支持该类型的任何内置动作，可先用 list_services 查能力，再用 call_service 调用"}
         return {"controllable": False, "actions": [],
                 "controllable_reason": "该类型无内置控制动作，可先用 list_services 查能力，再用 call_service 调用"}
     if str(state) in ("unavailable", "unknown"):
@@ -148,7 +214,8 @@ def redundant_switch_map(
             light_id = str(lights[0].get("entity_id") or "")
             light_label = _normalize_label(_friendly_name(lights[0]))
             switch_label = _normalize_label(_friendly_name(switches[0]))
-            light_info = _controllability(light_id, lights[0].get("state"))
+            light_info = _controllability(light_id, lights[0].get("state"),
+                                            lights[0].get("attributes"))
             if not light_info.get("controllable"):
                 info["reason"] = "灯具当前不可控制（" + str(light_info.get("controllable_reason") or "不可用") + "），未自动隐藏开关"
             elif light_label and light_label == switch_label:
@@ -174,7 +241,7 @@ def _drop_redundant_switches(states: list, devices: Optional[dict] = None, ents:
 def _entity_view(st: dict, devices: dict, ents: dict, areas: Optional[dict] = None) -> dict:
     """在实体摘要基础上补充 controllable 标记、所属设备与区域信息。"""
     v = summarize(st)
-    v.update(_controllability(st.get("entity_id", ""), st.get("state")))
+    v.update(_controllability(st.get("entity_id", ""), st.get("state"), st.get("attributes")))
     v.update(_danger_info(st.get("entity_id", ""), st.get("attributes") or {}))
     eid = str(st.get("entity_id", ""))
     ent_rec = ents.get(eid) or {}

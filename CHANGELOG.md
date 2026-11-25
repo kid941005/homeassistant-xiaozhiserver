@@ -8,6 +8,21 @@
 
 暂无计划中的变更。
 
+## [1.15.1] - 2026-11-25
+
+控制链路语义、能力过滤与批量控制修复版本。
+
+### 修复
+
+- `call_service` 成功判定与 `control_device` 统一：仅 `confirmed`/`accepted`，或 `no_change` 且已验证时返回 `ok=true`；未验证的 `no_change` 返回 `code=not_verified`。
+- `scene.turn_on` / `script.turn_on` / `automation.trigger` / `cover.stop_cover` 等无状态服务返回 `status=accepted`、`ok=true`，不再误判为 `accepted_pending`；无预期动作时提前结束回读。
+- 能力过滤读取 `supported_features`、`supported_color_modes`、温度/色温范围等属性，避免向设备暴露不支持的动作。
+- 新增 `set_percentage`、`set_position`、`set_hvac_mode`、`set_fan_mode`，并在下发前校验温度、色温、模式取值范围。
+- 批量控制预加载状态与注册表、复用实体解析、重复目标去重；新增 `CONTROL_BATCH_TIMEOUT` 总时限，超时条目返回 `pending_confirmation`，失败播报包含设备名。
+- 回读轮询在事件流未命中时降低 REST 回退频率（最多每 0.5 秒一次，最后一轮强制），减少 HA 压力。
+- `stop` / `pause` / `continue` / `resume` 不再兜底到 `homeassistant.*`，不支持时返回 `unsupported_action`。
+- `resolve_entity` 接受任意类型并按字符串处理，避免 WebUI 传数字时报 `internal_error`。
+
 ## [1.15.0] - 2026-11-25
 
 安全与健壮性修复版本，重点处理 WebUI 暴露面、控制结果语义、HA 异常响应与部署加固。
