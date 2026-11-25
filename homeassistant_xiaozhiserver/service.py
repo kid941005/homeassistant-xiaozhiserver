@@ -494,6 +494,10 @@ async def _apply_and_confirm_unlocked(ha: "HAClient", st: dict, service_domain: 
     verified = bool(check["verified"]) if has_expectation else bool(changed)
     if has_expectation and check["verified"]:
         status = "confirmed" if changed else "no_change"
+    elif not has_expectation and resp_kind in ("empty", "states"):
+        # 无预期语义的动作（如 cover.stop_cover）HA 已返回受影响状态，视为执行成功。
+        status = "confirmed"
+        verified = True
     elif changed:
         # 无明确预期时只能确认「有变化」，不能判为 mismatch
         status = "mismatch" if has_expectation else "confirmed"

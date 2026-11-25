@@ -17,6 +17,7 @@ COPY homeassistant_xiaozhiserver ./homeassistant_xiaozhiserver
 COPY server.py ./server.py
 COPY mcp_pipe.py ./mcp_pipe.py
 COPY docker-entrypoint.sh /app/docker-entrypoint.sh
+COPY healthcheck.py /app/healthcheck.py
 
 RUN useradd -m -u 10001 --no-log-init appuser \
     && chmod 0755 /app/docker-entrypoint.sh \
@@ -31,7 +32,7 @@ ENV HA_TIMEOUT=10 \
 # WebUI 默认监听 8099，可用 WEBUI_PORT 覆盖；EXPOSE 仅作默认声明。
 EXPOSE 8099
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD python -c "import os, urllib.request; host=os.environ.get('WEBUI_HOST') or '127.0.0.1'; host='127.0.0.1' if host in ('0.0.0.0','::') else host; host='['+host+']' if ':' in host else host; port=os.environ.get('WEBUI_PORT','8099'); urllib.request.urlopen('http://%s:%s/healthz' % (host, port), timeout=3)" || exit 1
+HEALTHCHECK --interval=30s --timeout=8s --start-period=20s --retries=3 \
+    CMD ["python", "/app/healthcheck.py"]
 
 ENTRYPOINT ["/app/docker-entrypoint.sh"]

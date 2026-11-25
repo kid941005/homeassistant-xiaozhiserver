@@ -13,6 +13,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# 直接运行本文件时不要让模块级 load_dotenv() 加载真实 .env 并操作真实 Home Assistant。
+# 已由调用方显式导出的环境变量优先保留（例如 run_local_test.sh 指向 fake_ha）。
+for _key in ("HA_URL", "HA_TOKEN", "MCP_ENDPOINT"):
+    os.environ.setdefault(_key, "")
+os.environ.setdefault("WEBUI_TOKEN", "testtoken")
+
 from fastapi.testclient import TestClient  # noqa: E402
 
 from homeassistant_xiaozhiserver import __version__  # noqa: E402
@@ -62,8 +68,9 @@ check("首页包含折叠的工具调试台", "高级：工具调试台" in r.te
 check("首页不再重复展示只读配置表", "配置（只读" not in r.text)
 
 r = client.get("/api/devices")
-check("无需登录访问 /api/devices 200", r.status_code == 200, str(r.status_code))
 devices = r.json()
+check("无需登录访问 /api/devices 成功或明确降级", r.status_code in (200, 503), str(r.status_code))
+check("/api/devices 状态码与 ok 一致", (r.status_code == 200) == bool(devices.get("ok")), str(r.status_code))
 check("devices 返回 rows 列表", isinstance(devices.get("rows"), list), str(type(devices.get("rows"))))
 if os.environ.get("HA_URL") and os.environ.get("HA_TOKEN"):
     check("已配置 HA 时设备加载成功", devices.get("ok") is True, json.dumps(devices, ensure_ascii=False)[:300])
@@ -131,6 +138,13 @@ if mcp_raw:
 r = client.get("/healthz")
 check("健康检查 200", r.status_code == 200 and r.json().get("ok") is True, r.text[:200])
 check("安全响应头存在", r.headers.get("X-Content-Type-Options") == "nosniff")
+check("响应禁止缓存", r.headers.get("Cache-Control") == "no-store", str(r.headers.get("Cache-Control")))
+
+r = anon.get("/readyz")
+check("/readyz 公开且只返回 ok", r.status_code in (200, 503) and set(r.json()) == {"ok"}, r.text[:200])
+
+r = post("/login", data={"token": "x" * 20000})
+check("登录表单超限返回 413", r.status_code == 413, str(r.status_code))
 
 r = post("/api/tool/list_devices", json={"limit": "abc"})
 check("非法分页参数返回 invalid_pagination",

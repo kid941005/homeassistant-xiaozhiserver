@@ -107,7 +107,10 @@ def build_server_command(script_path: str | None = None):
         script_path = sys.argv[1] if len(sys.argv) >= 2 else "server.py"
     if not os.path.isfile(script_path):
         raise RuntimeError("MCP server 脚本不存在：" + script_path)
-    return [sys.executable, script_path], os.environ.copy()
+    env = os.environ.copy()
+    # 子进程写独立的 .mcp.log，避免与 bridge 进程共用同一 RotatingFileHandler 造成轮转竞争。
+    env["LOG_ROLE"] = "mcp"
+    return [sys.executable, script_path], env
 
 
 def _terminate(process: subprocess.Popen, target: str) -> None:

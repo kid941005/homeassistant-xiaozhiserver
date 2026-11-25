@@ -100,6 +100,7 @@ class Settings:
     log_file: str = ""
     log_file_webui: str = ""
     log_file_bridge: str = ""
+    log_file_mcp: str = ""
     log_format: str = "text"
     log_max_bytes: int = 5 * 1024 * 1024
     log_backup_count: int = 3
@@ -133,12 +134,20 @@ class Settings:
         role = (role or os.environ.get("LOG_ROLE") or "bridge").strip().lower()
         if role == "webui":
             return self.log_file_webui or self.log_file
+        if role == "mcp":
+            return self.log_file_mcp or self.log_file
         return self.log_file_bridge or self.log_file
 
     @property
     def log_files(self) -> tuple[str, ...]:
         return tuple(dict.fromkeys(
-            path for path in (self.log_file_for("webui"), self.log_file_for("bridge")) if path
+            path
+            for path in (
+                self.log_file_for("webui"),
+                self.log_file_for("bridge"),
+                self.log_file_for("mcp"),
+            )
+            if path
         ))
 
 
@@ -152,6 +161,7 @@ def _load() -> Settings:
     )
     webui_file = env_str("LOG_FILE_WEBUI", "") or _split_path(base_file, ".webui")
     bridge_file = env_str("LOG_FILE_BRIDGE", "") or _split_path(base_file, ".bridge")
+    mcp_file = env_str("LOG_FILE_MCP", "") or _split_path(base_file, ".mcp")
     fmt = env_str("LOG_FORMAT", "text").lower()
     if fmt not in ("text", "json"):
         log.warning("环境变量 LOG_FORMAT=%r 非法，使用 text", fmt)
@@ -175,6 +185,7 @@ def _load() -> Settings:
         log_file=base_file,
         log_file_webui=webui_file,
         log_file_bridge=bridge_file,
+        log_file_mcp=mcp_file,
         log_format=fmt,
         log_max_bytes=env_int("LOG_MAX_BYTES", 5 * 1024 * 1024, 0, 1024 * 1024 * 1024),
         log_backup_count=env_int("LOG_BACKUP_COUNT", 3, 0, 50),
@@ -213,7 +224,7 @@ settings = _load()
 
 # 供 .env.example 一致性检查与文档使用：本程序会读取的全部环境变量。
 APP_ENV_KEYS = (
-    "LOG_LEVEL", "LOG_FILE", "LOG_FILE_WEBUI", "LOG_FILE_BRIDGE",
+    "LOG_LEVEL", "LOG_FILE", "LOG_FILE_WEBUI", "LOG_FILE_BRIDGE", "LOG_FILE_MCP",
     "LOG_FORMAT", "LOG_MAX_BYTES", "LOG_BACKUP_COUNT",
     "DEFAULT_LIST_LIMIT", "MAX_LIST_LIMIT",
     "EXCLUDED_DOMAINS", "EXCLUDED_DEVICE_KEYWORDS",

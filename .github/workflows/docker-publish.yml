@@ -6,7 +6,7 @@ on:
       version:
         description: "Image version tag, must match homeassistant_xiaozhiserver/__init__.py"
         required: true
-        default: "1.14.3"
+        default: "1.15.0"
   pull_request:
   push:
     branches:
@@ -111,7 +111,7 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: |
             org.opencontainers.image.title=homeassistant-xiaozhiserver

@@ -2,7 +2,7 @@
 
 > 把 **Home Assistant** 的实体与服务封装成标准 **MCP（Model Context Protocol）** 工具，供 **小智（xiaozhi-server）** 通过 **MCP 接入点** 用自然语言查询和控制智能家居设备。
 
-**当前版本：v1.14.3** · Python 3.12 · 传输方式：**stdio MCP server + WebSocket bridge** · 单容器部署（MCP bridge + WebUI）
+**当前版本：v1.15.0** · Python 3.12 · 传输方式：**stdio MCP server + WebSocket bridge** · 单容器部署（MCP bridge + WebUI）
 
 ---
 
@@ -213,8 +213,8 @@ docker compose logs -f homeassistant-xiaozhiserver
 看到以下日志表示 bridge 已连上小智：
 
 ```text
-2026-01-01 12:00:00.123 INFO    v1.14.3 MCP_PIPE [-] MCP接入点连接成功
-2026-01-01 12:00:00.456 INFO    v1.14.3 MCP_PIPE [-] 已启动 MCP server：...
+2026-01-01 12:00:00.123 INFO    v1.15.0 MCP_PIPE [-] MCP接入点连接成功
+2026-01-01 12:00:00.456 INFO    v1.15.0 MCP_PIPE [-] 已启动 MCP server：...
 ```
 
 WebUI 地址：`http://<宿主机IP>:8099/`（端口由 `WEBUI_PORT` 决定），首次打开会跳转登录页，输入 `.env` 的 `WEBUI_TOKEN` 后才能进入。compose 使用 `network_mode: host`，因此没有 `ports` 映射；如需只允许本机访问，把 `.env` 的 `WEBUI_HOST` 设为 `127.0.0.1`。
@@ -256,8 +256,8 @@ docker inspect homeassistant-xiaozhiserver --format 'user={{.Config.User}}'
 docker compose exec homeassistant-xiaozhiserver id
 docker compose exec homeassistant-xiaozhiserver sh -c 'touch /app/logs/.write-test && rm -f /app/logs/.write-test && echo logs-writable'
 
-# WebUI 状态
-curl -s http://127.0.0.1:${WEBUI_PORT:-8099}/api/status
+# WebUI 存活检查（无需登录）；/api/status 需要先登录拿到会话 Cookie
+curl -s http://127.0.0.1:${WEBUI_PORT:-8099}/healthz
 
 # 查看最近日志
 docker compose logs --tail=100 homeassistant-xiaozhiserver
@@ -267,7 +267,7 @@ docker compose logs --tail=100 homeassistant-xiaozhiserver
 
 ## 5. WebUI
 
-WebUI 与 MCP bridge 在同一个容器内运行：WebUI 后台常驻，bridge 前台运行；容器 `HEALTHCHECK` 探测 `/healthz`（进程存活），`/readyz` 额外反映 HA 是否已配置且可达；若配置了 `MCP_ENDPOINT`，还会要求 bridge 已实际连接。
+WebUI 与 MCP bridge 在同一个容器内运行：WebUI 后台常驻，bridge 前台运行（bridge 再启动 stdio MCP server 子进程）。容器 `HEALTHCHECK` 用 `healthcheck.py` 探测 `/healthz`，会依次尝试 `WEBUI_HOST`（若不是 `0.0.0.0`/`::`）与 `127.0.0.1`；`/readyz` 额外反映 HA 是否已配置且可达，若配置了 `MCP_ENDPOINT` 还要求 bridge 已实际连接。`/readyz` 是公开探针，只返回 `{"ok": true|false}`，不泄漏 HA 地址或 bridge 细节。
 
 ![WebUI 首页](docs/webui.png)
 
@@ -279,7 +279,7 @@ WebUI 与 MCP bridge 在同一个容器内运行：WebUI 后台常驻，bridge �
 |---|---|
 | 运行状态 | 版本、启动时间、运行时长、HA 连通性、MCP 接入点、Bridge 连接、运行形态 |
 | 可调用设备 | 按区域展示设备、实体、类型、状态与可执行动作；危险设备带标记；支持关键字过滤与刷新 |
-| 服务日志 | 汇总 WebUI 与 bridge 的分进程日志，展示最近 200 条，支持级别筛选、手动刷新、5 秒自动刷新 |
+| 服务日志 | 汇总 WebUI、bridge 与 MCP server 的分进程日志，展示最近 200 条，支持级别筛选、手动刷新、5 秒自动刷新 |
 | 高级（默认折叠） | 7 工具调试台与只读运行参数 |
 
 常用接口：
@@ -287,21 +287,21 @@ WebUI 与 MCP bridge 在同一个容器内运行：WebUI 后台常驻，bridge �
 | 方法 | 路径 | 用途 |
 |---|---|---|
 | GET | `/login` | 登录页 |
-| POST | `/login` | 校验 `WEBUI_TOKEN`，成功后写入 HttpOnly 会话 Cookie |
-| POST | `/logout` | 清除会话 Cookie |
+| POST | `/login` | 校验 `WEBUI_TOKEN`，成功后签发随机 HttpOnly 会话 Cookie（服务端内存校验，重启失效） |
+| POST | `/logout` | 注销服务端会话并清除 Cookie |
 | GET | `/` | WebUI 首页（需登录） |
 | GET | `/api/status` | 运行状态、HA 连通性与 bridge 实际连接状态（需登录） |
 | GET | `/api/config` | 只读配置，敏感值掩码（需登录） |
-| GET | `/api/devices` | 设备总览数据（需登录，默认 3 秒缓存） |
+| GET | `/api/devices` | 设备总览数据（需登录，默认 3 秒缓存；加载失败返回 503 与错误码） |
 | GET | `/api/logs?limit=200&level=INFO` | 最近日志，`limit` 1–500（需登录） |
 | GET | `/healthz` | 存活探针，仅表示 WebUI 进程可响应 |
-| GET | `/readyz` | 就绪探针，HA 已配置且可达、且配置 MCP 时 bridge 已连接则 200，否则 503 |
+| GET | `/readyz` | 公开就绪探针，只返回 `{"ok": bool}`；HA 已配置且可达、且配置 MCP 时 bridge 已连接则 200，否则 503 |
 | GET | `/metrics` | Prometheus 文本指标；`METRICS_ENABLED=false` 时 404 |
 | POST | `/api/tool/{name}` | JSON 工具调试，仅白名单 7 个工具；请求体上限 64KB（需登录） |
 
-WebUI 使用 `.env` 中的 `WEBUI_TOKEN` 登录，所有页面与 API（除 `/login`、`/healthz`、`/readyz`、`/metrics`）都要求有效会话 Cookie。仍然建议只绑定可信内网或放在带 TLS 的反向代理后面。WebUI 会独立拦截危险设备与高风险服务（不受 `DANGER_CONFIRM_ENABLED` 影响；查询设备安全性失败时按拒绝处理，失败关闭），写请求必须同源并校验 Host/Origin，所有响应附带 `X-Content-Type-Options`、`X-Frame-Options`、`CSP` 等安全头。允许的 Host 默认是 localhost/内网 IP，跨网段或域名访问可通过 `WEBUI_ALLOWED_HOSTS` 追加。
+WebUI 使用 `.env` 中的 `WEBUI_TOKEN` 登录，登录成功后签发随机会话 Cookie（仅存服务端内存，容器重启后需重新登录），所有页面与 API（除 `/login`、`/healthz`、`/readyz`、`/metrics`）都要求有效会话 Cookie。POST 登录表单限制 16KB、工具调试 JSON 限制 64KB；响应带 `Cache-Control: no-store` 与更严格的 CSP。仍然建议只绑定可信内网或放在带 TLS 的反向代理后面。WebUI 会独立拦截危险设备与高风险服务（不受 `DANGER_CONFIRM_ENABLED` 影响；查询设备安全性失败时按拒绝处理，失败关闭），写请求必须同源并校验 Host/Origin，所有响应附带 `X-Content-Type-Options`、`X-Frame-Options`、`CSP` 等安全头。允许的 Host 默认是 localhost/内网 IP，跨网段或域名访问可通过 `WEBUI_ALLOWED_HOSTS` 追加。
 
-日志默认写入系统临时目录，可用 `LOG_FILE` 指定；WebUI 与 bridge 始终分别写 `*.webui.log` / `*.bridge.log`，避免两个进程同时轮转同一文件。日志行格式为 `YYYY-MM-DD HH:MM:SS.mmm LEVEL v版本 模块 [call_id] 消息`，默认 `TZ=Asia/Shanghai`（可用环境变量覆盖），因此容器日志与宿主机本地时间一致。`LOG_FORMAT=json` 可输出结构化日志，`/metrics` 暴露工具与 HTTP 指标。项目根 `docker-compose.yml` 把容器 `/app/logs` 挂到宿主机 `./xiaozhi-logs`，并设置 json-file 日志上限。
+日志默认写入系统临时目录，可用 `LOG_FILE` 指定；WebUI、bridge 与 stdio MCP server 分别写 `*.webui.log` / `*.bridge.log` / `*.mcp.log`，避免多个进程同时轮转同一文件。日志行格式为 `YYYY-MM-DD HH:MM:SS.mmm LEVEL v版本 模块 [call_id] 消息`，默认 `TZ=Asia/Shanghai`（可用环境变量覆盖），因此容器日志与宿主机本地时间一致。`LOG_FORMAT=json` 可输出结构化日志，`/metrics` 暴露工具与 HTTP 指标。项目根 `docker-compose.yml` 把容器 `/app/logs` 挂到宿主机 `./xiaozhi-logs`，并设置 json-file 日志上限。
 
 > 日志目录不可写时，程序会自动回退到容器内临时目录（`/tmp/xiaozhi-logs`），并用一条带时间戳的告警说明原因，不再输出 Python logging 的整段 Traceback；WebUI 的日志面板会自动读取实际生效的日志文件。要保留宿主机日志，仍需保证 `./xiaozhi-logs` 归容器用户所有。
 
@@ -385,7 +385,8 @@ docker run --user "${PUID:-1000}:${PGID:-1000}" \
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL` |
 | `LOG_FILE` | 系统临时目录下 `homeassistant-xiaozhiserver.log` | 日志基准路径 |
 | `LOG_FILE_WEBUI` | 由 `LOG_FILE` 推导 `*.webui.log` | WebUI 进程日志路径 |
-| `LOG_FILE_BRIDGE` | 由 `LOG_FILE` 推导 `*.bridge.log` | bridge/MCP server 进程日志路径 |
+| `LOG_FILE_BRIDGE` | 由 `LOG_FILE` 推导 `*.bridge.log` | bridge 进程日志路径 |
+| `LOG_FILE_MCP` | 由 `LOG_FILE` 推导 `*.mcp.log` | stdio MCP server 子进程日志路径 |
 | `LOG_FORMAT` | `text` | `text` 或 `json`（结构化日志） |
 | `TZ` | `Asia/Shanghai` | 容器与日志时间戳时区；Dockerfile 与 compose 均提供默认值 |
 | `LOG_MAX_BYTES` | `5242880` | 单个日志文件轮转阈值（字节），`0` 表示不按大小轮转 |
@@ -733,7 +734,7 @@ bash tests/run_local_test.sh
 - `HA_TOKEN` / `MCP_ENDPOINT` 只通过环境变量注入，不写入镜像、代码或 Git；`.env` 已被 `.gitignore` 忽略。
 - bridge 主动出站，不要为它暴露入站端口；WebUI 的 `WEBUI_PORT`（默认 8099）只建议绑定可信内网。
 - WebUI 使用 `WEBUI_TOKEN` 登录，页面和 API 只展示掩码后的敏感值；远程访问仍建议走 SSH 隧道、TLS 反向代理，并保持 `WEBUI_TOKEN` 足够长且定期更换。
-- 容器以非 root 用户运行：compose 默认 `user: "1000:1000"`，可通过 `PUID` / `PGID` 覆盖（镜像内置的 `appuser` uid 10001 仅在未覆盖 user 时生效）；带 `/healthz` 健康检查，`/readyz` 可反映 HA 与 bridge 就绪状态。
+- 容器以非 root 用户运行：compose 默认 `user: "1000:1000"`，可通过 `PUID` / `PGID` 覆盖（镜像内置的 `appuser` uid 10001 仅在未覆盖 user 时生效）；compose 还启用 `cap_drop: [ALL]`、`read_only: true` 与 `/tmp` tmpfs。`healthcheck.py` 会尝试 `WEBUI_HOST` 与 `127.0.0.1`，`/readyz` 可反映 HA 与 bridge 就绪状态。发布镜像同时提供 `linux/amd64` 与 `linux/arm64`。
 - 危险操作确认只用于防误操作，不是权限控制；真正权限由 HA 长期令牌决定。
 - 建议为 HA 使用专用长期令牌，只授予必要设备权限；公网接入使用 `wss://` 并保护 token。
 
@@ -743,6 +744,7 @@ bash tests/run_local_test.sh
 
 | 版本 | 主要变化 |
 |---|---|
+| v1.15.0 | 安全与健壮性修复：WebUI 登录改为随机会话 Cookie（重启失效）、登录表单 16KB/工具 JSON 64KB 体积限制、`/readyz` 脱敏为仅 `{ok}`、响应加 `Cache-Control: no-store` 与更严格 CSP；`/api/devices` 加载失败返回 503；HA 3xx 与非数组响应显式报错、状态/服务/注册表请求加单飞锁；控制结果仅 `confirmed`（或 `no_change` 且已验证）为成功，批量部分失败返回 `ok=false` 并播报未成功数，`stop_cover` 等无预期动作按 HA 返回判定；补 `stop_cover`、区域注册表不可用显式降级；MCP server 独立 `*.mcp.log`（`LOG_FILE_MCP`）；健康检查脚本支持 `WEBUI_HOST` 与 127.0.0.1 回退；compose 增加 `cap_drop: ALL`/`read_only`；镜像支持 `linux/arm64`；WebUI 冒烟测试与真实 `.env` 隔离 |
 | v1.14.3 | 新增 MCP bridge 实际连接状态：`mcp_pipe` 定期写入 `.bridge-status.json`，`/api/status` 与首页展示 bridge 连接，配置 `MCP_ENDPOINT` 时 `/readyz` 同时校验 bridge；`_entity_locks` 改为弱引用字典避免无界增长；移除 `LOG_SPLIT`，固定 WebUI/bridge 分文件日志 |
 | v1.14.2 | 代码审查修复：MCP bridge 子进程正常退出后按退避重连，避免忙循环；`control_device` / `control_devices` / `call_service` 在 `mismatch` / `accepted_pending` 时返回 `ok=false`；WebUI 裸服务名按目标实体域判定高风险服务；拒绝 NaN/Infinity 数值；Docker healthcheck 跟随 `WEBUI_HOST`；畸形 Origin 失败关闭不返回 500；WebUI 状态/设备缓存增加单飞锁、危险检查并发执行 |
 | v1.14.1 | 日志可读性修复：时间戳加入毫秒并默认 `TZ=Asia/Shanghai` 本地时间；日志目录不可写时自动回退到 `/tmp/xiaozhi-logs`，只输出一条带时间戳的告警，不再刷 Python logging Traceback；清理重复 root handler；新增 `TZ` 容器变量与文档，补充日志目录权限说明 |

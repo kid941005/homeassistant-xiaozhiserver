@@ -108,7 +108,9 @@ def _effective_path(role: str | None = None) -> str:
             tempfile.gettempdir(), "xiaozhi-logs", os.path.basename(preferred) or "homeassistant-xiaozhiserver.log"
         )
         chosen = fallback if _probe_writable(fallback) else ""
-    _EFFECTIVE_FILES[key] = chosen
+    # 只缓存成功路径：若首次因权限不可写，后续调用仍会重新探测，避免永久退化到 stderr。
+    if chosen:
+        _EFFECTIVE_FILES[key] = chosen
     return chosen
 
 
@@ -118,7 +120,7 @@ def log_file_path(role: str | None = None) -> str:
 
 
 def log_files() -> tuple[str, ...]:
-    roles = ("webui", "bridge")
+    roles = ("webui", "bridge", "mcp")
     paths = [p for p in (_effective_path(role) for role in roles) if p]
     return tuple(dict.fromkeys(paths))
 

@@ -20,7 +20,6 @@ except Exception:  # noqa: BLE001
     pass
 
 import asyncio
-import hashlib
 import hmac
 import html
 import inspect
@@ -28,9 +27,11 @@ import ipaddress
 import json
 import logging
 import os
+import re
+import secrets
 import time
 from typing import Any
-from urllib.parse import parse_qsl, urlsplit, urlunsplit
+from urllib.parse import parse_qs, parse_qsl, urlsplit, urlunsplit
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
@@ -71,23 +72,49 @@ _STARTED_AT = time.time()
 _MAX_TOOL_BODY = 64 * 1024
 _DANGER_GATED_TOOLS = frozenset({"control_device", "control_devices", "call_service"})
 _AUTH_COOKIE = "xiaozhi_webui"
+_SESSION_TTL = 7 * 24 * 3600
 _PUBLIC_PATHS = frozenset({"/login", "/healthz", "/readyz", "/metrics"})
-
-
-def _auth_cookie_value() -> str:
-    return hashlib.sha256(("webui-session:" + WEBUI_TOKEN).encode("utf-8")).hexdigest()
+# 登录后签发随机 session id，服务端内存校验；重启即失效，避免固定 cookie 值长期可用。
+_SESSIONS: dict[str, float] = {}
 
 
 def _token_ok(raw: str) -> bool:
     return bool(WEBUI_TOKEN) and hmac.compare_digest(str(raw or ""), WEBUI_TOKEN)
 
 
+def _new_session() -> str:
+    now = time.time()
+    # 顺带清理已过期会话，避免只登录不访问时内存表无界增长。
+    for stale in [key for key, expiry in _SESSIONS.items() if expiry < now]:
+        _SESSIONS.pop(stale, None)
+    token = secrets.token_urlsafe(24)
+    _SESSIONS[token] = now + _SESSION_TTL
+    return token
+
+
 def _cookie_ok(raw: str) -> bool:
-    return bool(WEBUI_TOKEN) and hmac.compare_digest(str(raw or ""), _auth_cookie_value())
+    if not raw:
+        return False
+    expiry = _SESSIONS.get(str(raw))
+    if expiry is None:
+        return False
+    if expiry < time.time():
+        _SESSIONS.pop(str(raw), None)
+        return False
+    return True
+
+
+def _drop_session(raw: str) -> None:
+    if raw:
+        _SESSIONS.pop(str(raw), None)
 
 
 def _metric_path(path: str) -> str:
-    return "/api/tool/{name}" if path.startswith("/api/tool/") else path
+    if path.startswith("/api/tool/"):
+        return "/api/tool/{name}"
+    known = {"/", "/login", "/logout", "/healthz", "/readyz", "/metrics",
+             "/api/status", "/api/config", "/api/devices", "/api/logs", "/tool"}
+    return path if path in known else "/{other}"
 
 # 工具白名单：名称 -> (说明, 参数示例)
 _TOOLS: list[tuple[str, str, str]] = [
@@ -186,7 +213,12 @@ def _mask_endpoint(raw: str) -> str:
         key + "=***" if any(marker in key.lower() for marker in sensitive) else key + "=" + value
         for key, value in parse_qsl(parts.query, keep_blank_values=True)
     )
-    return urlunsplit((parts.scheme, netloc, parts.path, query, ""))
+    # 路径里也可能内嵌长 token（如 /mcp/<token>），把长随机段一并掩码。
+    path = "/".join(
+        "***" if len(seg) >= 24 and re.fullmatch(r"[A-Za-z0-9_-]+", seg) else seg
+        for seg in parts.path.split("/")
+    )
+    return urlunsplit((parts.scheme, netloc, path, query, ""))
 
 
 def _bridge_data() -> dict[str, Any]:
@@ -288,13 +320,30 @@ def create_app() -> FastAPI:
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers.setdefault("Referrer-Policy", "no-referrer")
+        response.headers.setdefault("Cache-Control", "no-store")
         response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
         response.headers.setdefault(
             "Content-Security-Policy",
             "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
-            "img-src 'self' data:; connect-src 'self'",
+            "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
         )
         return response
+
+    async def _read_form_limited(request: Request, limit: int) -> dict | None:
+        """读取 application/x-www-form-urlencoded 表单并限制体积；超限/类型不符返回 None。"""
+        ctype = request.headers.get("content-type", "").lower()
+        if not ctype.startswith("application/x-www-form-urlencoded"):
+            return None
+        raw = bytearray()
+        async for chunk in request.stream():
+            if len(raw) + len(chunk) > limit:
+                return None
+            raw.extend(chunk)
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+        return parse_qs(text, keep_blank_values=True)
 
     def _login_html(error: str = "") -> str:
         message = ('<p class="bad">' + html.escape(error) + '</p>') if error else ""
@@ -591,16 +640,27 @@ def create_app() -> FastAPI:
 
     @app.post("/login")
     async def login(request: Request):
-        form = await request.form()
-        token = str(form.get("token") or "")
+        form = await _read_form_limited(request, 16 * 1024)
+        if form is None:
+            return HTMLResponse(_login_html("登录请求格式不正确或体积过大。"), status_code=413)
+        token = str((form.get("token") or [""])[0])
         if not _token_ok(token):
             return HTMLResponse(_login_html("访问令牌不正确，请重试。"), status_code=401)
         response = RedirectResponse("/", status_code=303)
-        response.set_cookie(_AUTH_COOKIE, _auth_cookie_value(), httponly=True, samesite="lax", path="/")
+        response.set_cookie(
+            _AUTH_COOKIE,
+            _new_session(),
+            max_age=_SESSION_TTL,
+            httponly=True,
+            samesite="lax",
+            secure=(request.url.scheme == "https"),
+            path="/",
+        )
         return response
 
     @app.post("/logout")
-    async def logout():
+    async def logout(request: Request):
+        _drop_session(request.cookies.get(_AUTH_COOKIE, ""))
         response = RedirectResponse("/login", status_code=303)
         response.delete_cookie(_AUTH_COOKIE, path="/")
         return response
@@ -618,10 +678,8 @@ def create_app() -> FastAPI:
         bridge = status.get("bridge") or {}
         bridge_ready = not bridge.get("configured") or bool(bridge.get("connected"))
         ready = bool(ha_ready and bridge_ready)
-        return JSONResponse(
-            {"ok": ready, "ha": status.get("ha"), "bridge": bridge},
-            status_code=200 if ready else 503,
-        )
+        # 公开探针只回布尔值，不泄漏 HA 地址、令牌掩码或 bridge 细节。
+        return JSONResponse({"ok": ready}, status_code=200 if ready else 503)
 
     @app.get("/", response_class=HTMLResponse)
     async def index() -> HTMLResponse:
@@ -630,16 +688,17 @@ def create_app() -> FastAPI:
         return HTMLResponse(_render_index(status, devices, logs, _config_data()))
 
     @app.get("/api/status")
-    async def api_status() -> JSONResponse:
-        return JSONResponse(await _status_data())
+    async def api_status(force: bool = False) -> JSONResponse:
+        return JSONResponse(await _status_data(force=force))
 
     @app.get("/api/config")
     async def api_config() -> JSONResponse:
         return JSONResponse(_config_data())
 
     @app.get("/api/devices")
-    async def api_devices() -> JSONResponse:
-        return JSONResponse(await _devices_data())
+    async def api_devices(force: bool = False) -> JSONResponse:
+        data = await _devices_data(force=force)
+        return JSONResponse(data, status_code=200 if data.get("ok") else 503)
 
     @app.get("/api/logs")
     async def api_logs(limit: str = "200", level: str = "") -> JSONResponse:
@@ -648,9 +707,11 @@ def create_app() -> FastAPI:
 
     @app.post("/tool", response_class=HTMLResponse)
     async def run_tool_form(request: Request) -> HTMLResponse:
-        form = await request.form()
-        name = str(form.get("name") or "")
-        raw_params = str(form.get("params") or "").strip() or "{}"
+        form = await _read_form_limited(request, _MAX_TOOL_BODY)
+        if form is None:
+            return HTMLResponse(_render_tool_result("", "", {"ok": False, "code": "payload_too_large", "message": "请求体格式不正确或超过 64KB 上限。"}, 413), status_code=413)
+        name = str((form.get("name") or [""])[0])
+        raw_params = str((form.get("params") or [""])[0]).strip() or "{}"
         result, status = await _execute_tool(name, raw_params)
         return HTMLResponse(_render_tool_result(name, raw_params, result, status), status_code=status)
 
@@ -737,8 +798,14 @@ def create_app() -> FastAPI:
             return None
 
         if candidates:
+            sem = asyncio.Semaphore(5)
+
+            async def _check_limited(ref: str) -> dict | None:
+                async with sem:
+                    return await _check_one(ref)
+
             outcomes = await asyncio.gather(
-                *(_check_one(ref) for ref in candidates), return_exceptions=True
+                *(_check_limited(ref) for ref in candidates), return_exceptions=True
             )
             for outcome in outcomes:
                 if isinstance(outcome, BaseException):

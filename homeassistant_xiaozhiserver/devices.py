@@ -36,6 +36,14 @@ from .views import (
 log = logging.getLogger("homeassistant_xiaozhiserver.devices")
 
 _VERIFIED_OK_STATUSES = ("confirmed", "no_change")
+
+def _result_ok(result: dict) -> bool:
+    """只有 confirmed 或 verified 的 no_change 才算真正成功；
+    no_change 但 verified=false 说明服务已接受但没看到预期变化，不能报成功。"""
+    status = str(result.get("status") or "")
+    if status == "confirmed":
+        return True
+    return status == "no_change" and bool(result.get("verified"))
 _TARGET_SELECTOR_KEYS = frozenset({
     "entity_id", "target", "device_id", "area_id", "floor_id", "label_id",
 })
@@ -226,7 +234,7 @@ class DeviceService:
         未传任何过滤条件（keyword/domain/area）时，为控制返回体积默认只返回可控制
         设备且每页 DEFAULT_LIST_LIMIT（通常 50）条；可用 controllable_only=false、
         limit 显式覆盖。
-        传入本工具不支持的参数会返回 invalid_argument 并列出可用参数。
+        未知参数由 MCP SDK 按工具签名过滤，不会传给本方法。
 
         每个实体带 controllable（是否可控制）、actions（内置动作）、
         device_id/device_name/area_id/area_name。
@@ -275,6 +283,9 @@ class DeviceService:
                 raise reg
             if isinstance(reg, BaseException):
                 reg = None
+            if area and reg is None:
+                return {"ok": False, "code": "registry_unavailable",
+                        "message": "无法读取设备/区域注册表，无法按 area 过滤。请稍后重试，或改用 keyword/domain 过滤。"}
             devices_map, ents_map, areas_map = _registry_maps(reg)
             states = [s for s in states if not is_excluded_entity(s, devices_map, ents_map)]
             states, hidden_switches, ambiguous_switch_groups = _drop_redundant_switches(
@@ -466,17 +477,21 @@ class DeviceService:
                 return guard
             result = await _apply_and_confirm(ha, st, sd, svc, payload, action_name)
             status = str(result.get("status") or "")
-            result["ok"] = status in _VERIFIED_OK_STATUSES
+            result["ok"] = _result_ok(result)
             if not result["ok"]:
                 result["code"] = ("not_verified" if status == "mismatch"
                                   else "pending_confirmation")
             # 注意：xiaozhi MCP 接入点把结果里的 action 当作 Action 枚举名解析；
             # turn_off / turn_on 不是合法枚举，会被转成 Action.ERROR 并把 "turn_off" 直接 TTS。
             # 因此设备动作放在 device_action，成功时用 action=RESPONSE + 中文 response 让助手直接播报，
-            # 省掉一次 LLM 往返；确认/错误分支不返回 action，仍交给 LLM 处理。
+            # 省掉一次 LLM 往返；失败/确认/错误分支不返回 action，交给 LLM 处理。
             result["device_action"] = action_name
-            result["action"] = "RESPONSE"
-            result["response"] = result.get("voice") or result.get("message") or "操作已完成。"
+            if result["ok"]:
+                result["action"] = "RESPONSE"
+                result["response"] = result.get("voice") or result.get("message") or "操作已完成。"
+            else:
+                result.pop("action", None)
+                result.pop("response", None)
             return result
         except HAError as e:
             return {"ok": False, **e.to_dict(), "hint": "可先用 list_devices / get_device_state 确认设备与能力后重试。"}
@@ -570,32 +585,45 @@ class DeviceService:
             raw_results = await asyncio.gather(*tasks, return_exceptions=True)
             per: list = []
             voices: list = []
+            failed: list = []
             for op, result in zip(resolved, raw_results, strict=True):
-                if isinstance(result, Exception):
+                if isinstance(result, asyncio.CancelledError):
+                    raise result
+                if isinstance(result, BaseException):
                     per.append({"ok": False, "entity_id": op["entity_id"], "code": "internal_error",
                                 "message": str(result)})
+                    failed.append(op["entity_id"])
                     continue
                 status = str(result.get("status") or "")
-                result["ok"] = status in _VERIFIED_OK_STATUSES
+                result["ok"] = _result_ok(result)
                 if not result["ok"]:
                     result["code"] = ("not_verified" if status == "mismatch"
                                       else "pending_confirmation")
                 result["device_action"] = action_name
-                result["action"] = "RESPONSE"
-                result["response"] = result.get("voice") or result.get("message") or "操作已完成。"
+                if result["ok"]:
+                    result["action"] = "RESPONSE"
+                    result["response"] = result.get("voice") or result.get("message") or "操作已完成。"
+                    voices.append(str(result["response"]))
+                else:
+                    result.pop("action", None)
+                    result.pop("response", None)
+                    failed.append(op["entity_id"])
                 per.append(result)
-                voices.append(str(result["response"]))
 
-            ok = any(item.get("ok") for item in per)
+            ok = bool(per) and all(bool(item.get("ok")) for item in per) and not errors
             out = {"ok": ok, "count": len(per), "action": "RESPONSE" if voices else None,
-                   "response": "；".join(voices) if voices else "批量控制未执行。",
-                   "results": per}
+                   "response": "；".join(voices) if voices else "", "results": per}
             if errors:
                 out["errors"] = errors
-                out["message"] = "部分设备未执行：" + "；".join(str(e.get("message") or e.get("entity")) for e in errors)
+            failed_count = len(errors) + len(failed)
+            if failed_count:
+                out["partial"] = ok is False and bool(voices)
+                out["message"] = "部分设备未成功，共 " + str(failed_count) + " 个。"
                 if voices:
-                    # 直出播报必须把未执行数量说出来，避免只播成功项造成“全部成功”的错觉。
-                    out["response"] = out["response"] + "；另有 " + str(len(errors)) + " 个设备未执行。"
+                    # 直出播报必须把未成功数量说出来，避免只播成功项造成“全部成功”的错觉。
+                    out["response"] = out["response"] + "；另有 " + str(failed_count) + " 个设备未成功。"
+            if not out["response"]:
+                out.pop("response", None)
             return out
         except HAError as e:
             return {"ok": False, **e.to_dict(), "hint": _hint()}
@@ -767,9 +795,12 @@ class DeviceService:
                       and service_domain not in ("script", "scene", "automation")
                       and svc in DIRECT_RESPONSE_SERVICES) or (
                 service_domain == "homeassistant" and svc == "toggle")
-            if direct:
+            if direct and result["ok"]:
                 result["action"] = "RESPONSE"
                 result["response"] = result.get("voice") or result.get("message") or "操作已完成。"
+            elif not result["ok"]:
+                result.pop("action", None)
+                result.pop("response", None)
             return result
         except HAError as e:
             out = {"ok": False, **e.to_dict()}

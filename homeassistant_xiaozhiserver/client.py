@@ -85,6 +85,10 @@ class HAClient:
         self._states_dirty: bool = True
         self._services_cache: list[dict] | None = None
         self._services_ts: float = 0.0
+        # 单飞锁：TTL 到期时只允许一个请求回源，避免并发重复拉全量/打开 WebSocket。
+        self._states_lock = asyncio.Lock()
+        self._services_lock = asyncio.Lock()
+        self._registry_lock = asyncio.Lock()
         self._state_ws_task: asyncio.Task | None = None
         self._state_ws_ready = asyncio.Event()
         self._state_ws_stop = asyncio.Event()
@@ -182,6 +186,12 @@ class HAClient:
             raise HAError("upstream_error", "Home Assistant 内部错误（HTTP " + str(resp.status_code) + "）。", resp.text[:300])
         if resp.status_code >= 400:
             raise HAError("http_error", "Home Assistant 返回错误（HTTP " + str(resp.status_code) + "）。", resp.text[:300])
+        if 300 <= resp.status_code < 400:
+            raise HAError(
+                "unexpected_redirect",
+                "Home Assistant 返回重定向（HTTP " + str(resp.status_code) + "）。请直接把 HA_URL 配置为最终可访问的 http/https 地址，避免跟随跳转。",
+                resp.headers.get("location", ""),
+            )
         if resp.content:
             try:
                 return resp.json()
@@ -222,7 +232,9 @@ class HAClient:
 
     async def _fetch_states_rest(self) -> list[dict]:
         data = await self._request("GET", "/api/states")
-        return data if isinstance(data, list) else []
+        if not isinstance(data, list):
+            raise HAError("invalid_response", "Home Assistant 返回的实体状态不是 JSON 数组。")
+        return data
 
     def _store_states(self, states: list[dict]) -> None:
         self._state_entities = {
@@ -414,8 +426,15 @@ class HAClient:
         if (not force and self._states_cache is not None
                 and now - self._states_ts < self.state_cache_ttl):
             return list(self._states_snapshot())
-        self._store_states(await self._fetch_states_rest())
-        return list(self._states_snapshot())
+        async with self._states_lock:
+            if self._state_ws_ready.is_set() and not force:
+                return list(self._states_snapshot())
+            now = time.time()
+            if (not force and self._states_cache is not None
+                    and now - self._states_ts < self.state_cache_ttl):
+                return list(self._states_snapshot())
+            self._store_states(await self._fetch_states_rest())
+            return list(self._states_snapshot())
 
     async def get_services(self, force: bool = False) -> list:
         """GET /api/services，返回服务目录（每个 domain 及其服务与参数字段），带 TTL 缓存。"""
@@ -423,10 +442,17 @@ class HAClient:
         if (not force and self._services_cache is not None
                 and now - self._services_ts < self.services_ttl):
             return list(self._services_cache)
-        data = await self._request("GET", "/api/services")
-        self._services_cache = data if isinstance(data, list) else []
-        self._services_ts = now
-        return list(self._services_cache)
+        async with self._services_lock:
+            now = time.time()
+            if (not force and self._services_cache is not None
+                    and now - self._services_ts < self.services_ttl):
+                return list(self._services_cache)
+            data = await self._request("GET", "/api/services")
+            if not isinstance(data, list):
+                raise HAError("invalid_response", "Home Assistant 返回的服务目录不是 JSON 数组。")
+            self._services_cache = data
+            self._services_ts = now
+            return list(self._services_cache)
 
     async def get_state(self, entity_id: str, force: bool = False) -> dict | None:
         eid = str(entity_id or "").strip()
@@ -483,6 +509,11 @@ class HAClient:
         return ctx
 
     async def get_registries(self, force: bool = False) -> dict | None:
+        """读取 HA 的设备、实体与区域注册表（带 TTL 缓存，并发单飞）。"""
+        async with self._registry_lock:
+            return await self._get_registries_uncached(force)
+
+    async def _get_registries_uncached(self, force: bool = False) -> dict | None:
         """读取 HA 的设备、实体与区域注册表（带 TTL 缓存）。
 
         返回 {"devices": [...], "entities": [...], "areas": [...]}；WebSocket 不可用/无权限时返回 None，

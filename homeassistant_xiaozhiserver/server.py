@@ -128,7 +128,10 @@ def _log_tool(name: str):
             log.debug("tool=%s start args=%s", name, _safe_log_args(args, kwargs))
             try:
                 result = await fn(*args, **kwargs)
-            except Exception:
+            except Exception as exc:
+                metrics.record_tool(
+                    name, False, time.perf_counter() - started, type(exc).__name__
+                )
                 log.exception("tool=%s exception", name)
                 raise
             else:

@@ -27,7 +27,7 @@ def main() -> None:
             str(path),
         )
         check(path.is_file(), "状态文件已写入")
-        check(not Path(str(path) + ".tmp").exists(), "临时文件已被原子替换")
+        check(not list(Path(tmp).glob("*.tmp")), "临时文件已被原子替换")
 
         data = read_status(str(path), now=now)
         check(bool(data) and data.get("connected") is True, "读取 connected 字段")

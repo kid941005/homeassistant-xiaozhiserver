@@ -12,6 +12,7 @@ LOG_LEVEL = settings.log_level
 LOG_FILE = settings.log_file
 LOG_FILE_WEBUI = settings.log_file_webui
 LOG_FILE_BRIDGE = settings.log_file_bridge
+LOG_FILE_MCP = settings.log_file_mcp
 LOG_FORMAT = settings.log_format
 LOG_MAX_BYTES = settings.log_max_bytes
 LOG_BACKUP_COUNT = settings.log_backup_count

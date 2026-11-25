@@ -39,10 +39,13 @@ def write_status(payload: dict[str, Any], path: str | None = None) -> str:
         os.makedirs(directory, exist_ok=True)
     data = dict(payload)
     data["updated_at"] = float(data.get("updated_at") or time.time())
-    tmp = target + ".tmp"
+    # 唯一临时名避免多进程/多线程同时写时互相覆盖；fsync 后再原子替换。
+    tmp = "%s.%s.tmp" % (target, os.getpid())
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(data, fh, ensure_ascii=False, separators=(",", ":"))
         fh.write("\n")
+        fh.flush()
+        os.fsync(fh.fileno())
     os.replace(tmp, target)
     return target
 
