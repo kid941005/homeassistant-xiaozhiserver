@@ -168,6 +168,8 @@ def _record_login_failure(ip: str) -> None:
     recent = [ts for ts in _LOGIN_FAILURES.get(ip, []) if now - ts < _LOGIN_WINDOW]
     recent.append(now)
     _LOGIN_FAILURES[ip] = recent
+    # 单次新增后再次裁剪，保证来源表严格不超过 _MAX_LOGIN_SOURCES。
+    _prune_login_failures(now)
 
 
 def _clear_login_failures(ip: str) -> None:

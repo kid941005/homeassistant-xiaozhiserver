@@ -76,6 +76,19 @@ check("超过失败阈值后返回 429 且带 Retry-After",
       r.status_code == 429 and int(r.headers.get("Retry-After", "0")) > 0,
       str(r.status_code) + " " + str(r.headers.get("Retry-After")))
 
+# 回归：登录失败来源表必须有硬上限，不能因持续新增来源而无限增长。
+_saved_cap_failures = dict(webui_mod._LOGIN_FAILURES)
+webui_mod._LOGIN_FAILURES.clear()
+try:
+    for _i in range(webui_mod._MAX_LOGIN_SOURCES + 16):
+        webui_mod._record_login_failure("cap-" + str(_i))
+    check("登录失败来源表不超过上限",
+          len(webui_mod._LOGIN_FAILURES) <= webui_mod._MAX_LOGIN_SOURCES,
+          str(len(webui_mod._LOGIN_FAILURES)) + " > " + str(webui_mod._MAX_LOGIN_SOURCES))
+finally:
+    webui_mod._LOGIN_FAILURES.clear()
+    webui_mod._LOGIN_FAILURES.update(_saved_cap_failures)
+
 r = client.get("/")
 check("无需登录访问首页 200", r.status_code == 200, str(r.status_code))
 check("首页包含运行状态", "运行状态" in r.text)
