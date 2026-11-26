@@ -18,6 +18,9 @@ from collections import defaultdict
 
 _SHARED_DIR_ENV = "XIAOZHI_METRICS_DIR"
 _SHARED_MAX_AGE = 24 * 3600
+_FLUSH_INTERVAL = 2.0
+_FLUSH_MAX_PENDING = 20
+_CLEANUP_INTERVAL = 3600.0
 
 
 def _shared_dir() -> str:
@@ -42,6 +45,9 @@ class Metrics:
         if persist is None:
             persist = (os.environ.get("LOG_ROLE") or "").strip().lower() == "mcp"
         self._persist = bool(persist)
+        self._last_flush = 0.0
+        self._last_cleanup = 0.0
+        self._pending = 0
 
     def inc(self, name: str, labels: dict[str, str] | None = None, value: float = 1.0) -> None:
         key = (name, tuple(sorted((labels or {}).items())))
@@ -57,7 +63,20 @@ class Metrics:
     def record_tool(self, tool: str, ok: bool, elapsed: float, code: str = "") -> None:
         self.inc("ha_mcp_tool_calls_total", {"tool": tool, "ok": str(bool(ok)).lower(), "code": code or "ok"})
         self.observe("ha_mcp_tool_duration_seconds", elapsed, {"tool": tool})
-        self.flush()
+        with self._lock:
+            self._pending += 1
+        self._maybe_flush()
+
+    def _maybe_flush(self) -> None:
+        """按时间/条数节流写共享快照，避免每次工具调用都同步 fsync。"""
+        if not self._persist:
+            return
+        now = time.monotonic()
+        with self._lock:
+            pending = self._pending
+            last = self._last_flush
+        if pending >= _FLUSH_MAX_PENDING or (pending > 0 and now - last >= _FLUSH_INTERVAL):
+            self.flush()
 
     def record_http(self, method: str, path: str, status: int, elapsed: float) -> None:
         self.inc("ha_mcp_http_requests_total", {"method": method, "path": path, "status": str(status)})
@@ -86,11 +105,26 @@ class Metrics:
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(tmp, path)
-        except OSError:
+            with self._lock:
+                self._last_flush = time.monotonic()
+                self._pending = 0
+            if self._last_flush - self._last_cleanup >= _CLEANUP_INTERVAL:
+                self._last_cleanup = self._last_flush
+                self._cleanup_shared()
+        except (OSError, ValueError):
             try:
                 os.unlink(tmp)
             except OSError:
                 pass
+
+    def _cleanup_shared(self) -> None:
+        """主动清理超过保留期的旧进程快照，避免共享目录长期堆积。"""
+        for path in glob.glob(os.path.join(_shared_dir(), "metrics-*.json")):
+            try:
+                if time.time() - os.path.getmtime(path) > _SHARED_MAX_AGE:
+                    os.unlink(path)
+            except OSError:
+                continue
 
     def _shared_snapshots(self) -> list[dict]:
         own = os.path.basename(_shared_path())

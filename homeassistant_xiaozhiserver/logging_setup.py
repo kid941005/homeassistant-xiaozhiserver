@@ -14,6 +14,7 @@ import os
 import re
 import sys
 import tempfile
+import threading
 import time
 from logging.handlers import RotatingFileHandler, WatchedFileHandler
 
@@ -23,6 +24,10 @@ from .settings import settings
 _CALL_ID = contextvars.ContextVar("call_id", default="-")
 _VERSION_LOGGED = False
 _EFFECTIVE_FILES: dict[str, str] = {}
+# WebUI 日志页每 5 秒刷新一次：文件未变化时复用上次解析结果，避免反复解析 256KB。
+_TAIL_CACHE: dict[str, tuple[tuple[int, int], list[str]]] = {}
+_TAIL_CACHE_LOCK = threading.Lock()
+_TAIL_CACHE_MAX = 8
 _LINE_RE = re.compile(
     r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:[,.]\d{3})? (\w+)\s+(?:v(\d+\.\d+\.\d+\S*)\s+)?(\S+) \[([^\]]*)\] (.*)$"
 )
@@ -221,6 +226,27 @@ def _tail(path: str, max_bytes: int = 256 * 1024) -> list[str]:
     return lines
 
 
+def _tail_cached(path: str, max_bytes: int = 256 * 1024) -> list[str]:
+    try:
+        stat = os.stat(path)
+    except OSError:
+        with _TAIL_CACHE_LOCK:
+            _TAIL_CACHE.pop(path, None)
+        return []
+    signature = (stat.st_mtime_ns, stat.st_size)
+    with _TAIL_CACHE_LOCK:
+        cached = _TAIL_CACHE.get(path)
+        if cached is not None and cached[0] == signature:
+            return cached[1]
+    lines = _tail(path, max_bytes)
+    with _TAIL_CACHE_LOCK:
+        _TAIL_CACHE[path] = (signature, lines)
+        if len(_TAIL_CACHE) > _TAIL_CACHE_MAX:
+            for stale in list(_TAIL_CACHE)[:-_TAIL_CACHE_MAX]:
+                _TAIL_CACHE.pop(stale, None)
+    return lines
+
+
 def _parse_line(line: str) -> dict[str, str] | None:
     if line.startswith("{"):
         try:
@@ -262,7 +288,7 @@ def read_recent_logs(limit: int = 200, level: str | None = None) -> list[dict[st
 
     entries: list[dict[str, str]] = []
     for path in log_files():
-        for raw_line in _tail(path):
+        for raw_line in _tail_cached(path):
             line = raw_line.rstrip("\r\n")
             parsed = _parse_line(line)
             if parsed:

@@ -74,7 +74,7 @@ _MAX_TOOL_BODY = 64 * 1024
 _DANGER_GATED_TOOLS = frozenset({"control_device", "control_devices", "call_service"})
 _AUTH_COOKIE = "xiaozhi_webui"
 _SESSION_TTL = 7 * 24 * 3600
-_PUBLIC_PATHS = frozenset({"/login", "/healthz", "/readyz", "/metrics"})
+_PUBLIC_PATHS = frozenset({"/login", "/healthz", "/readyz"})
 # 登录后签发随机 session id，服务端内存校验；重启即失效，避免固定 cookie 值长期可用。
 _SESSIONS: dict[str, float] = {}
 _MAX_SESSIONS = 512
@@ -82,10 +82,17 @@ _MAX_SESSIONS = 512
 _LOGIN_FAILURES: dict[str, list[float]] = {}
 _LOGIN_MAX_FAILURES = 5
 _LOGIN_WINDOW = 300.0
+_MAX_LOGIN_SOURCES = 1024
 
 
 def _token_ok(raw: str) -> bool:
     return bool(WEBUI_TOKEN) and hmac.compare_digest(str(raw or ""), WEBUI_TOKEN)
+
+
+def _bearer_ok(header: str) -> bool:
+    """允许 Prometheus 用 Authorization: Bearer WEBUI_TOKEN 抓取 /metrics。"""
+    scheme, _, token = str(header or "").partition(" ")
+    return scheme.lower() == "bearer" and _token_ok(token.strip())
 
 
 def _new_session() -> str:
@@ -127,9 +134,24 @@ def _client_ip(request: Request) -> str:
     return str(getattr(client, "host", "") or "unknown")
 
 
+def _prune_login_failures(now: float) -> None:
+    """清理过期来源并限制来源总数，避免反向代理/扫描导致内存无界增长。"""
+    for ip in list(_LOGIN_FAILURES):
+        recent = [ts for ts in _LOGIN_FAILURES.get(ip, []) if now - ts < _LOGIN_WINDOW]
+        if recent:
+            _LOGIN_FAILURES[ip] = recent
+        else:
+            _LOGIN_FAILURES.pop(ip, None)
+    overflow = len(_LOGIN_FAILURES) - _MAX_LOGIN_SOURCES
+    if overflow > 0:
+        for ip in sorted(_LOGIN_FAILURES, key=lambda key: min(_LOGIN_FAILURES[key]))[:overflow]:
+            _LOGIN_FAILURES.pop(ip, None)
+
+
 def _login_guard(ip: str) -> int:
     """返回需要等待的秒数；0 表示允许尝试。"""
     now = time.time()
+    _prune_login_failures(now)
     recent = [ts for ts in _LOGIN_FAILURES.get(ip, []) if now - ts < _LOGIN_WINDOW]
     if recent:
         _LOGIN_FAILURES[ip] = recent
@@ -142,6 +164,7 @@ def _login_guard(ip: str) -> int:
 
 def _record_login_failure(ip: str) -> None:
     now = time.time()
+    _prune_login_failures(now)
     recent = [ts for ts in _LOGIN_FAILURES.get(ip, []) if now - ts < _LOGIN_WINDOW]
     recent.append(now)
     _LOGIN_FAILURES[ip] = recent
@@ -363,7 +386,7 @@ def create_app() -> FastAPI:
             return False
         return ip.is_loopback or ip.is_private or ip.is_link_local
 
-    def _harden(response):
+    def _harden(response, nonce: str):
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers.setdefault("Referrer-Policy", "no-referrer")
@@ -371,34 +394,34 @@ def create_app() -> FastAPI:
         response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
         response.headers.setdefault(
             "Content-Security-Policy",
-            "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+            "default-src 'self'; script-src 'self' 'nonce-" + nonce + "'; style-src 'self' 'nonce-" + nonce + "'; "
             "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
         )
         return response
 
-    async def _read_form_limited(request: Request, limit: int) -> dict | None:
-        """读取 application/x-www-form-urlencoded 表单并限制体积；超限/类型不符返回 None。"""
+    async def _read_form_limited(request: Request, limit: int) -> tuple[dict | None, int]:
+        """读取表单并限长；返回 (form, 错误状态码)，成功状态码为 0。"""
         ctype = request.headers.get("content-type", "").lower()
         if not ctype.startswith("application/x-www-form-urlencoded"):
-            return None
+            return None, 415
         raw = bytearray()
         async for chunk in request.stream():
             if len(raw) + len(chunk) > limit:
-                return None
+                return None, 413
             raw.extend(chunk)
         try:
             text = raw.decode("utf-8")
         except UnicodeDecodeError:
-            return None
-        return parse_qs(text, keep_blank_values=True)
+            return None, 400
+        return parse_qs(text, keep_blank_values=True), 0
 
-    def _login_html(error: str = "") -> str:
+    def _login_html(error: str = "", nonce: str = "") -> str:
         message = ('<p class="bad">' + html.escape(error) + '</p>') if error else ""
         return (
             '<!doctype html><html lang="zh-CN"><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width,initial-scale=1">'
             '<title>登录 · 小智 MCP</title>'
-            '<style>body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif;'
+            '<style nonce="' + html.escape(nonce, quote=True) + '">body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif;'
             'background:#f5f6f8;display:flex;min-height:100vh;align-items:center;justify-content:center}'
             'form{background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:28px;width:320px;'
             'box-shadow:0 10px 30px rgba(15,23,42,.08)}h1{font-size:18px;margin:0 0 6px}'
@@ -416,6 +439,8 @@ def create_app() -> FastAPI:
     async def _same_origin(request: Request, call_next):
         """安全中间件：Host/Origin 校验、WEBUI_TOKEN 登录校验、安全响应头与访问指标。"""
         started = time.perf_counter()
+        nonce = secrets.token_urlsafe(16)
+        request.state.csp_nonce = nonce
         path = request.url.path
         host = request.headers.get("host", "")
         response = None
@@ -424,15 +449,18 @@ def create_app() -> FastAPI:
                 {"ok": False, "code": "host_not_allowed", "message": "Host 不在允许范围内。"},
                 status_code=403,
             )
-        if response is None and path not in _PUBLIC_PATHS and not _cookie_ok(
-                request.cookies.get(_AUTH_COOKIE, "")):
-            if path.startswith("/api/") or path.startswith("/tool"):
-                response = JSONResponse(
-                    {"ok": False, "code": "unauthorized", "message": "请先登录。"},
-                    status_code=401,
-                )
-            else:
-                response = RedirectResponse("/login")
+        if response is None and path not in _PUBLIC_PATHS:
+            authed = _cookie_ok(request.cookies.get(_AUTH_COOKIE, ""))
+            if not authed and path == "/metrics":
+                authed = _bearer_ok(request.headers.get("authorization", ""))
+            if not authed:
+                if path.startswith("/api/") or path.startswith("/tool") or path == "/metrics":
+                    response = JSONResponse(
+                        {"ok": False, "code": "unauthorized", "message": "请先登录。"},
+                        status_code=401,
+                    )
+                else:
+                    response = RedirectResponse("/login")
         if response is None and request.method in ("POST", "PUT", "PATCH", "DELETE"):
             origin = request.headers.get("origin")
             if not origin:
@@ -458,7 +486,7 @@ def create_app() -> FastAPI:
         if METRICS_ENABLED:
             metrics.record_http(request.method, _metric_path(path), response.status_code,
                                 time.perf_counter() - started)
-        return _harden(response)
+        return _harden(response, nonce)
 
     _status_cache: tuple[float, dict[str, Any]] | None = None
     _status_lock = asyncio.Lock()
@@ -691,28 +719,30 @@ def create_app() -> FastAPI:
         return JSONResponse({"ok": True})
 
     @app.get("/login", response_class=HTMLResponse)
-    async def login_page() -> HTMLResponse:
-        return HTMLResponse(_login_html())
+    async def login_page(request: Request) -> HTMLResponse:
+        return HTMLResponse(_login_html(nonce=request.state.csp_nonce))
 
     @app.post("/login")
     async def login(request: Request):
+        nonce = request.state.csp_nonce
         ip = _client_ip(request)
         retry_after = _login_guard(ip)
         if retry_after > 0:
             log.warning("webui login rate limited ip=%s retry_after=%ss", ip, retry_after)
             return HTMLResponse(
-                _login_html("登录失败次数过多，请稍后再试。"),
+                _login_html("登录失败次数过多，请稍后再试。", nonce),
                 status_code=429,
                 headers={"Retry-After": str(retry_after)},
             )
-        form = await _read_form_limited(request, 16 * 1024)
+        form, form_status = await _read_form_limited(request, 16 * 1024)
         if form is None:
-            return HTMLResponse(_login_html("登录请求格式不正确或体积过大。"), status_code=413)
+            message = "不支持的请求格式。" if form_status == 415 else "登录请求体积过大。" if form_status == 413 else "登录请求格式不正确。"
+            return HTMLResponse(_login_html(message, nonce), status_code=form_status)
         token = str((form.get("token") or [""])[0])
         if not _token_ok(token):
             _record_login_failure(ip)
             log.warning("webui login failed ip=%s", ip)
-            return HTMLResponse(_login_html("访问令牌不正确，请重试。"), status_code=401)
+            return HTMLResponse(_login_html("访问令牌不正确，请重试。", nonce), status_code=401)
         _clear_login_failures(ip)
         log.info("webui login success ip=%s", ip)
         response = RedirectResponse("/", status_code=303)
@@ -738,7 +768,8 @@ def create_app() -> FastAPI:
     async def metrics_endpoint() -> PlainTextResponse:
         if not METRICS_ENABLED:
             return PlainTextResponse("metrics disabled\n", status_code=404)
-        return PlainTextResponse(metrics.render(), media_type="text/plain; version=0.0.4")
+        return PlainTextResponse(await asyncio.to_thread(metrics.render),
+                                 media_type="text/plain; version=0.0.4")
 
     @app.get("/readyz")
     async def readyz() -> JSONResponse:
@@ -751,10 +782,11 @@ def create_app() -> FastAPI:
         return JSONResponse({"ok": ready}, status_code=200 if ready else 503)
 
     @app.get("/", response_class=HTMLResponse)
-    async def index() -> HTMLResponse:
+    async def index(request: Request) -> HTMLResponse:
         status, devices = await asyncio.gather(_status_data(), _devices_data())
         logs = await asyncio.to_thread(read_recent_logs, limit=200)
-        return HTMLResponse(_render_index(status, devices, logs, _config_data()))
+        return HTMLResponse(_render_index(status, devices, logs, _config_data(),
+                                          nonce=request.state.csp_nonce))
 
     @app.get("/api/status")
     async def api_status(force: bool = False) -> JSONResponse:
@@ -776,13 +808,15 @@ def create_app() -> FastAPI:
 
     @app.post("/tool", response_class=HTMLResponse)
     async def run_tool_form(request: Request) -> HTMLResponse:
-        form = await _read_form_limited(request, _MAX_TOOL_BODY)
+        nonce = request.state.csp_nonce
+        form, form_status = await _read_form_limited(request, _MAX_TOOL_BODY)
         if form is None:
-            return HTMLResponse(_render_tool_result("", "", {"ok": False, "code": "payload_too_large", "message": "请求体格式不正确或超过 64KB 上限。"}, 413), status_code=413)
+            message = "请求体格式不正确或超过 64KB 上限。" if form_status == 413 else "请求体类型不受支持。"
+            return HTMLResponse(_render_tool_result("", "", {"ok": False, "code": "payload_too_large", "message": message}, form_status, nonce=nonce), status_code=form_status)
         name = str((form.get("name") or [""])[0])
         raw_params = str((form.get("params") or [""])[0]).strip() or "{}"
         result, status = await _execute_tool(name, raw_params)
-        return HTMLResponse(_render_tool_result(name, raw_params, result, status), status_code=status)
+        return HTMLResponse(_render_tool_result(name, raw_params, result, status, nonce=nonce), status_code=status)
 
     @app.post("/api/tool/{name}")
     async def api_tool(name: str, request: Request) -> JSONResponse:

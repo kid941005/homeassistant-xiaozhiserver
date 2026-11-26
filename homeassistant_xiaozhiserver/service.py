@@ -364,7 +364,8 @@ def _expected_attributes(payload: dict) -> dict:
         return exp
     pct = _num(payload.get("brightness_pct"))
     if pct is not None:
-        exp["brightness"] = {"expected": int(round(pct * 2.55)), "tolerance": 3}
+        # 不同灯具把百分比换算成 brightness 的刻度略有差异，容差放宽到 5，避免误报 mismatch。
+        exp["brightness"] = {"expected": int(round(pct * 2.55)), "tolerance": 5}
     bright = _num(payload.get("brightness"))
     if bright is not None:
         exp["brightness"] = {"expected": int(round(bright)), "tolerance": 1}

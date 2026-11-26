@@ -95,6 +95,15 @@ def check_filter_actions() -> None:
     full_cover = _filter_actions("cover", ["open", "close", "stop", "set_position"],
                                  {"supported_features": 15})
     check(len(full_cover) == 4, "能力完整的窗帘保留全部动作")
+    no_color = _filter_actions("light", ["turn_on", "set_brightness", "set_color_temp", "set_color"],
+                               {"supported_color_modes": []})
+    check(no_color == ["turn_on"], "颜色模式为空时只保留开关动作")
+    basic_vacuum = _filter_actions("vacuum", ["turn_on", "turn_off", "stop", "pause", "continue", "resume"],
+                                   {"supported_features": 1})
+    check(basic_vacuum == ["turn_on"], "只支持启动的扫地机不暴露停止/暂停动作")
+    full_vacuum = _filter_actions("vacuum", ["turn_on", "turn_off", "stop", "pause", "continue", "resume"],
+                                  {"supported_features": 15})
+    check(full_vacuum == ["turn_on", "turn_off", "stop", "pause"], "扫地机按能力位保留动作")
 
 
 def check_invalid_number(value, action: str, label: str) -> None:

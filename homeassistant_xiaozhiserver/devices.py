@@ -111,19 +111,29 @@ def _parse_pagination(limit: Any, offset: Any) -> Optional[tuple[int, int]]:
 
 
 
-async def _excluded_entity_error(ha: HAClient, st: dict) -> Optional[dict]:
-    """实体属于隐藏类型/设备时返回错误结构，否则返回 None。"""
-    try:
-        reg = await ha.get_registries()
-    except HAError as exc:
+async def _excluded_entity_error(ha: HAClient, st: dict,
+                                 maps: Optional[tuple] = None,
+                                 registry_error: Optional[Exception] = None,
+                                 registry_loaded: bool = False) -> Optional[dict]:
+    """实体属于隐藏类型/设备时返回错误结构，否则返回 None。
+
+    maps/registry_loaded 由批量入口预加载后复用，避免每个实体重复读取注册表；
+    registry_error 用于在注册表不可用时对设备名排除规则失败关闭。
+    """
+    if not registry_loaded:
+        try:
+            reg = await ha.get_registries()
+            maps = _registry_maps(reg)[:2]
+        except HAError as exc:
+            registry_error = exc
+            maps = None
+    if registry_error is not None and EXCLUDED_DEVICE_KEYWORDS:
         # 配置了设备名排除关键字时，注册表不可用就无法检查设备名，必须失败关闭。
-        if EXCLUDED_DEVICE_KEYWORDS:
-            log.warning("读取 HA 注册表失败，无法校验设备名排除规则：%s", exc)
-            return {"ok": False, "code": "registry_unavailable",
-                    "message": "暂时无法读取设备注册表，无法确认该设备是否在开放范围内，已拒绝执行。",
-                    "entity_id": str(st.get("entity_id") or "")}
-        reg = None
-    devices_map, ents_map, _ = _registry_maps(reg)
+        log.warning("读取 HA 注册表失败，无法校验设备名排除规则：%s", registry_error)
+        return {"ok": False, "code": "registry_unavailable",
+                "message": "暂时无法读取设备注册表，无法确认该设备是否在开放范围内，已拒绝执行。",
+                "entity_id": str(st.get("entity_id") or "")}
+    devices_map, ents_map = maps if maps else ({}, {})
     if not is_excluded_entity(st, devices_map, ents_map):
         return None
     return {"ok": False, "code": "unsupported_device",
@@ -131,21 +141,25 @@ async def _excluded_entity_error(ha: HAClient, st: dict) -> Optional[dict]:
             "entity_id": str(st.get("entity_id") or "")}
 
 
-async def _redundant_switch_context(ha: HAClient, states: Optional[list] = None) -> tuple:
+async def _redundant_switch_context(ha: HAClient, states: Optional[list] = None,
+                                    maps: Optional[tuple] = None,
+                                    registry_loaded: bool = False) -> tuple:
     """惰性加载实体状态与注册表，返回 (hidden_switch_map, ambiguous_groups)。
 
-    states 可由 resolve_entity 复用，避免按名称解析时重复拉取全量状态。
+    states/maps 可由批量入口复用，避免重复拉取全量状态与注册表。
     """
     if states is None:
         try:
             states = await ha.get_states()
         except HAError:
             return {}, []
-    try:
-        reg = await ha.get_registries()
-    except HAError:
-        reg = None
-    devices_map, ents_map, _ = _registry_maps(reg)
+    if not registry_loaded:
+        try:
+            reg = await ha.get_registries()
+            maps = _registry_maps(reg)[:2]
+        except HAError:
+            maps = None
+    devices_map, ents_map = maps if maps else ({}, {})
     return redundant_switch_map(states, devices_map, ents_map)
 
 
@@ -160,10 +174,13 @@ def _duplicate_switch_error(st: dict, light_id: str) -> dict:
 
 async def _resolve_entity_or_error(ha: HAClient, entity: str, verb: str,
                                   states: Optional[list] = None,
-                                  hidden: Optional[dict] = None) -> tuple:
+                                  hidden: Optional[dict] = None,
+                                  maps: Optional[tuple] = None,
+                                  registry_error: Optional[Exception] = None,
+                                  registry_loaded: bool = False) -> tuple:
     """统一实体解析失败结构，避免四处复制歧义/未找到分支。
 
-    states/hidden 可由批量入口预加载，避免逐设备重复拉取全量状态与重算重复开关映射。
+    states/hidden/maps 可由批量入口预加载，避免逐设备重复拉取状态/注册表与重算重复开关映射。
     """
     st, cands, states = await ha.resolve_entity(entity, states)
     switch_ids = []
@@ -174,10 +191,12 @@ async def _resolve_entity_or_error(ha: HAClient, entity: str, verb: str,
     if hidden is None:
         hidden = {}
         if any(_domain_of(eid) == "switch" for eid in switch_ids):
-            hidden, _ = await _redundant_switch_context(ha, states)
+            hidden, _ = await _redundant_switch_context(
+                ha, states, maps, registry_loaded)
     if st is not None:
         eid = str(st.get("entity_id") or "")
-        blocked = await _excluded_entity_error(ha, st)
+        blocked = await _excluded_entity_error(
+            ha, st, maps, registry_error, registry_loaded)
         if blocked is not None:
             return None, blocked
         light_id = hidden.get(eid)
@@ -188,7 +207,8 @@ async def _resolve_entity_or_error(ha: HAClient, entity: str, verb: str,
         visible = [c for c in cands if str(c.get("entity_id") or "") not in hidden]
         if len(visible) == 1:
             st = visible[0]
-            blocked = await _excluded_entity_error(ha, st)
+            blocked = await _excluded_entity_error(
+                ha, st, maps, registry_error, registry_loaded)
             if blocked is not None:
                 return None, blocked
             return st, None
@@ -560,15 +580,28 @@ class DeviceService:
             # 批量入口只拉一次全量状态与重复开关映射，避免每个设备各扫一遍（N+1）。
             batch_states = None
             batch_hidden: Optional[dict] = {}
+            batch_maps: Optional[tuple] = None
+            batch_registry_error: Optional[Exception] = None
+            batch_registry_loaded = False
             try:
                 batch_states = await ha.get_states()
-                batch_hidden, _ = await _redundant_switch_context(ha, batch_states)
             except HAError:
                 batch_states = None
+            try:
+                reg = await ha.get_registries()
+                batch_maps = _registry_maps(reg)[:2]
+            except HAError as exc:
+                batch_registry_error = exc
+            batch_registry_loaded = True
+            try:
+                batch_hidden, _ = await _redundant_switch_context(
+                    ha, batch_states, batch_maps, batch_registry_loaded)
+            except HAError:
                 batch_hidden = None
             for ref in refs:
                 st, error = await _resolve_entity_or_error(
-                    ha, ref, "控制", batch_states, batch_hidden)
+                    ha, ref, "控制", batch_states, batch_hidden,
+                    batch_maps, batch_registry_error, batch_registry_loaded)
                 if error is not None:
                     errors.append({"entity": ref, "error": error})
                     continue

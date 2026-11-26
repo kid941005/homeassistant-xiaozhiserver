@@ -81,6 +81,8 @@ class HAClient:
         self._state_entities: dict[str, dict] = {}
         self._states_cache: list[dict] | None = None
         self._states_ts: float = 0.0
+        # 每个实体最近一次状态写入时间：事件流就绪时判断缓存是否足够新鲜。
+        self._state_entity_ts: dict[str, float] = {}
         # 事件只标脏，读取时再一次性生成 list，避免每条 state_changed 都重建全量列表。
         self._states_dirty: bool = True
         self._services_cache: list[dict] | None = None
@@ -237,13 +239,15 @@ class HAClient:
         return data
 
     def _store_states(self, states: list[dict]) -> None:
+        now = time.time()
         self._state_entities = {
             str(s.get("entity_id")): s
             for s in states
             if isinstance(s, dict) and s.get("entity_id")
         }
+        self._state_entity_ts = {eid: now for eid in self._state_entities}
         self._states_dirty = True
-        self._states_ts = time.time()
+        self._states_ts = now
 
     def _states_snapshot(self) -> list[dict]:
         """按需生成全量 list：只在事件更新/失效后重建一次。"""
@@ -296,6 +300,10 @@ class HAClient:
         if not self._ensure_state_stream() or not self._state_ws_ready.is_set():
             return None
         pred = predicate or (lambda _state: True)
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        # 先注册等待者再检查当前值：避免两步之间到达的 state_changed 丢失。
+        self._state_waiters.setdefault(eid, []).append((fut, pred))
         current = self._state_entities.get(eid)
         if isinstance(current, dict):
             try:
@@ -303,9 +311,6 @@ class HAClient:
                     return current
             except Exception:  # noqa: BLE001
                 pass
-        loop = asyncio.get_running_loop()
-        fut = loop.create_future()
-        self._state_waiters.setdefault(eid, []).append((fut, pred))
         try:
             return await asyncio.wait_for(fut, timeout=max(0.01, float(timeout)))
         except asyncio.TimeoutError:
@@ -407,12 +412,15 @@ class HAClient:
                 eid = (new_state or {}).get("entity_id") or (old_state or {}).get("entity_id")
                 if not eid:
                     continue
+                now = time.time()
                 if isinstance(new_state, dict):
                     self._state_entities[eid] = new_state
+                    self._state_entity_ts[eid] = now
                 else:
                     self._state_entities.pop(eid, None)
+                    self._state_entity_ts.pop(eid, None)
                 self._states_dirty = True
-                self._states_ts = time.time()
+                self._states_ts = now
                 self._notify_state(eid, new_state)
             raise HAError("ws_closed", "Home Assistant 状态事件连接已关闭。")
 
@@ -461,7 +469,8 @@ class HAClient:
         self._ensure_state_stream()
         if self._state_ws_ready.is_set() and not force:
             cached = self._state_entities.get(eid)
-            if isinstance(cached, dict):
+            age = time.time() - self._state_entity_ts.get(eid, 0.0)
+            if isinstance(cached, dict) and age <= self.state_cache_ttl:
                 return cached
         try:
             data = await self._request("GET", "/api/states/" + eid)
@@ -472,6 +481,7 @@ class HAClient:
         if not isinstance(data, dict):
             raise HAError("invalid_response", "Home Assistant 返回的实体状态不是 JSON 对象。")
         self._state_entities[eid] = data
+        self._state_entity_ts[eid] = time.time()
         if self._states_cache is not None:
             self._states_dirty = True
             self._states_ts = time.time()
@@ -485,6 +495,16 @@ class HAClient:
         result = await self._request("POST", "/api/services/" + dom + "/" + svc, json=data)
         if result is not None and not isinstance(result, (dict, list)):
             raise HAError("invalid_response", "Home Assistant 返回的服务调用结果不是 JSON 对象/数组。")
+        # 目标实体的缓存立即视为过期，回读必须回源，避免刚下发就返回旧状态。
+        if isinstance(data, dict):
+            for key in ("entity_id", "entities"):
+                targets = data.get(key)
+                if isinstance(targets, str):
+                    self._state_entity_ts.pop(targets, None)
+                elif isinstance(targets, list):
+                    for target in targets:
+                        if isinstance(target, str):
+                            self._state_entity_ts.pop(target, None)
         self.invalidate_states()
         return result
 
@@ -621,9 +641,14 @@ class HAClient:
             return None, [], None
         # 1) 直接当作 entity_id；只接受合法格式，避免把用户输入拼进 URL 路径
         if is_entity_id(ref):
+            # 批量入口已预加载 states 时直接复用，避免对每个 entity_id 再发一次 REST。
+            if states is not None:
+                for state in states:
+                    if isinstance(state, dict) and str(state.get("entity_id") or "") == ref:
+                        return state, [], states
             st = await self.get_state(ref)
             if st is not None:
-                return st, [], None
+                return st, [], states if states is not None else None
         if states is None:
             states = await self.get_states()
         low = ref.lower()

@@ -2,7 +2,7 @@
 
 > 把 **Home Assistant** 的实体与服务封装成标准 **MCP（Model Context Protocol）** 工具，供 **小智（xiaozhi-server）** 通过 **MCP 接入点** 用自然语言查询和控制智能家居设备。
 
-**当前版本：v1.15.2** · Python 3.12 · 传输方式：**stdio MCP server + WebSocket bridge** · 单容器部署（MCP bridge + WebUI）
+**当前版本：v1.15.3** · Python 3.12 · 传输方式：**stdio MCP server + WebSocket bridge** · 单容器部署（MCP bridge + WebUI）
 
 ---
 
@@ -213,8 +213,8 @@ docker compose logs -f homeassistant-xiaozhiserver
 看到以下日志表示 bridge 已连上小智：
 
 ```text
-2026-01-01 12:00:00.123 INFO    v1.15.2 MCP_PIPE [-] MCP接入点连接成功
-2026-01-01 12:00:00.456 INFO    v1.15.2 MCP_PIPE [-] 已启动 MCP server：...
+2026-01-01 12:00:00.123 INFO    v1.15.3 MCP_PIPE [-] MCP接入点连接成功
+2026-01-01 12:00:00.456 INFO    v1.15.3 MCP_PIPE [-] 已启动 MCP server：...
 ```
 
 WebUI 地址：`http://<宿主机IP>:8099/`（端口由 `WEBUI_PORT` 决定），首次打开会跳转登录页，输入 `.env` 的 `WEBUI_TOKEN` 后才能进入。compose 使用 `network_mode: host`，因此没有 `ports` 映射；如需只允许本机访问，把 `.env` 的 `WEBUI_HOST` 设为 `127.0.0.1`。
@@ -297,10 +297,10 @@ WebUI 与 MCP bridge 在同一个容器内运行：WebUI 后台常驻，bridge �
 | GET | `/api/logs?limit=200&level=INFO` | 最近日志，`limit` 1–500（需登录） |
 | GET | `/healthz` | 存活探针，仅表示 WebUI 进程可响应 |
 | GET | `/readyz` | 公开就绪探针，只返回 `{"ok": bool}`；HA 已配置且可达、且配置 MCP 时 bridge 已连接则 200，否则 503 |
-| GET | `/metrics` | Prometheus 文本指标；`METRICS_ENABLED=false` 时 404 |
+| GET | `/metrics` | Prometheus 文本指标；需会话 Cookie 或 `Authorization: Bearer <WEBUI_TOKEN>`；`METRICS_ENABLED=false` 时 404 |
 | POST | `/api/tool/{name}` | JSON 工具调试，仅白名单 7 个工具；请求体上限 64KB（需登录） |
 
-WebUI 使用 `.env` 中的 `WEBUI_TOKEN` 登录，登录成功后签发随机会话 Cookie（仅存服务端内存，容器重启后需重新登录），所有页面与 API（除 `/login`、`/healthz`、`/readyz`、`/metrics`）都要求有效会话 Cookie。POST 登录表单限制 16KB、工具调试 JSON 限制 64KB；同一来源 5 分钟内登录失败 5 次后返回 429 并带 `Retry-After`；HTTPS 直连时会话 Cookie 自动加 `Secure`；响应带 `Cache-Control: no-store` 与更严格的 CSP。仍然建议只绑定可信内网或放在带 TLS 的反向代理后面。WebUI 会独立拦截危险设备与高风险服务（不受 `DANGER_CONFIRM_ENABLED` 影响；查询设备安全性失败时按拒绝处理，失败关闭；`scene.turn_on` 视为可能包含门锁动作的高风险操作），写请求必须同源并校验 Host/Origin，所有响应附带 `X-Content-Type-Options`、`X-Frame-Options`、`CSP` 等安全头。允许的 Host 默认是 localhost/内网 IP，跨网段或域名访问可通过 `WEBUI_ALLOWED_HOSTS` 追加。
+WebUI 使用 `.env` 中的 `WEBUI_TOKEN` 登录，登录成功后签发随机会话 Cookie（仅存服务端内存，容器重启后需重新登录），所有页面与 API（除 `/login`、`/healthz`、`/readyz`）都要求有效会话 Cookie；`/metrics` 也接受 `Authorization: Bearer <WEBUI_TOKEN>` 供 Prometheus 抓取。POST 登录表单限制 16KB、工具调试 JSON 限制 64KB；同一来源 5 分钟内登录失败 5 次后返回 429 并带 `Retry-After`；HTTPS 直连时会话 Cookie 自动加 `Secure`；响应带 `Cache-Control: no-store` 与更严格的 CSP。仍然建议只绑定可信内网或放在带 TLS 的反向代理后面。WebUI 会独立拦截危险设备与高风险服务（不受 `DANGER_CONFIRM_ENABLED` 影响；查询设备安全性失败时按拒绝处理，失败关闭；`scene.turn_on` 视为可能包含门锁动作的高风险操作），写请求必须同源并校验 Host/Origin，所有响应附带 `X-Content-Type-Options`、`X-Frame-Options`、`CSP` 等安全头。允许的 Host 默认是 localhost/内网 IP，跨网段或域名访问可通过 `WEBUI_ALLOWED_HOSTS` 追加。
 
 日志默认写入系统临时目录，可用 `LOG_FILE` 指定；WebUI、bridge 与 stdio MCP server 分别写 `*.webui.log` / `*.bridge.log` / `*.mcp.log`，避免多个进程同时轮转同一文件。日志行格式为 `YYYY-MM-DD HH:MM:SS.mmm LEVEL v版本 模块 [call_id] 消息`，默认 `TZ=Asia/Shanghai`（可用环境变量覆盖），因此容器日志与宿主机本地时间一致。`LOG_FORMAT=json` 可输出结构化日志。`/metrics` 暴露工具与 HTTP 指标，并合并 WebUI 进程与 stdio MCP server 子进程的指标（通过共享临时目录），因此工具调用指标不会因进程隔离而丢失。项目根 `docker-compose.yml` 把容器 `/app/logs` 挂到宿主机 `./xiaozhi-logs`，并设置 json-file 日志上限。
 
@@ -356,6 +356,8 @@ docker run --user "${PUID:-1000}:${PGID:-1000}" \
 | `EXCLUDED_DOMAINS` | `automation,media_player` | 不向 MCP 暴露的设备 domain，逗号分隔 |
 | `EXCLUDED_DEVICE_KEYWORDS` | `门铃,水壶,中枢网关` | 不向 MCP 暴露的设备名称关键字，匹配实体名、`entity_id` 与设备注册表名称 |
 
+> `automation` 与 `media_player` 默认在 `EXCLUDED_DOMAINS` 中，因此工具虽然支持这些域的动作，默认不会暴露；需要时从 `EXCLUDED_DOMAINS` 移除后重启。
+>
 > 默认隐藏门铃、自动化、热水壶、中枢网关、媒体五类设备。被隐藏设备不会出现在 `list_devices`、`get_device_state`、`control_device`、`call_service`、`list_services`、`list_domains` 和 WebUI 设备总览中。
 >
 > 同一 `device_id` 下恰好 1 个 `light` 与 1 个 `switch`，且两者 `friendly_name` 归一化后相同，则该 `switch` 视为同一被控对象的重复入口，自动隐藏，只保留灯具。灯具/开关数量不唯一或名称不同时不做隐藏，并在 `ambiguous_switch_groups` 中记录可疑组。
@@ -526,6 +528,8 @@ docker run --user "${PUID:-1000}:${PGID:-1000}" \
 | vacuum | turn_on, turn_off, stop, pause, continue, resume |
 | lock | lock, unlock |
 | scene / script | turn_on |
+
+返回的 `actions` 会按设备的 `supported_features`、`supported_color_modes` 与温度/色温范围过滤，避免暴露设备不支持的动作；`vacuum` 也按能力位过滤。
 
 `control_devices` 参数为 `entities`（string 列表，最多 20 个）、`action`、`value`、`confirm_token`；同一 `action` 批量执行，返回 `count`、合并后的中文 `response` 与逐设备 `results`，单个设备失败会收集到 `errors` 而不中断其余设备。重复目标自动去重并在 `deduplicated` 返回；整批受 `CONTROL_BATCH_TIMEOUT` 总时限约束：超时且尚未下发的条目返回 `status=not_sent`、`code=batch_timeout`，已下发但未在时限内确认的条目返回 `status=accepted_pending`、`code=pending_confirmation`。
 
@@ -755,6 +759,7 @@ bash tests/run_local_test.sh
 
 | 版本 | 主要变化 |
 |---|---|
+| v1.15.3 | 性能与边界加固：批量控制复用预加载状态，`resolve_entity` 命中预加载实体不再逐条 REST；事件流缓存按实体时间戳判断新鲜度，控制后强制回读回源；`/metrics` 改为需登录或 Bearer 令牌，CSP 由 `unsafe-inline` 收紧为 nonce；登录失败来源表设上限并清理；指标落盘改为节流并主动清理过期快照；日志尾部读取按文件元信息缓存；`supported_color_modes=[]` 不再暴露颜色动作，`vacuum` 按能力位过滤；信号处理改为正常取消以执行 bridge 清理；批量超时文档区分 `not_sent` 与 `accepted_pending` |
 | v1.15.2 | 指标、危险闸门与部署加固：`/metrics` 合并 MCP server 子进程指标；WebUI 危险闸门按 `control_device` 动作映射实际服务并识别 scene/script；登录失败 5 次/5 分钟限速、会话上限、HTTPS Cookie Secure；`/readyz` 成为容器健康检查依据；批量超时区分未下发 `not_sent`/`batch_timeout` 与已下发待确认；确认令牌意图不再受列表顺序影响；状态判定修正 bool 属性缺失、cover/valve 预期与 `accepted`；注册表不可用时危险设备检查失败关闭；compose 增加资源限制与 `/tmp` 大小限制；PR 构建镜像 |
 | v1.15.1 | 控制链路修复：`call_service` 与 `control_device` 统一成功语义（`confirmed`/`accepted`/已验证 `no_change`）；scene/script/`stop_cover` 等无状态服务返回 `accepted` 不再误判失败；按 `supported_features`、颜色模式和温度范围过滤动作；新增 `set_percentage`/`set_position`/`set_hvac_mode`/`set_fan_mode` 并校验参数范围；批量控制预加载状态、去重、失败含设备名并受 `CONTROL_BATCH_TIMEOUT` 总时限约束；回读 REST 回退降频；移除 `homeassistant.*` 危险兜底；`resolve_entity` 兼容非字符串输入 |
 | v1.15.0 | 安全与健壮性修复：WebUI 登录改为随机会话 Cookie（重启失效）、登录表单 16KB/工具 JSON 64KB 体积限制、`/readyz` 脱敏为仅 `{ok}`、响应加 `Cache-Control: no-store` 与更严格 CSP；`/api/devices` 加载失败返回 503；HA 3xx 与非数组响应显式报错、状态/服务/注册表请求加单飞锁；控制结果仅 `confirmed`（或 `no_change` 且已验证）为成功，批量部分失败返回 `ok=false` 并播报未成功数，`stop_cover` 等无预期动作按 HA 返回判定；补 `stop_cover`、区域注册表不可用显式降级；MCP server 独立 `*.mcp.log`（`LOG_FILE_MCP`）；健康检查脚本支持 `WEBUI_HOST` 与 127.0.0.1 回退；compose 增加 `cap_drop: ALL`/`read_only`；镜像支持 `linux/arm64`；WebUI 冒烟测试与真实 `.env` 隔离 |

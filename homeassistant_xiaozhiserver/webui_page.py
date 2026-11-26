@@ -62,11 +62,14 @@ small{color:#6b7280}
 """
 
 
-def _page(title: str, body: str, script: str = "") -> str:
+def _page(title: str, body: str, script: str = "", nonce: str = "") -> str:
+    nonce_attr = (" nonce=\"" + html.escape(nonce, quote=True) + "\"") if nonce else ""
+    if script and nonce:
+        script = script.replace("<script>", "<script" + nonce_attr + ">", 1)
     return (
         "<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-        "<title>" + html.escape(title) + "</title><style>" + _PAGE_STYLE + "</style></head>"
+        "<title>" + html.escape(title) + "</title><style" + nonce_attr + ">" + _PAGE_STYLE + "</style></head>"
         "<body><header><div class='brand'><h1>homeassistant-xiaozhiserver · WebUI</h1>"
         "<span class='version'>v" + html.escape(__version__) + "</span></div>"
         "<div class='sub'>设备总览 · 服务日志 · 高级工具调试</div></header>"
@@ -135,7 +138,8 @@ def _render_log_entries(entries: list[dict[str, str]]) -> str:
 
 
 def _render_index(status: dict[str, Any], devices: dict[str, Any],
-                  logs: list[dict[str, str]], config: dict[str, Any]) -> str:
+                  logs: list[dict[str, str]], config: dict[str, Any],
+                  nonce: str = "") -> str:
     ha = status["ha"]
     if not ha["configured"]:
         ha_text = "<span class='bad'>未配置</span>"
@@ -211,7 +215,7 @@ def _render_index(status: dict[str, Any], devices: dict[str, Any],
         "<span id='device-summary' class='muted'>" + html.escape(device_summary) + "</span></div>"
         "<div class='toolbar'>"
         "<input id='device-filter' type='text' placeholder='按区域、设备、类型、实体过滤…'>"
-        "<button type='button' onclick='loadDevices()'>刷新设备</button>"
+        "<button type='button' id='device-refresh'>刷新设备</button>"
         "</div>"
         "<table class='device-table'><thead><tr>"
         "<th>区域</th><th>设备</th><th>类型</th><th>实体</th><th>状态</th><th>可执行动作</th>"
@@ -223,7 +227,7 @@ def _render_index(status: dict[str, Any], devices: dict[str, Any],
         "<select id='log-level'><option value='ALL'>全部级别</option><option value='INFO'>INFO</option>"
         "<option value='WARNING'>WARNING</option><option value='ERROR'>ERROR</option>"
         "<option value='DEBUG'>DEBUG</option></select>"
-        "<button type='button' onclick='loadLogs()'>刷新日志</button>"
+        "<button type='button' id='log-refresh'>刷新日志</button>"
         "<label class='auto'><input id='log-auto' type='checkbox' checked>自动刷新（5 秒）</label>"
         "</div>"
         "<div id='log-box' class='log-box'>" + _render_log_entries(logs) + "</div>"
@@ -237,10 +241,11 @@ def _render_index(status: dict[str, Any], devices: dict[str, Any],
         "</form>"
         "<p><small>参数示例：</small></p><table>" + examples + "</table></details>"
     )
-    return _page("homeassistant-xiaozhiserver WebUI", body, _INDEX_SCRIPT)
+    return _page("homeassistant-xiaozhiserver WebUI", body, _INDEX_SCRIPT, nonce)
 
 
-def _render_tool_result(name: str, params: str, result: Any, status: int) -> str:
+def _render_tool_result(name: str, params: str, result: Any, status: int,
+                        nonce: str = "") -> str:
     pretty = json.dumps(result, ensure_ascii=False, indent=2, default=str)
     ok = not (isinstance(result, dict) and result.get("ok") is False)
     badge = ("<span class='ok'>成功</span>" if status == 200 and ok
@@ -252,7 +257,7 @@ def _render_tool_result(name: str, params: str, result: Any, status: int) -> str
         "<section><h2>返回</h2><pre>" + html.escape(pretty) + "</pre></section>"
         "<p><a href='/'>← 返回首页</a></p>"
     )
-    return _page("调用结果", body)
+    return _page("调用结果", body, nonce=nonce)
 
 
 _INDEX_SCRIPT = r"""
@@ -368,6 +373,10 @@ var filterInput = document.getElementById('device-filter');
 if (filterInput) filterInput.addEventListener('input', applyDeviceFilter);
 var levelSelect = document.getElementById('log-level');
 if (levelSelect) levelSelect.addEventListener('change', loadLogs);
+var deviceRefresh = document.getElementById('device-refresh');
+if (deviceRefresh) deviceRefresh.addEventListener('click', loadDevices);
+var logRefresh = document.getElementById('log-refresh');
+if (logRefresh) logRefresh.addEventListener('click', loadLogs);
 setInterval(function () {
   var auto = document.getElementById('log-auto');
   if (auto && auto.checked) loadLogs();

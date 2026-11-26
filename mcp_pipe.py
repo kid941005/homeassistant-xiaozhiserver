@@ -230,7 +230,7 @@ async def connect_with_retry(uri: str, script_path: str, target: str) -> None:
     state = _new_bridge_state()
     heartbeat = asyncio.create_task(_bridge_status_heartbeat(uri, state))
     try:
-        while True:
+        while not _STOP_REQUESTED:
             # 在 try 外赋值，保证异常路径也能安全计算连接时长。
             started = time.monotonic()
             try:
@@ -263,9 +263,16 @@ async def connect_with_retry(uri: str, script_path: str, target: str) -> None:
         _publish_bridge_status(uri, state)
 
 
+_STOP_REQUESTED = False
+
+
 def signal_handler(sig, frame) -> None:
+    global _STOP_REQUESTED
+    _STOP_REQUESTED = True
     logger.info("收到退出信号，正在关闭...")
-    sys.exit(0)
+    # 抛 KeyboardInterrupt 让 asyncio.run 取消主任务并执行 connect_with_retry 的 finally，
+    # 正常取消心跳并写 bridge 断开状态；直接 sys.exit 可能跳过这些清理。
+    raise KeyboardInterrupt
 
 
 def main() -> None:

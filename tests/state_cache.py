@@ -33,7 +33,7 @@ def check(condition: bool, label: str) -> None:
 
 async def run() -> None:
     ha = make_client()
-    calls = {"states": 0, "services": 0, "service": 0}
+    calls = {"states": 0, "services": 0, "service": 0, "state_one": 0}
     states = [
         {"entity_id": "light.a", "state": "off", "attributes": {}},
         {"entity_id": "switch.b", "state": "on", "attributes": {}},
@@ -46,6 +46,9 @@ async def run() -> None:
         if path == "/api/services":
             calls["services"] += 1
             return [{"domain": "light", "services": {"turn_on": {}}}]
+        if path == "/api/states/light.a":
+            calls["state_one"] += 1
+            return {"entity_id": "light.a", "state": "off", "attributes": {}}
         if method == "POST":
             calls["service"] += 1
             return None
@@ -59,6 +62,11 @@ async def run() -> None:
     check(calls["states"] == 1, "get_states 命中短 TTL 缓存，只请求一次 REST")
     await ha.get_states(force=True)
     check(calls["states"] == 2, "get_states(force=True) 绕过缓存")
+
+    resolved, candidates, returned_states = await ha.resolve_entity("light.a", states=first)
+    check(isinstance(resolved, dict) and resolved.get("entity_id") == "light.a" and not candidates
+          and returned_states is first, "resolve_entity 可复用预加载状态")
+    check(calls["state_one"] == 0, "resolve_entity 命中预加载 entity_id 时不再单独请求状态")
 
     await ha.get_services()
     await ha.get_services()
@@ -96,6 +104,13 @@ async def run() -> None:
     before = calls["states"]
     cached = await ha.get_states()
     check(len(cached) == 1 and calls["states"] == before, "事件流就绪时 get_states 走内存缓存")
+
+    one = await ha.get_state("light.a")
+    check(one and one.get("state") == "on" and calls["state_one"] == 0, "事件流缓存新鲜时 get_state 直接返回内存快照")
+    ha.state_cache_ttl = 0.0
+    ha._state_entity_ts["light.a"] = time.monotonic() - 10
+    one = await ha.get_state("light.a")
+    check(one and calls["state_one"] == 1, "事件流缓存过期时 get_state 回源 REST 刷新")
 
     await ha.aclose()
 

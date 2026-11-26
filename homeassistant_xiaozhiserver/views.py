@@ -63,6 +63,9 @@ def _filter_actions(domain: str, actions: list, attributes: dict) -> list:
     if domain == "light":
         modes = attrs.get("supported_color_modes")
         modes = [str(m).lower() for m in modes] if isinstance(modes, list) else None
+        if modes == []:
+            # 明确报告空颜色模式：按“只有开关能力”处理，不暴露亮度/色温/颜色。
+            out = [a for a in out if a not in ("set_brightness", "set_color_temp", "set_color")]
         if "set_brightness" in out:
             if modes is not None:
                 if modes and all(m == "onoff" for m in modes):
@@ -101,6 +104,13 @@ def _filter_actions(domain: str, actions: list, attributes: dict) -> list:
     elif domain == "fan":
         if features is not None and "set_percentage" in out and not (features & 16):
             out.remove("set_percentage")
+    elif domain == "vacuum":
+        if features is not None:
+            # VacuumEntityFeature：TURN_ON=1, TURN_OFF=2, PAUSE=4, STOP=8, START=8192。
+            mapping = {"turn_on": 1, "turn_off": 2, "pause": 4, "stop": 8,
+                       "continue": 8192, "resume": 8192}
+            out = [a for a in out if not (a in mapping and not (features & mapping[a]))]
+    # lock 的 lock/unlock 属于基础服务，不依赖 supported_features；humidifier 无内置动作。
     return out
 
 

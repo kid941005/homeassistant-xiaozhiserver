@@ -51,7 +51,9 @@ r = anon.get("/", follow_redirects=False)
 check("未登录访问首页跳转登录页", r.status_code in (302, 303, 307) and "/login" in r.headers.get("location", ""),
       str(r.status_code) + " " + str(r.headers.get("location")))
 r = anon.get("/metrics")
-check("未登录可访问 /metrics", r.status_code == 200 and r.headers.get("content-type", "").startswith("text/plain"),
+check("未登录访问 /metrics 返回 401", r.status_code == 401, str(r.status_code) + " " + r.text[:120])
+r = anon.get("/metrics", headers={"Authorization": "Bearer " + WEBUI_TOKEN})
+check("/metrics 支持 Bearer 指标令牌", r.status_code == 200 and r.headers.get("content-type", "").startswith("text/plain"),
       str(r.status_code) + " " + r.headers.get("content-type", ""))
 
 r = post("/login", data={"token": "bad-token"})
@@ -155,6 +157,10 @@ r = client.get("/healthz")
 check("健康检查 200", r.status_code == 200 and r.json().get("ok") is True, r.text[:200])
 check("安全响应头存在", r.headers.get("X-Content-Type-Options") == "nosniff")
 check("响应禁止缓存", r.headers.get("Cache-Control") == "no-store", str(r.headers.get("Cache-Control")))
+csp = r.headers.get("Content-Security-Policy", "")
+check("CSP 使用 nonce 而非 unsafe-inline", "nonce-" in csp and "unsafe-inline" not in csp, csp[:200])
+r = client.get("/")
+check("首页脚本与样式带 CSP nonce", "nonce=" in r.text and " onclick=" not in r.text, r.text[:160])
 
 r = anon.get("/readyz")
 check("/readyz 公开且只返回 ok", r.status_code in (200, 503) and set(r.json()) == {"ok"}, r.text[:200])
@@ -249,7 +255,7 @@ if os.environ.get("HA_URL") and os.environ.get("HA_TOKEN"):
           str(r.status_code) + " " + r.text[:200])
 
     r = client.get("/metrics")
-    check("工具调用指标已暴露",
+    check("登录后可访问 /metrics 且工具调用指标已暴露",
           r.status_code == 200 and 'ha_mcp_tool_calls_total{' in r.text
           and 'tool="list_domains"' in r.text and 'tool="call_service"' in r.text,
           r.text[:300])

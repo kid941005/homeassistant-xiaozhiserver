@@ -264,7 +264,7 @@ async def control_devices(entities: list[str], action: str, value: Optional[Any]
     对每个设备分别回读确认，返回 results 列表与合并后的中文 response。
     任一目标属于危险设备或本次服务高风险时，整批只申请一次 confirm_token；
     用户确认后带同一 token 重试整批即可。单次最多 20 个设备，重复目标自动去重；
-    整批受 CONTROL_BATCH_TIMEOUT 总时限约束，超时条目返回 pending_confirmation。
+    整批受 CONTROL_BATCH_TIMEOUT 总时限约束：超时且尚未下发的条目返回 status=not_sent/code=batch_timeout；已下发但未在时限内确认的条目返回 status=accepted_pending/code=pending_confirmation。
     """
     return await get_device_service().control_devices(**locals())
 
