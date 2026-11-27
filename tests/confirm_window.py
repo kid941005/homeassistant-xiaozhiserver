@@ -175,6 +175,23 @@ class RuntimeRefreshHA(DangerSwapHA):
         raise RuntimeError("模拟刷新崩溃")
 
 
+class RegistryCrashHA(DangerSwapHA):
+    """注册表读取抛非 HAError：应 state_unavailable/not_sent 且不调用 call_service。"""
+
+    async def get_registries(self):
+        raise RuntimeError("模拟注册表崩溃")
+
+    async def resolve_entity(self, entity, states=None):
+        return {"entity_id": "cover.x", "state": "closed", "attributes": {}}, [], states
+
+
+class ResolveCrashHA(DangerSwapHA):
+    """实体解析抛非 HAError：应记为 state_unavailable 并整批 not_sent。"""
+
+    async def resolve_entity(self, entity, states=None):
+        raise RuntimeError("模拟解析崩溃")
+
+
 class CancelGarageHA(DangerSwapHA):
     """锁内 fresh 始终是车库门，POST 开始后挂起，用于验证取消后的令牌消费。"""
 
@@ -325,10 +342,11 @@ async def run() -> None:
     check_invalid_number(float("inf"), "set_color_temp", "set_color_temp 拒绝 Infinity")
     check_invalid_attributes()
     check_filter_actions()
-    for cn_name in ("主卧窗", "厨房门", "阳台门", "入户门", "庭院门"):
+    for cn_name in ("主卧窗", "厨房门", "阳台门", "入户门", "庭院门",
+                    "停车场道闸", "小区闸机", "起落杆"):
         check(_danger_flags("cover.x", {"friendly_name": cn_name})[0],
-              "中文门窗名称按高风险处理：" + cn_name)
-    for cn_safe in ("窗帘", "窗纱", "门铃", "门磁", "门帘"):
+              "中文门窗/道闸名称按高风险处理：" + cn_name)
+    for cn_safe in ("窗帘", "窗纱", "门铃", "门磁", "门帘", "百叶窗", "纱窗"):
         check(not _danger_flags("cover.x", {"friendly_name": cn_safe})[0],
               "非门窗本体不误判：" + cn_safe)
     ha = SlowHA()
@@ -571,6 +589,54 @@ async def run() -> None:
     rejected = [o for o in outcomes
                 if isinstance(o, dict) and o.get("code") == "invalid_confirm_token"]
     check(len(rejected) == 1, "同一令牌并发请求中有一个被拒绝")
+    check(devices_module._confirm_token_lock("__bogus_token__") is None,
+          "伪造令牌不创建锁，避免内存无界增长")
+    whitespace_ha = DangerSwapHA()
+    whitespace_service = DeviceService(lambda: whitespace_ha)
+    with patch.object(devices_module, "_resolve_entity_or_error", new=_fake_resolve_any):
+        first_ws = await whitespace_service.control_devices(["cover.x"], "open")
+        ws_token = str(first_ws.get("confirm_token") or "")
+        check(bool(ws_token), "空白变体并发场景首次返回确认令牌")
+        ws_a = asyncio.create_task(
+            whitespace_service.control_devices(["cover.x"], "open", confirm_token=ws_token))
+        ws_b = asyncio.create_task(
+            whitespace_service.control_devices(["cover.x"], "open",
+                                              confirm_token="  " + ws_token + "  "))
+        ws_outcomes = await asyncio.gather(ws_a, ws_b, return_exceptions=True)
+    check(whitespace_ha.calls == 1, "含空白变体的同一令牌并发批量只执行一次")
+    ws_rejected = [o for o in ws_outcomes
+                   if isinstance(o, dict) and o.get("code") == "invalid_confirm_token"]
+    check(len(ws_rejected) == 1, "空白变体令牌并发时也只有一个请求成功")
+    registry_ha = RegistryCrashHA()
+    registry_service = DeviceService(lambda: registry_ha)
+    with patch.object(devices_module, "EXCLUDED_DEVICE_KEYWORDS", ("路由器",)):
+        registry_out = await registry_service.control_devices(["cover.x"], "open")
+    check(registry_out.get("status") == "not_sent", "注册表崩溃时整批标记 not_sent")
+    check(any(e.get("code") == "registry_unavailable" for e in (registry_out.get("errors") or [])),
+          "注册表非 HAError 崩溃按 registry_unavailable 记录")
+    check(registry_ha.calls == 0, "注册表崩溃时不调用 call_service")
+    resolve_ha = ResolveCrashHA()
+    resolve_service = DeviceService(lambda: resolve_ha)
+    resolve_out = await resolve_service.control_devices(["cover.x"], "open")
+    check(resolve_out.get("status") == "not_sent", "实体解析崩溃时整批标记 not_sent")
+    check(any(e.get("code") == "state_unavailable" for e in (resolve_out.get("errors") or [])),
+          "实体解析非 HAError 崩溃按 state_unavailable 记录")
+    check(resolve_ha.calls == 0, "实体解析崩溃时不调用 call_service")
+    invalid_service_ha = DangerSwapHA()
+    invalid_service = DeviceService(lambda: invalid_service_ha)
+    with patch.object(devices_module, "_resolve_entity_or_error", new=_fake_resolve):
+        first_invalid = await invalid_service.call_service("cover.x", "cover.open_cover")
+        invalid_token = str(first_invalid.get("confirm_token") or "")
+        check(bool(invalid_token), "非法服务名场景首次返回确认令牌")
+        bad_service = await invalid_service.call_service(
+            "cover.x", "cover.bad service", confirm_token=invalid_token)
+        check(bad_service.get("code") == "invalid_service", "非法服务名不进入危险下发")
+        check(invalid_service_ha.calls == 0, "非法服务名不调用 call_service")
+        valid_after = await invalid_service.call_service(
+            "cover.x", "cover.open_cover", confirm_token=invalid_token)
+    check(valid_after.get("code") != "invalid_confirm_token",
+          "非法服务名预校验失败不消费确认令牌")
+    check(invalid_service_ha.calls == 1, "同一令牌随后一次有效调用可正常执行")
     print("CONFIRM WINDOW OK")
 
 

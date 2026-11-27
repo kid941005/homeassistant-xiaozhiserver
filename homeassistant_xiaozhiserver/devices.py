@@ -10,7 +10,7 @@ import logging
 import time
 from typing import Any, Optional
 
-from .client import HAError, HAClient
+from .client import HAError, HAClient, _SERVICE_NAME_RE
 from .config import (
     CONTROL_BATCH_TIMEOUT,
     CONTROL_CONCURRENCY,
@@ -19,7 +19,14 @@ from .config import (
     EXCLUDED_DOMAINS,
     MAX_LIST_LIMIT,
 )
-from .danger import _confirm_intent, _consume_confirm_token, _danger_block, _danger_flags, _service_is_dangerous
+from .danger import (
+    _confirm_intent,
+    _confirm_token_exists,
+    _consume_confirm_token,
+    _danger_block,
+    _danger_flags,
+    _service_is_dangerous,
+)
 from .service import (
     DIRECT_RESPONSE_SERVICES,
     DOMAIN_ACTIONS,
@@ -45,19 +52,18 @@ from .views import (
 
 log = logging.getLogger("homeassistant_xiaozhiserver.devices")
 
-# 同一确认令牌的请求串行化：批量/单设备都在入口先占用该令牌的锁，
+# 同一确认令牌的请求串行化：批量/单设备都在入口先占用共享锁，
 # 避免两个并发请求在令牌被消费前都通过复核而重复执行一次性危险操作。
-_CONFIRM_TOKEN_LOCKS: dict = {}
+# 只对真实存在的令牌加锁，且不按令牌建字典，避免恶意随机 token 造成内存无界增长。
+_CONFIRM_TOKEN_LOCK = asyncio.Lock()
 
 
 def _confirm_token_lock(confirm_token: Optional[str]):
-    if not confirm_token:
+    if not confirm_token or len(confirm_token) > 256:
         return None
-    lock = _CONFIRM_TOKEN_LOCKS.get(confirm_token)
-    if lock is None:
-        lock = asyncio.Lock()
-        _CONFIRM_TOKEN_LOCKS[confirm_token] = lock
-    return lock
+    if not _confirm_token_exists(confirm_token):
+        return None
+    return _CONFIRM_TOKEN_LOCK
 
 
 class _BatchNotDispatched(Exception):
@@ -542,6 +548,7 @@ class DeviceService:
         """
         dispatch_state = {"dispatched": False}
         token_intent: Optional[str] = None
+        confirm_token = (confirm_token or "").strip() or None
         token_lock = _confirm_token_lock(confirm_token)
         if token_lock is not None:
             await token_lock.acquire()
@@ -619,7 +626,10 @@ class DeviceService:
         except Exception as e:  # noqa: BLE001
             if confirm_token and dispatch_state.get("dispatched"):
                 _consume_confirm_token(confirm_token, token_intent)
-            return {"ok": False, "code": "internal_error", "message": "控制设备失败：" + str(e)}
+            out = {"ok": False, "code": "internal_error", "message": "控制设备失败：" + str(e)}
+            if not dispatch_state.get("dispatched"):
+                out["status"] = "not_sent"
+            return out
         finally:
             if token_lock is not None:
                 token_lock.release()
@@ -635,9 +645,20 @@ class DeviceService:
         """
         dispatch_states: list = []
         batch_intent: Optional[str] = None
+        confirm_token = (confirm_token or "").strip() or None
+        # 总时限从入口开始，令牌锁等待、状态/注册表加载和实体解析都计入。
+        deadline = time.monotonic() + CONTROL_BATCH_TIMEOUT
+        not_sent = {"ok": False, "status": "not_sent", "code": "batch_timeout",
+                    "message": "批量控制超时，指令未下发。"}
         token_lock = _confirm_token_lock(confirm_token)
+        token_acquired = False
         if token_lock is not None:
-            await token_lock.acquire()
+            try:
+                await asyncio.wait_for(token_lock.acquire(),
+                                       timeout=max(0.0, deadline - time.monotonic()))
+                token_acquired = True
+            except asyncio.TimeoutError:
+                return dict(not_sent)
         try:
             ha = self._ha_provider()
             action_name = (action or "").strip().lower()
@@ -647,10 +668,7 @@ class DeviceService:
             if len(refs) > 20:
                 return {"ok": False, "code": "invalid_argument", "message": "单次最多批量控制 20 个设备，收到 " + str(len(refs)) + " 个。"}
 
-            # 总时限从入口开始计算，状态/注册表加载和实体解析也计入，避免预检阶段无限拖长。
-            deadline = time.monotonic() + CONTROL_BATCH_TIMEOUT
-            not_sent = {"ok": False, "status": "not_sent", "code": "batch_timeout",
-                        "message": "批量控制超时，指令未下发。"}
+            # deadline/not_sent 已在入口（获取令牌锁之前）创建。
 
             resolved: list = []
             errors: list = []
@@ -682,8 +700,12 @@ class DeviceService:
                     batch_maps = _registry_maps(reg)[:2]
             except asyncio.TimeoutError:
                 return not_sent
+            except asyncio.CancelledError:
+                raise
             except HAError as exc:
                 batch_registry_error = exc
+            except Exception as exc:  # noqa: BLE001
+                batch_registry_error = HAError("registry_unavailable", "读取设备注册表失败：" + str(exc))
             batch_registry_loaded = True
             if deadline - time.monotonic() <= 0:
                 return not_sent
@@ -710,9 +732,15 @@ class DeviceService:
                         timeout=remaining)
                 except asyncio.TimeoutError:
                     return not_sent
+                except asyncio.CancelledError:
+                    raise
                 except HAError as exc:
                     errors.append({"entity": ref, "entity_id": ref, "code": exc.code,
                                    "message": "『" + ref + "』解析失败：" + exc.message})
+                    continue
+                except Exception as exc:  # noqa: BLE001
+                    errors.append({"entity": ref, "entity_id": ref, "code": "state_unavailable",
+                                   "message": "『" + ref + "』解析失败：" + str(exc)})
                     continue
                 if error is not None:
                     # 统一为扁平结构，避免 errors 里同时出现 {entity,error:{...}} 和 {entity,code,...}
@@ -752,7 +780,7 @@ class DeviceService:
                                  "extra": extra, "payload": payload})
 
             if not resolved:
-                return {"ok": False, "code": "no_valid_entities",
+                return {"ok": False, "status": "not_sent", "code": "no_valid_entities",
                         "message": "没有可执行的目标设备。", "errors": errors or None}
 
             # 阶段一：先把所有目标刷新到最新状态并重新校验参数/危险属性，全部通过后
@@ -1021,9 +1049,10 @@ class DeviceService:
         except Exception as e:  # noqa: BLE001
             if confirm_token and any(ds.get("dispatched") for ds in dispatch_states):
                 _consume_confirm_token(confirm_token, batch_intent)
-            return {"ok": False, "code": "internal_error", "message": "批量控制失败：" + str(e)}
+            return {"ok": False, "status": "not_sent", "code": "internal_error",
+                    "message": "批量控制失败：" + str(e)}
         finally:
-            if token_lock is not None:
+            if token_acquired and token_lock is not None:
                 token_lock.release()
 
     async def list_services(self, entity: Optional[str] = None, domain: Optional[str] = None,
@@ -1144,6 +1173,7 @@ class DeviceService:
         """
         dispatch_state = {"dispatched": False}
         token_intent: Optional[str] = None
+        confirm_token = (confirm_token or "").strip() or None
         token_lock = _confirm_token_lock(confirm_token)
         if token_lock is not None:
             await token_lock.acquire()
@@ -1166,6 +1196,11 @@ class DeviceService:
             if not service_domain or not svc:
                 return {"ok": False, "code": "invalid_service",
                         "message": "服务名格式应为 'service' 或 'domain.service'，收到：" + str(service)}
+            # 与 HAClient 相同的语法预校验：非法服务名不会发 POST，绝不能消费确认令牌。
+            if not _SERVICE_NAME_RE.match(service_domain) or not _SERVICE_NAME_RE.match(svc):
+                return {"ok": False, "code": "invalid_service",
+                        "message": "服务名格式不合法：" + service_domain + "." + svc
+                                   + "。只允许小写字母、数字与下划线。"}
             if data is None:
                 extra = {}
             elif isinstance(data, dict):
@@ -1233,7 +1268,10 @@ class DeviceService:
         except Exception as e:  # noqa: BLE001
             if confirm_token and dispatch_state.get("dispatched"):
                 _consume_confirm_token(confirm_token, token_intent)
-            return {"ok": False, "code": "internal_error", "message": "调用服务失败：" + str(e)}
+            out = {"ok": False, "code": "internal_error", "message": "调用服务失败：" + str(e)}
+            if not dispatch_state.get("dispatched"):
+                out["status"] = "not_sent"
+            return out
         finally:
             if token_lock is not None:
                 token_lock.release()

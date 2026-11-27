@@ -40,9 +40,12 @@ def _danger_flags(entity_id: str, attributes: Optional[dict]) -> tuple:
         # 中文没有词边界，直接子串匹配。
         ascii_words = ("garage", "gate", "window", "door")
         # 中文没有词边界：用“门/窗”词根兜底，覆盖主卧窗、厨房门、阳台门等常见命名；
-        # 先排除门铃/门磁/窗帘/窗纱/门帘等并非门窗本体的设备，避免误报。
-        cn_safe = ("门铃", "门磁", "窗帘", "窗纱", "门帘")
-        cn_hit = any(k in ident for k in ("门", "窗")) and not any(k in ident for k in cn_safe)
+        # 显式高危词覆盖不含“门/窗”的道闸、闸机、起落杆等物理通道设备（恢复 v1.15.8 语义）；
+        # 先排除门铃/门磁/窗帘/窗纱/门帘/百叶窗/纱窗等并非门窗本体的设备，避免误报。
+        cn_safe = ("门铃", "门磁", "窗帘", "窗纱", "门帘", "百叶窗", "纱窗")
+        cn_hot = ("道闸", "闸机", "起落杆", "闸杆", "卷闸")
+        cn_hit = (any(k in ident for k in ("门", "窗")) or any(k in ident for k in cn_hot)) \
+            and not any(k in ident for k in cn_safe)
         if any(re.search(r"(?<![a-z])" + w + r"(?![a-z])", ident) for w in ascii_words) or cn_hit:
             return True, "该 cover 设备（" + str(entity_id) + "）名称/标识疑似门窗或车库，按高风险处理"
     return False, None
@@ -158,6 +161,15 @@ def _consume_confirm_token(token: Optional[str], expected_intent: Optional[str] 
     if expected_intent is not None and str(rec.get("intent")) != str(expected_intent):
         return
     _CONFIRM_TOKENS.pop(tok, None)
+
+
+def _confirm_token_exists(token: Optional[str]) -> bool:
+    """仅供内部加锁前判断：令牌是否存在且未过期。"""
+    tok = (token or "").strip()
+    if not tok:
+        return False
+    _prune_confirm_tokens()
+    return tok in _CONFIRM_TOKENS
 
 
 def _danger_block(st: dict, service_domain: str, service: str,
