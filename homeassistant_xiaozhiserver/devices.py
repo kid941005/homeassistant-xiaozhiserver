@@ -1010,7 +1010,8 @@ class DeviceService:
                     _consume_confirm_token(late_guard.get("confirm_token"), batch_intent)
                     late_guard.pop("confirm_token", None)
                     late_guard.pop("expires_in", None)
-                    late_guard["partial"] = True
+                    late_guard["status"] = "partial"
+                    late_guard["partial"] = late_guard["status"] == "partial"
                     late_guard["executed_entities"] = executed
                     late_guard["results"] = per
                     if errors:

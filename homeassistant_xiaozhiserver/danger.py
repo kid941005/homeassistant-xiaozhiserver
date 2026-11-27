@@ -132,17 +132,37 @@ def _danger_info(entity_id: str, attributes: Optional[dict]) -> dict:
 _CONFIRM_TOKENS: dict = {}
 # 单用户场景下正常不会堆积；加硬上限防止异常循环不断申请令牌导致内存增长。
 _MAX_CONFIRM_TOKENS = 512
+# 已过期/被清理令牌的短期墓碑：让入口校验返回“已过期”而不是“无效”，
+# 同时有界且带 TTL，避免被任意伪造令牌撑大内存。
+_EXPIRED_CONFIRM_TOKENS: dict = {}
+_MAX_EXPIRED_CONFIRM_TOKENS = 512
+_EXPIRED_TOMBSTONE_TTL = 600.0
+
+
+def _remember_expired_token(token: str) -> None:
+    if not token:
+        return
+    now = time.monotonic()
+    _EXPIRED_CONFIRM_TOKENS[token] = now + _EXPIRED_TOMBSTONE_TTL
+    overflow = len(_EXPIRED_CONFIRM_TOKENS) - _MAX_EXPIRED_CONFIRM_TOKENS
+    if overflow > 0:
+        oldest = sorted(_EXPIRED_CONFIRM_TOKENS, key=lambda k: float(_EXPIRED_CONFIRM_TOKENS[k]))
+        for tok in oldest[:overflow]:
+            _EXPIRED_CONFIRM_TOKENS.pop(tok, None)
 
 
 def _prune_confirm_tokens() -> None:
     now = time.monotonic()
     for token in [k for k, v in _CONFIRM_TOKENS.items() if float(v.get("expires_at", 0)) <= now]:
         _CONFIRM_TOKENS.pop(token, None)
+        _remember_expired_token(token)
     overflow = len(_CONFIRM_TOKENS) - _MAX_CONFIRM_TOKENS
     if overflow > 0:
         oldest = sorted(_CONFIRM_TOKENS, key=lambda k: float(_CONFIRM_TOKENS[k].get("expires_at", 0)))
         for token in oldest[:overflow]:
             _CONFIRM_TOKENS.pop(token, None)
+    for token in [k for k, v in _EXPIRED_CONFIRM_TOKENS.items() if float(v) <= now]:
+        _EXPIRED_CONFIRM_TOKENS.pop(token, None)
 
 
 _TARGET_LIST_KEYS = frozenset({
@@ -257,11 +277,18 @@ def _danger_block(st: dict, service_domain: str, service: str,
                            "令牌 " + str(ttl) + " 秒内有效且仅可使用一次。"}
     rec = _CONFIRM_TOKENS.get(token)
     if rec is None:
+        if token in _EXPIRED_CONFIRM_TOKENS:
+            new_token = _issue_confirm_token(eid, intent_sd, intent_svc, payload)
+            log.warning("danger confirmation rejected entity=%s service=%s code=confirm_token_expired", eid, svc_str)
+            return {**base, "code": "confirm_token_expired", "confirm_token": new_token,
+                    "expires_in": ttl,
+                    "message": "确认令牌已过期。已生成新的 confirm_token；请让用户确认后重新调用。"}
         log.warning("danger confirmation rejected entity=%s service=%s code=invalid_confirm_token", eid, svc_str)
         return {**base, "code": "invalid_confirm_token",
                 "message": "确认令牌无效或已使用。请重新发起原操作获取新的 confirm_token，并在用户确认后使用。"}
     if float(rec.get("expires_at", 0)) <= time.monotonic():
         _CONFIRM_TOKENS.pop(token, None)
+        _remember_expired_token(token)
         new_token = _issue_confirm_token(eid, intent_sd, intent_svc, payload)
         log.warning("danger confirmation rejected entity=%s service=%s code=confirm_token_expired", eid, svc_str)
         return {**base, "code": "confirm_token_expired", "confirm_token": new_token,

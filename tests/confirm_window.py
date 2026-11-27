@@ -611,6 +611,8 @@ async def run() -> None:
           "部分结果列出已下发目标")
     check(not partial_out.get("confirm_token"),
           "late-danger 有已执行目标时不得返回可授权整批的令牌")
+    check(partial_out.get("status") == "partial" and partial_out.get("partial") is True,
+          "late-danger 部分结果 status=partial 与 partial=True 同源")
     with patch.object(devices_module, "_resolve_entity_or_error", new=_fake_resolve_any):
         retried_partial = await partial_service.control_devices(["cover.a", "cover.b"], "open")
     check(retried_partial.get("code") == "confirmation_required",
@@ -769,6 +771,16 @@ async def run() -> None:
         "cover", "open_cover", {"entity_id": "cover.x"}, expired_token)
     check(bool(expired_guard) and expired_guard.get("code") == "confirm_token_expired",
           "过期令牌返回 confirm_token_expired 而非 invalid_confirm_token")
+    pruned_token = danger_module._issue_confirm_token(
+        "cover.x", "cover", "open_cover", {"entity_id": "cover.x"})
+    danger_module._CONFIRM_TOKENS[pruned_token]["expires_at"] = time.monotonic() - 1
+    danger_module._issue_confirm_token(
+        "cover.y", "cover", "open_cover", {"entity_id": "cover.y"})
+    pruned_guard = danger_module._danger_block(
+        {"entity_id": "cover.x", "attributes": {"device_class": "garage"}},
+        "cover", "open_cover", {"entity_id": "cover.x"}, pruned_token)
+    check(bool(pruned_guard) and pruned_guard.get("code") == "confirm_token_expired",
+          "被 prune 清理的过期令牌仍返回 expired 契约而非 invalid_confirm_token")
     print("CONFIRM WINDOW OK")
 
 

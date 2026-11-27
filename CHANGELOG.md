@@ -8,6 +8,16 @@
 
 暂无计划中的变更。
 
+## [1.15.16] - 2026-11-27
+
+### 修复
+- 批量 late-danger 部分执行分支补齐 `status=partial`，并由 status 派生布尔 `partial`，避免返回 `status=None` 而 `partial=True` 的矛盾。
+- 过期确认令牌若先被 `_prune_confirm_tokens` 清理，再提交旧令牌时仍返回 `confirm_token_expired`（有界、带 TTL 的过期令牌墓碑），不再误报 `invalid_confirm_token`。
+
+### 测试
+- 新增 late-danger 部分结果 `status=partial`/`partial=True` 同源断言。
+- 新增被 prune 清理的过期令牌仍返回 expired 契约回归。
+
 ## [1.15.15] - 2026-11-27
 
 ### 修复
