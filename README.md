@@ -2,7 +2,7 @@
 
 > 把 **Home Assistant** 的实体与服务封装成标准 **MCP（Model Context Protocol）** 工具，供 **小智（xiaozhi-server）** 通过 **MCP 接入点** 用自然语言查询和控制智能家居设备。
 
-**当前版本：v1.15.14** · Python 3.12 · 传输方式：**stdio MCP server + WebSocket bridge** · 单容器部署（MCP bridge + WebUI）
+**当前版本：v1.15.15** · Python 3.12 · 传输方式：**stdio MCP server + WebSocket bridge** · 单容器部署（MCP bridge + WebUI）
 
 ---
 
@@ -213,8 +213,8 @@ docker compose logs -f homeassistant-xiaozhiserver
 看到以下日志表示 bridge 已连上小智：
 
 ```text
-2026-01-01 12:00:00.123 INFO    v1.15.14 MCP_PIPE [-] MCP接入点连接成功
-2026-01-01 12:00:00.456 INFO    v1.15.14 MCP_PIPE [-] 已启动 MCP server：...
+2026-01-01 12:00:00.123 INFO    v1.15.15 MCP_PIPE [-] MCP接入点连接成功
+2026-01-01 12:00:00.456 INFO    v1.15.15 MCP_PIPE [-] 已启动 MCP server：...
 ```
 
 WebUI 地址：`http://<宿主机IP>:8099/`（端口由 `WEBUI_PORT` 决定），首次打开会跳转登录页，输入 `.env` 的 `WEBUI_TOKEN` 后才能进入。compose 使用 `network_mode: host`，因此没有 `ports` 映射；如需只允许本机访问，把 `.env` 的 `WEBUI_HOST` 设为 `127.0.0.1`。
@@ -759,6 +759,7 @@ bash tests/run_local_test.sh
 
 | 版本 | 主要变化 |
 |---|---|
+| v1.15.15 | 第七轮复核补丁：英文安全词支持复数与空格写法（Window Blinds/Curtains/Shades/Screens、Door Bell 不误判），混合强危险词仍判危 |
 | v1.15.14 | 第六轮复核补丁：英文安全名称识别覆盖 entity_id-only（window_blind 等不再误判，含 garage/door 仍判危）；单设备解析非 HAError 统一 state_unavailable/not_sent |
 | v1.15.13 | 第六轮对抗复核修复：英文安全名称 window blind/curtain/shade/screen 不再误判危险，同时 window blind garage/window door curtain 仍判危；批量部分下发时 partial 布尔与 status 同源，避免 status=partial 而 partial=false 矛盾 |
 | v1.15.12 | 第五轮对抗复核修复：单设备 control_device/call_service 在 POST 已发出后返回 invalid_response 或其他异常统一标记 accepted_pending/pending_confirmation/may_be_dispatched 并消费令牌；危险安全词不再整体否决混合名称（百叶窗式车库门/纱窗门/门磁式车库门仍判危）；批量解析非 HAError 错误项补 status=not_sent，顶层按是否实际下发区分 partial/not_sent；阶段一刷新后参数校验失败补 status=not_sent；过期令牌统一返回 confirm_token_expired |

@@ -389,6 +389,10 @@ async def run() -> None:
     for en_bad_id in ("cover.window_blind_garage", "cover.window_door_curtain"):
         check(_danger_flags(en_bad_id, {})[0],
               "仅 entity_id 的混合强危险词仍判危：" + en_bad_id)
+    for en_plural in ("Window Blinds", "Window Curtains", "Window Shades",
+                      "Window Screens", "Door Bell", "Window Blind Door Bell"):
+        check(not _danger_flags("cover.x", {"friendly_name": en_plural})[0],
+              "英文复数/空格安全写法不误判：" + en_plural)
     ha = SlowHA()
     st = {"entity_id": "light.slow", "state": "off", "attributes": {}}
     result = await _apply_and_confirm(

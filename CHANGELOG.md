@@ -8,6 +8,14 @@
 
 暂无计划中的变更。
 
+## [1.15.15] - 2026-11-27
+
+### 修复
+- 危险 cover 英文安全词支持复数与空格/下划线写法：`Window Blinds`、`Window Curtains`、`Window Shades`、`Window Screens`、`Door Bell` 不再误判；`window blind garage`、`window door curtain` 仍判高风险。
+
+### 测试
+- 新增英文复数与空格安全写法（含 `Window Blind Door Bell`）不误判回归。
+
 ## [1.15.14] - 2026-11-27
 
 ### 修复

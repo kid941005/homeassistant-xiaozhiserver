@@ -45,7 +45,6 @@ def _danger_flags(entity_id: str, attributes: Optional[dict]) -> tuple:
         cn_hot = ("道闸", "闸机", "起落杆", "闸杆", "卷闸")
         # 百叶窗/纱窗/窗帘等英文 entity_id 常含 window，安全词必须同时作用于英文分支，
         # 否则 friendly_name=百叶窗 但 entity_id=cover.living_room_window 仍会误报。
-        ascii_safe = ("doorbell", "door_bell", "curtain", "blind", "shade")
         name = str(attrs.get("friendly_name") or "").lower()
         id_text = str(entity_id or "").lower()
 
@@ -56,18 +55,26 @@ def _danger_flags(entity_id: str, attributes: Optional[dict]) -> tuple:
             # 安全词只能从名称中“扣除自己”，不能整体否决剩余危险词。
             for word in cn_safe:
                 text = text.replace(word, "")
-            for word in ascii_safe:
+            # door bell / door_bell / doorbell 等空格或下划线写法统一按安全词处理。
+            text = re.sub(r"(?<![a-z])door[\s_-]*bell(?:s)?(?![a-z])", "", text)
+            for word in ("curtain", "blind", "shade"):
+                text = re.sub(r"(?<![a-z])" + word + r"s?(?![a-z])", "", text)
+            for word in ("doorbell", "door_bell"):
                 text = re.sub(r"(?<![a-z])" + word + r"(?![a-z])", "", text)
             if _ascii_word(text, "screen") and not _ascii_word(text, "door"):
-                text = re.sub(r"(?<![a-z])screen(?![a-z])", "", text)
+                text = re.sub(r"(?<![a-z])screens?(?![a-z])", "", text)
             return text
 
         # 安全词可能只出现在 entity_id（如 cover.window_blind），不能只看 friendly_name。
+        # 英文做空格/下划线/连字符归一化后再按子串识别，兼容 blinds/curtains/shades/screens 与 door bell。
         combined = name + " " + id_text
-        typed_safe = bool(combined) and (
-            any(word in combined for word in cn_safe)
-            or any(_ascii_word(combined, word) for word in ascii_safe)
-            or (_ascii_word(combined, "screen") and not _ascii_word(combined, "door")))
+        flat = re.sub(r"[ _-]+", "", combined)
+        typed_safe = ("doorbell" in flat
+                      or "curtain" in flat
+                      or "blind" in flat
+                      or "shade" in flat
+                      or ("screen" in flat and "door" not in flat)
+                      or any(word in combined for word in cn_safe))
         # friendly_name 已明确是窗帘/纱窗时，entity_id 里泛化的 window 不再单独判危；
         # 但 garage/gate/door 等强危险词仍保留，避免“百叶窗式车库门”被整体放行。
         if typed_safe and not any(_ascii_word(id_text, word)
