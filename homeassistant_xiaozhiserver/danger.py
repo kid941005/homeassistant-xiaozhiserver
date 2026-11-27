@@ -62,10 +62,12 @@ def _danger_flags(entity_id: str, attributes: Optional[dict]) -> tuple:
                 text = re.sub(r"(?<![a-z])screen(?![a-z])", "", text)
             return text
 
-        typed_safe = bool(name) and (
-            any(word in name for word in cn_safe)
-            or any(_ascii_word(name, word) for word in ascii_safe)
-            or (_ascii_word(name, "screen") and not _ascii_word(name, "door")))
+        # 安全词可能只出现在 entity_id（如 cover.window_blind），不能只看 friendly_name。
+        combined = name + " " + id_text
+        typed_safe = bool(combined) and (
+            any(word in combined for word in cn_safe)
+            or any(_ascii_word(combined, word) for word in ascii_safe)
+            or (_ascii_word(combined, "screen") and not _ascii_word(combined, "door")))
         # friendly_name 已明确是窗帘/纱窗时，entity_id 里泛化的 window 不再单独判危；
         # 但 garage/gate/door 等强危险词仍保留，避免“百叶窗式车库门”被整体放行。
         if typed_safe and not any(_ascii_word(id_text, word)

@@ -8,6 +8,15 @@
 
 暂无计划中的变更。
 
+## [1.15.14] - 2026-11-27
+
+### 修复
+- 危险 cover 安全词识别改为基于 `friendly_name + entity_id` 合并文本：仅 entity_id 含 `window_blind`/`window_curtain`/`window_shade`/`window_screen` 时也不再误判；`window_blind_garage`、`window_door_curtain` 仍判高风险。
+- 单设备 `control_device` / `call_service` 的实体解析抛出非 `HAError`（如 `RuntimeError`）时统一返回 `status=not_sent`、`code=state_unavailable`，不再误报 `internal_error`。
+
+### 测试
+- 新增仅 entity_id 的英文安全名称不误判、仅 entity_id 的混合强危险词仍判危，以及单设备解析非 `HAError` 映射 `state_unavailable/not_sent` 回归。
+
 ## [1.15.13] - 2026-11-27
 
 ### 修复

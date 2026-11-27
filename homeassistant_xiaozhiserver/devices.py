@@ -554,7 +554,15 @@ class DeviceService:
             await token_lock.acquire()
         try:
             ha = self._ha_provider()
-            st, error = await _resolve_entity_or_error(ha, entity, "控制")
+            try:
+                st, error = await _resolve_entity_or_error(ha, entity, "控制")
+            except asyncio.CancelledError:
+                raise
+            except HAError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                return {"ok": False, "status": "not_sent", "code": "state_unavailable",
+                        "message": "读取设备状态失败：" + str(exc)}
             if error is not None:
                 return error
             eid = str(st.get("entity_id"))
@@ -1213,7 +1221,15 @@ class DeviceService:
             await token_lock.acquire()
         try:
             ha = self._ha_provider()
-            st, error = await _resolve_entity_or_error(ha, entity, "调用服务")
+            try:
+                st, error = await _resolve_entity_or_error(ha, entity, "调用服务")
+            except asyncio.CancelledError:
+                raise
+            except HAError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                return {"ok": False, "status": "not_sent", "code": "state_unavailable",
+                        "message": "读取设备状态失败：" + str(exc)}
             if error is not None:
                 return error
             eid = str(st.get("entity_id"))

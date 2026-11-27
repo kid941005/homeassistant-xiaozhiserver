@@ -382,6 +382,13 @@ async def run() -> None:
     for en_mix in ("window blind garage", "window door curtain"):
         check(_danger_flags("cover.x", {"friendly_name": en_mix})[0],
               "英文安全名称仍保留强危险词：" + en_mix)
+    for en_id in ("cover.window_blind", "cover.window_curtain",
+                  "cover.window_shade", "cover.window_screen"):
+        check(not _danger_flags(en_id, {})[0],
+              "仅 entity_id 的英文安全名称不误判：" + en_id)
+    for en_bad_id in ("cover.window_blind_garage", "cover.window_door_curtain"):
+        check(_danger_flags(en_bad_id, {})[0],
+              "仅 entity_id 的混合强危险词仍判危：" + en_bad_id)
     ha = SlowHA()
     st = {"entity_id": "light.slow", "state": "off", "attributes": {}}
     result = await _apply_and_confirm(
@@ -737,6 +744,19 @@ async def run() -> None:
           "混合解析错误 + 已下发待确认时顶层 status=partial")
     check(mixed_pending_out.get("partial") is True,
           "混合解析错误 + 已下发待确认时 partial 布尔与 status 一致")
+
+    async def _resolve_raise(*args, **kwargs):
+        raise RuntimeError("模拟解析崩溃")
+
+    with patch.object(devices_module, "_resolve_entity_or_error", new=_resolve_raise):
+        cd_resolve_err = await mixed_pending_service.control_device("cover.x", "turn_on")
+        cs_resolve_err = await mixed_pending_service.call_service("cover.x", "cover.turn_on")
+    check(cd_resolve_err.get("code") == "state_unavailable"
+          and cd_resolve_err.get("status") == "not_sent",
+          "control_device 实体解析非 HAError 映射 state_unavailable/not_sent")
+    check(cs_resolve_err.get("code") == "state_unavailable"
+          and cs_resolve_err.get("status") == "not_sent",
+          "call_service 实体解析非 HAError 映射 state_unavailable/not_sent")
     expired_token = danger_module._issue_confirm_token(
         "cover.x", "cover", "open_cover", {"entity_id": "cover.x"})
     danger_module._CONFIRM_TOKENS[expired_token]["expires_at"] = time.monotonic() - 1
