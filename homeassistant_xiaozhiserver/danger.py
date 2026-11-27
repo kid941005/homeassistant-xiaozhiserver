@@ -33,6 +33,11 @@ def _danger_flags(entity_id: str, attributes: Optional[dict]) -> tuple:
         dc = str(attrs.get("device_class") or "").strip().lower()
         if dc in DANGEROUS_COVER_CLASSES:
             return True, "该 cover 设备类型（" + dc + "）属于高风险（门窗/车库等）"
+        # 很多集成不填 device_class，只能靠实体 id / 名称兜底识别车库门/大门/窗。
+        ident = (str(entity_id or "") + " " + str(attrs.get("friendly_name") or "")).lower()
+        keywords = ("garage", "gate", "window", "door", "车库", "大门", "窗户")
+        if any(k in ident for k in keywords):
+            return True, "该 cover 设备（" + str(entity_id) + "）名称/标识疑似门窗或车库，按高风险处理"
     return False, None
 
 

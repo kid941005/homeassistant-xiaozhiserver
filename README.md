@@ -2,7 +2,7 @@
 
 > 把 **Home Assistant** 的实体与服务封装成标准 **MCP（Model Context Protocol）** 工具，供 **小智（xiaozhi-server）** 通过 **MCP 接入点** 用自然语言查询和控制智能家居设备。
 
-**当前版本：v1.15.4** · Python 3.12 · 传输方式：**stdio MCP server + WebSocket bridge** · 单容器部署（MCP bridge + WebUI）
+**当前版本：v1.15.5** · Python 3.12 · 传输方式：**stdio MCP server + WebSocket bridge** · 单容器部署（MCP bridge + WebUI）
 
 ---
 
@@ -213,8 +213,8 @@ docker compose logs -f homeassistant-xiaozhiserver
 看到以下日志表示 bridge 已连上小智：
 
 ```text
-2026-01-01 12:00:00.123 INFO    v1.15.4 MCP_PIPE [-] MCP接入点连接成功
-2026-01-01 12:00:00.456 INFO    v1.15.4 MCP_PIPE [-] 已启动 MCP server：...
+2026-01-01 12:00:00.123 INFO    v1.15.5 MCP_PIPE [-] MCP接入点连接成功
+2026-01-01 12:00:00.456 INFO    v1.15.5 MCP_PIPE [-] 已启动 MCP server：...
 ```
 
 WebUI 地址：`http://<宿主机IP>:8099/`（端口由 `WEBUI_PORT` 决定），首次打开会跳转登录页，输入 `.env` 的 `WEBUI_TOKEN` 后才能进入。compose 使用 `network_mode: host`，因此没有 `ports` 映射；如需只允许本机访问，把 `.env` 的 `WEBUI_HOST` 设为 `127.0.0.1`。
@@ -759,6 +759,7 @@ bash tests/run_local_test.sh
 
 | 版本 | 主要变化 |
 |---|---|
+| v1.15.5 | 安全与一致性加固：WebUI 危险闸门识别 `call_service` 的 scene/homeassistant 目标、登录来源并发原子限速、非 ASCII 令牌比较不再 500；状态缓存按实体时间戳判新鲜度并在服务调用后强制失效回源，`resolve_entity` 对不存在实体不回退名称匹配；并发控制先强制读取初始状态，回读增加硬截止；能力位修正 fan/vacuum/climate，cover 慢速过渡按 `accepted_pending`；注册表不可用与重复开关读取失败均失败关闭，批量单条 HAError 隔离并保留错误码；温度单位保护、数值边界与 RGB 整数校验；危险 cover 支持名称关键词兜底；消除工具指标双计数；CI 拆分 PR/发布权限、固定 Actions SHA |
 | v1.15.4 | 登录失败来源表上限修正：新增来源后立即再次裁剪，保证来源表严格不超过上限，并补回归测试 |
 | v1.15.3 | 性能与边界加固：批量控制复用预加载状态，`resolve_entity` 命中预加载实体不再逐条 REST；事件流缓存按实体时间戳判断新鲜度，控制后强制回读回源；`/metrics` 改为需登录或 Bearer 令牌，CSP 由 `unsafe-inline` 收紧为 nonce；登录失败来源表设上限并清理；指标落盘改为节流并主动清理过期快照；日志尾部读取按文件元信息缓存；`supported_color_modes=[]` 不再暴露颜色动作，`vacuum` 按能力位过滤；信号处理改为正常取消以执行 bridge 清理；批量超时文档区分 `not_sent` 与 `accepted_pending` |
 | v1.15.2 | 指标、危险闸门与部署加固：`/metrics` 合并 MCP server 子进程指标；WebUI 危险闸门按 `control_device` 动作映射实际服务并识别 scene/script；登录失败 5 次/5 分钟限速、会话上限、HTTPS Cookie Secure；`/readyz` 成为容器健康检查依据；批量超时区分未下发 `not_sent`/`batch_timeout` 与已下发待确认；确认令牌意图不再受列表顺序影响；状态判定修正 bool 属性缺失、cover/valve 预期与 `accepted`；注册表不可用时危险设备检查失败关闭；compose 增加资源限制与 `/tmp` 大小限制；PR 构建镜像 |

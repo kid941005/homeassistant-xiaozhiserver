@@ -29,6 +29,7 @@ import logging
 import os
 import re
 import secrets
+import threading
 import time
 from typing import Any
 from urllib.parse import parse_qs, parse_qsl, urlsplit, urlunsplit
@@ -83,10 +84,18 @@ _LOGIN_FAILURES: dict[str, list[float]] = {}
 _LOGIN_MAX_FAILURES = 5
 _LOGIN_WINDOW = 300.0
 _MAX_LOGIN_SOURCES = 1024
+_MAX_BATCH_ENTITIES = 20
+_LOGIN_LOCK = threading.Lock()
 
 
 def _token_ok(raw: str) -> bool:
-    return bool(WEBUI_TOKEN) and hmac.compare_digest(str(raw or ""), WEBUI_TOKEN)
+    # 统一编码成 UTF-8 字节再比较，避免非 ASCII 输入让 hmac.compare_digest 抛 TypeError。
+    if not WEBUI_TOKEN:
+        return False
+    try:
+        return hmac.compare_digest(str(raw or "").encode("utf-8"), WEBUI_TOKEN.encode("utf-8"))
+    except (UnicodeError, AttributeError, TypeError):
+        return False
 
 
 def _bearer_ok(header: str) -> bool:
@@ -101,7 +110,7 @@ def _new_session() -> str:
     for stale in [key for key, expiry in _SESSIONS.items() if expiry < now]:
         _SESSIONS.pop(stale, None)
     # 上限保护：异常登录刷量时淘汰最早过期的会话，避免内存无界增长。
-    overflow = len(_SESSIONS) - _MAX_SESSIONS
+    overflow = len(_SESSIONS) - _MAX_SESSIONS + 1
     if overflow > 0:
         for stale in sorted(_SESSIONS, key=lambda key: _SESSIONS[key])[:overflow]:
             _SESSIONS.pop(stale, None)
@@ -149,31 +158,32 @@ def _prune_login_failures(now: float) -> None:
 
 
 def _login_guard(ip: str) -> int:
-    """返回需要等待的秒数；0 表示允许尝试。"""
+    """原子地预留一次登录尝试；返回需要等待的秒数，0 表示本次已计入并允许继续。"""
     now = time.time()
-    _prune_login_failures(now)
-    recent = [ts for ts in _LOGIN_FAILURES.get(ip, []) if now - ts < _LOGIN_WINDOW]
-    if recent:
+    with _LOGIN_LOCK:
+        _prune_login_failures(now)
+        recent = _LOGIN_FAILURES.get(ip, [])
+        if len(recent) >= _LOGIN_MAX_FAILURES:
+            return max(1, int(_LOGIN_WINDOW - (now - recent[0])))
+        recent.append(now)
         _LOGIN_FAILURES[ip] = recent
-    else:
-        _LOGIN_FAILURES.pop(ip, None)
-    if len(recent) >= _LOGIN_MAX_FAILURES:
-        return max(1, int(_LOGIN_WINDOW - (now - recent[0])))
+        _prune_login_failures(now)
     return 0
 
 
 def _record_login_failure(ip: str) -> None:
+    """记录一次失败（兼容旧调用与测试）；生产登录路径已由 _login_guard 原子预留。"""
     now = time.time()
-    _prune_login_failures(now)
-    recent = [ts for ts in _LOGIN_FAILURES.get(ip, []) if now - ts < _LOGIN_WINDOW]
-    recent.append(now)
-    _LOGIN_FAILURES[ip] = recent
-    # 单次新增后再次裁剪，保证来源表严格不超过 _MAX_LOGIN_SOURCES。
-    _prune_login_failures(now)
+    with _LOGIN_LOCK:
+        recent = [ts for ts in _LOGIN_FAILURES.get(ip, []) if now - ts < _LOGIN_WINDOW]
+        recent.append(now)
+        _LOGIN_FAILURES[ip] = recent
+        _prune_login_failures(now)
 
 
 def _clear_login_failures(ip: str) -> None:
-    _LOGIN_FAILURES.pop(ip, None)
+    with _LOGIN_LOCK:
+        _LOGIN_FAILURES.pop(ip, None)
 
 
 def _request_proto(request: Request) -> str:
@@ -742,7 +752,6 @@ def create_app() -> FastAPI:
             return HTMLResponse(_login_html(message, nonce), status_code=form_status)
         token = str((form.get("token") or [""])[0])
         if not _token_ok(token):
-            _record_login_failure(ip)
             log.warning("webui login failed ip=%s", ip)
             return HTMLResponse(_login_html("访问令牌不正确，请重试。", nonce), status_code=401)
         _clear_login_failures(ip)
@@ -847,6 +856,17 @@ def create_app() -> FastAPI:
         result, status = await _execute_tool(name, payload)
         return JSONResponse(result, status_code=status)
 
+    def _dangerous_service_reason(service_domain: str, service_value: str,
+                                  target_domain: str = "") -> str:
+        """返回 WebUI 需要拦截的服务原因；空字符串表示非高风险。"""
+        if service_domain == "scene" and service_value in ("turn_on", "toggle"):
+            return "可能包含门锁等高风险动作的场景"
+        if (service_domain == "homeassistant" and service_value in ("turn_on", "toggle")
+                and target_domain == "scene"):
+            return "通过 homeassistant 控制场景，可能包含门锁等高风险动作"
+        dangerous, reason = service_is_dangerous(service_domain, service_value)
+        return reason if dangerous else ""
+
     async def _webui_danger_block(name: str, params: dict) -> dict | None:
         """WebUI 侧独立的高风险闸门，不依赖 DANGER_CONFIRM_ENABLED，也不接受确认令牌。"""
         if str(params.get("confirm_token") or "").strip():
@@ -857,8 +877,8 @@ def create_app() -> FastAPI:
         explicit_domain = ""
         if "." in service_raw:
             explicit_domain, service_name = service_raw.split(".", 1)
-            dangerous, reason = service_is_dangerous(explicit_domain, service_name)
-            if dangerous:
+            reason = _dangerous_service_reason(explicit_domain, service_name)
+            if reason:
                 return {"ok": False, "code": "dangerous_operation_blocked",
                         "message": "WebUI 不执行高风险服务（" + reason + "）；请通过小智语音确认后再操作。"}
         candidates: list[str] = []
@@ -868,6 +888,19 @@ def create_app() -> FastAPI:
         raw_entities = params.get("entities")
         if isinstance(raw_entities, list):
             candidates.extend(str(x).strip() for x in raw_entities if str(x).strip())
+        # call_service 允许把目标放在 data.entity_id/entities，同样必须纳入安全检查。
+        if name == "call_service" and isinstance(params.get("data"), dict):
+            data = params["data"]
+            data_entity = str(data.get("entity_id") or "").strip()
+            if data_entity:
+                candidates.append(data_entity)
+            data_entities = data.get("entities")
+            if isinstance(data_entities, list):
+                candidates.extend(str(x).strip() for x in data_entities if str(x).strip())
+        candidates = list(dict.fromkeys(candidates))
+        if len(candidates) > _MAX_BATCH_ENTITIES:
+            return {"ok": False, "code": "too_many_entities",
+                    "message": "批量控制最多支持 " + str(_MAX_BATCH_ENTITIES) + " 个实体。"}
 
         async def _check_one(ref: str) -> dict | None:
             # 安全判定必须失败关闭：HA 抖动、实体不存在或返回结构异常时都不能当作“非危险”。
@@ -893,6 +926,13 @@ def create_app() -> FastAPI:
             if not domain:
                 eid = str(view.get("entity_id") or "")
                 domain = eid.split(".", 1)[0] if "." in eid else ""
+            if name == "call_service" and service_name and domain:
+                # call_service 的 service 可能只写裸服务名或 homeassistant.*，必须结合目标实体域判断。
+                target_domain = explicit_domain or domain
+                reason = _dangerous_service_reason(target_domain, service_name, domain)
+                if reason:
+                    return {"ok": False, "code": "dangerous_operation_blocked",
+                            "message": "WebUI 不执行高风险服务（" + reason + "）；请通过小智语音确认后再操作。"}
             action_raw = str(params.get("action") or "").strip().lower()
             if action_raw and name in ("control_device", "control_devices") and domain:
                 # control_device/control_devices 只传 action，必须映射成实际服务后再判定。
@@ -902,17 +942,14 @@ def create_app() -> FastAPI:
                 except HAError:
                     service_domain, service_value = "", ""
                 if service_domain:
-                    if (service_domain, service_value) == ("scene", "turn_on"):
-                        return {"ok": False, "code": "dangerous_operation_blocked",
-                                "message": "WebUI 不执行可能包含门锁等高风险动作的场景；请通过小智语音确认后再操作。"}
-                    dangerous, reason = service_is_dangerous(service_domain, service_value)
-                    if dangerous:
+                    reason = _dangerous_service_reason(service_domain, service_value, domain)
+                    if reason:
                         return {"ok": False, "code": "dangerous_operation_blocked",
                                 "message": "WebUI 不执行高风险服务（" + reason + "）；请通过小智语音确认后再操作。"}
             if service_name and not explicit_domain and domain:
                 # 裸服务名必须结合目标实体域判断：script/shell_command 等即使目标实体普通也高风险。
-                dangerous, reason = service_is_dangerous(domain, service_name)
-                if dangerous:
+                reason = _dangerous_service_reason(domain, service_name, domain)
+                if reason:
                     return {"ok": False, "code": "dangerous_operation_blocked",
                             "message": "WebUI 不执行高风险服务（" + reason + "）；请通过小智语音确认后再操作。"}
             return None
@@ -961,9 +998,10 @@ def create_app() -> FastAPI:
                                     "dangerous_operation_blocked")
                 return blocked, 403
         try:
+            # 注意：fn 本身已由 server._log_tool 记录一次指标（WebUI 与 MCP 同进程），
+            # 这里不能再记，否则同一调用会被计两次；仅在下发前被拦截的分支单独记。
             result = await fn(**params)
         except Exception:  # noqa: BLE001
-            metrics.record_tool(name, False, time.perf_counter() - started, "internal_error")
             log.exception("webui tool=%s failed", name)
             return {"ok": False, "code": "internal_error", "message": "工具调用失败，详见服务端日志。"}, 500
         # WebUI 使用独立登录令牌，不复用 MCP 的危险设备确认令牌，避免两次请求即可绕过确认。
@@ -972,10 +1010,6 @@ def create_app() -> FastAPI:
                                 "dangerous_operation_blocked")
             return {"ok": False, "code": "dangerous_operation_blocked",
                     "message": "WebUI 不执行危险设备操作；请通过小智语音确认后再操作。"}, 403
-        ok = not (isinstance(result, dict) and result.get("ok") is False)
-        code = str(result.get("code") or "") if isinstance(result, dict) else ""
-        metrics.record_tool(name, ok, time.perf_counter() - started,
-                            code or ("ok" if ok else "error"))
         return result, 200
 
     return app

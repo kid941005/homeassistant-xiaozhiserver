@@ -152,6 +152,9 @@ async def pipe_process_to_websocket(process, websocket, target: str) -> None:
             if not line:
                 logger.info("[%s] MCP server stdout 已结束", target)
                 return
+            if len(line) > 16 * 1024 * 1024:
+                # 单条 JSON-RPC 消息异常巨大时断开重连，避免无上限转发拖垮内存/带宽。
+                raise MCPPipeClosed("[%s] MCP server 单行输出超过 16MiB，已断开重连" % target)
             await websocket.send(line)
     except Exception as e:
         logger.error("[%s] stdio -> WebSocket 失败：%s", target, e)

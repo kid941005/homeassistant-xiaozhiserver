@@ -10,7 +10,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from homeassistant_xiaozhiserver.service import (  # noqa: E402
-    HAError, _apply_and_confirm, build_service, validate_action_attributes,
+    HAError, _apply_and_confirm, _rgb_components, build_service,
+    validate_action_attributes,
 )
 from homeassistant_xiaozhiserver.views import _filter_actions  # noqa: E402
 
@@ -75,6 +76,11 @@ def check_invalid_attributes() -> None:
          {"min_color_temp_kelvin": 2000, "max_color_temp_kelvin": 6500}, "色温超上限被拒绝"),
         ({"hvac_mode": "dry"}, {"hvac_modes": ["off", "heat", "cool"]}, "不支持的空调模式被拒绝"),
         ({"fan_mode": "turbo"}, {"fan_modes": ["low", "high"]}, "不支持的风速被拒绝"),
+        ({"brightness_pct": 1000}, {}, "亮度百分比超范围被拒绝"),
+        ({"volume_level": 2}, {}, "音量超范围被拒绝"),
+        ({"position": 999}, {}, "位置超范围被拒绝"),
+        ({"temperature": 26}, {"temperature_unit": "°F", "min_temp": 60, "max_temp": 80},
+         "华氏设备收到疑似摄氏温度被拒绝"),
     ]
     for extra, attrs, label in cases:
         try:
@@ -83,6 +89,12 @@ def check_invalid_attributes() -> None:
             check(exc.code == "invalid_value", label)
         else:
             raise AssertionError(label + "（未拒绝 " + repr(extra) + "）")
+    try:
+        _rgb_components([1.5, 2, 3])
+    except HAError as exc:
+        check(exc.code == "invalid_value", "RGB 浮点分量被拒绝")
+    else:
+        raise AssertionError("RGB 浮点分量未被拒绝")
 
 
 def check_filter_actions() -> None:
@@ -99,11 +111,11 @@ def check_filter_actions() -> None:
                                {"supported_color_modes": []})
     check(no_color == ["turn_on"], "颜色模式为空时只保留开关动作")
     basic_vacuum = _filter_actions("vacuum", ["turn_on", "turn_off", "stop", "pause", "continue", "resume"],
-                                   {"supported_features": 1})
-    check(basic_vacuum == ["turn_on"], "只支持启动的扫地机不暴露停止/暂停动作")
+                                   {"supported_features": 8192})
+    check(basic_vacuum == ["turn_on", "continue", "resume"], "只支持启动的扫地机保留启动类动作")
     full_vacuum = _filter_actions("vacuum", ["turn_on", "turn_off", "stop", "pause", "continue", "resume"],
                                   {"supported_features": 15})
-    check(full_vacuum == ["turn_on", "turn_off", "stop", "pause"], "扫地机按能力位保留动作")
+    check(full_vacuum == ["turn_off", "stop", "pause"], "扫地机按能力位保留停止/暂停动作")
 
 
 def check_invalid_number(value, action: str, label: str) -> None:

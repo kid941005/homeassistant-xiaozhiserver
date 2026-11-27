@@ -21,6 +21,8 @@ _SHARED_MAX_AGE = 24 * 3600
 _FLUSH_INTERVAL = 2.0
 _FLUSH_MAX_PENDING = 20
 _CLEANUP_INTERVAL = 3600.0
+_HTTP_METHODS = frozenset({"GET",
+    "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "CONNECT", "TRACE"})
 
 
 def _shared_dir() -> str:
@@ -79,6 +81,10 @@ class Metrics:
             self.flush()
 
     def record_http(self, method: str, path: str, status: int, elapsed: float) -> None:
+        # method 是客户端可控字符串，必须收敛到固定集合，避免 Prometheus label 基数被刷爆。
+        method = str(method or "").upper()
+        if method not in _HTTP_METHODS:
+            method = "OTHER"
         self.inc("ha_mcp_http_requests_total", {"method": method, "path": path, "status": str(status)})
         self.observe("ha_mcp_http_request_duration_seconds", elapsed, {"method": method, "path": path})
 

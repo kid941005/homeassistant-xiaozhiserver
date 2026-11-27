@@ -83,6 +83,8 @@ class HAClient:
         self._states_ts: float = 0.0
         # 每个实体最近一次状态写入时间：事件流就绪时判断缓存是否足够新鲜。
         self._state_entity_ts: dict[str, float] = {}
+        # 服务调用或全量失效后置位：即使事件流就绪，也强制下一次 get_states 回源一次。
+        self._states_stale: bool = False
         # 事件只标脏，读取时再一次性生成 list，避免每条 state_changed 都重建全量列表。
         self._states_dirty: bool = True
         self._services_cache: list[dict] | None = None
@@ -248,6 +250,7 @@ class HAClient:
         self._state_entity_ts = {eid: now for eid in self._state_entities}
         self._states_dirty = True
         self._states_ts = now
+        self._states_stale = False
 
     def _states_snapshot(self) -> list[dict]:
         """按需生成全量 list：只在事件更新/失效后重建一次。"""
@@ -260,6 +263,7 @@ class HAClient:
         """服务调用后让状态缓存失效；事件流就绪时保留内存快照，由事件增量更新。"""
         self._states_ts = 0.0
         self._states_dirty = True
+        self._states_stale = True
         if not self._state_ws_ready.is_set():
             self._states_cache = None
             self._state_entities = {}
@@ -305,7 +309,9 @@ class HAClient:
         # 先注册等待者再检查当前值：避免两步之间到达的 state_changed 丢失。
         self._state_waiters.setdefault(eid, []).append((fut, pred))
         current = self._state_entities.get(eid)
-        if isinstance(current, dict):
+        # 只接受足够新鲜的缓存：服务调用会删除目标实体时间戳，避免旧缓存直接满足回读。
+        age = time.time() - self._state_entity_ts.get(eid, 0.0)
+        if isinstance(current, dict) and age <= self.state_cache_ttl:
             try:
                 if pred(current):
                     return current
@@ -428,14 +434,14 @@ class HAClient:
     async def get_states(self, force: bool = False) -> list:
         """返回全量实体状态；事件流就绪时直接读内存，否则按短 TTL 缓存，避免重复拉全量。"""
         self._ensure_state_stream()
-        if self._state_ws_ready.is_set() and not force:
+        if self._state_ws_ready.is_set() and not force and not self._states_stale:
             return list(self._states_snapshot())
         now = time.time()
         if (not force and self._states_cache is not None
                 and now - self._states_ts < self.state_cache_ttl):
             return list(self._states_snapshot())
         async with self._states_lock:
-            if self._state_ws_ready.is_set() and not force:
+            if self._state_ws_ready.is_set() and not force and not self._states_stale:
                 return list(self._states_snapshot())
             now = time.time()
             if (not force and self._states_cache is not None
@@ -492,21 +498,26 @@ class HAClient:
         svc = str(service or "").strip()
         if not _SERVICE_NAME_RE.match(dom) or not _SERVICE_NAME_RE.match(svc):
             raise HAError("invalid_service", "服务名格式不合法：" + dom + "." + svc + "。只允许小写字母、数字与下划线。")
-        result = await self._request("POST", "/api/services/" + dom + "/" + svc, json=data)
-        if result is not None and not isinstance(result, (dict, list)):
-            raise HAError("invalid_response", "Home Assistant 返回的服务调用结果不是 JSON 对象/数组。")
-        # 目标实体的缓存立即视为过期，回读必须回源，避免刚下发就返回旧状态。
-        if isinstance(data, dict):
-            for key in ("entity_id", "entities"):
-                targets = data.get(key)
-                if isinstance(targets, str):
-                    self._state_entity_ts.pop(targets, None)
-                elif isinstance(targets, list):
-                    for target in targets:
-                        if isinstance(target, str):
-                            self._state_entity_ts.pop(target, None)
-        self.invalidate_states()
-        return result
+        # 无论 POST 是否成功，都先让目标实体缓存失效：HA 可能已执行但响应超时/断开，
+        # 继续读旧状态会造成“已执行却显示旧值”甚至 toggle 重试反跳。
+        try:
+            result = await self._request("POST", "/api/services/" + dom + "/" + svc, json=data)
+            if result is not None and not isinstance(result, (dict, list)):
+                raise HAError("invalid_response", "Home Assistant 返回的服务调用结果不是 JSON 对象/数组。")
+            return result
+        finally:
+            if isinstance(data, dict):
+                for key in ("entity_id", "entities"):
+                    targets = data.get(key)
+                    if isinstance(targets, str):
+                        self._state_entity_ts.pop(targets, None)
+                        self._state_entities.pop(targets, None)
+                    elif isinstance(targets, list):
+                        for target in targets:
+                            if isinstance(target, str):
+                                self._state_entity_ts.pop(target, None)
+                                self._state_entities.pop(target, None)
+            self.invalidate_states()
 
     async def ping(self) -> bool:
         await self._request("GET", "/api/")
@@ -646,9 +657,18 @@ class HAClient:
                 for state in states:
                     if isinstance(state, dict) and str(state.get("entity_id") or "") == ref:
                         return state, [], states
-            st = await self.get_state(ref)
+            try:
+                st = await self.get_state(ref)
+            except HAError as exc:
+                if exc.code == "not_found":
+                    st = None
+                else:
+                    raise
             if st is not None:
                 return st, [], states if states is not None else None
+            # 合法 entity_id 但不存在时立即返回 not_found，绝不回退到名称模糊匹配，
+            # 否则可能误控 friendly_name 恰好等于该字符串的另一台设备。
+            return None, [], states if states is not None else None
         if states is None:
             states = await self.get_states()
         low = ref.lower()

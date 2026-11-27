@@ -151,8 +151,9 @@ async def _redundant_switch_context(ha: HAClient, states: Optional[list] = None,
     if states is None:
         try:
             states = await ha.get_states()
-        except HAError:
-            return {}, []
+        except HAError as exc:
+            # 读不到全量状态就无法计算重复开关映射；失败关闭，避免误放行重复开关。
+            raise HAError("state_unavailable", "暂时无法读取设备状态，无法校验重复开关，已拒绝执行。") from exc
     if not registry_loaded:
         try:
             reg = await ha.get_registries()
@@ -336,6 +337,9 @@ class DeviceService:
             if isinstance(reg, asyncio.CancelledError):
                 raise reg
             if isinstance(reg, BaseException):
+                if EXCLUDED_DEVICE_KEYWORDS:
+                    return {"ok": False, "code": "registry_unavailable",
+                            "message": "无法读取设备注册表，无法校验设备名排除规则，为避免泄露隐藏设备已拒绝返回列表。请稍后重试或关闭 EXCLUDED_DEVICE_KEYWORDS。"}
                 reg = None
             if area and reg is None:
                 return {"ok": False, "code": "registry_unavailable",
@@ -443,6 +447,9 @@ class DeviceService:
             try:
                 reg = await ha.get_registries()
             except HAError:
+                if EXCLUDED_DEVICE_KEYWORDS:
+                    return {"ok": False, "code": "registry_unavailable",
+                            "message": "无法读取设备注册表，无法确认该设备是否在开放范围内，已拒绝查询。"}
                 reg = None
             devices_map, ents_map, areas_map = _registry_maps(reg)
             s = _entity_view(st, devices_map, ents_map, areas_map)
@@ -599,9 +606,14 @@ class DeviceService:
             except HAError:
                 batch_hidden = None
             for ref in refs:
-                st, error = await _resolve_entity_or_error(
-                    ha, ref, "控制", batch_states, batch_hidden,
-                    batch_maps, batch_registry_error, batch_registry_loaded)
+                try:
+                    st, error = await _resolve_entity_or_error(
+                        ha, ref, "控制", batch_states, batch_hidden,
+                        batch_maps, batch_registry_error, batch_registry_loaded)
+                except HAError as exc:
+                    errors.append({"entity": ref, "entity_id": ref, "code": exc.code,
+                                   "message": "『" + ref + "』解析失败：" + exc.message})
+                    continue
                 if error is not None:
                     errors.append({"entity": ref, "error": error})
                     continue
@@ -699,8 +711,12 @@ class DeviceService:
                     failed_names.append(_friendly_name(op["st"]))
                     continue
                 if isinstance(result, BaseException):
-                    per.append({"ok": False, "entity_id": op["entity_id"], "code": "internal_error",
-                                "message": str(result)})
+                    if isinstance(result, HAError):
+                        per.append({"ok": False, "entity_id": op["entity_id"],
+                                    "device_action": action_name, **result.to_dict()})
+                    else:
+                        per.append({"ok": False, "entity_id": op["entity_id"], "code": "internal_error",
+                                    "device_action": action_name, "message": str(result)})
                     failed.append(op["entity_id"])
                     failed_names.append(_friendly_name(op["st"]))
                     continue
@@ -944,6 +960,9 @@ class DeviceService:
             if isinstance(reg, asyncio.CancelledError):
                 raise reg
             if isinstance(reg, BaseException):
+                if EXCLUDED_DEVICE_KEYWORDS:
+                    return {"ok": False, "code": "registry_unavailable",
+                            "message": "无法读取设备注册表，无法校验设备名排除规则，已拒绝返回设备类型列表。"}
                 reg = None
             devices_map, ents_map, _ = _registry_maps(reg)
             states = [s for s in states if not is_excluded_entity(s, devices_map, ents_map)]

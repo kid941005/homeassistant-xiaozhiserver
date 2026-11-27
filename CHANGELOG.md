@@ -8,6 +8,32 @@
 
 暂无计划中的变更。
 
+## [1.15.5] - 2026-11-27
+
+安全边界、状态一致性与能力过滤修复版本。
+
+### 修复
+
+- `resolve_entity` 对合法但不存在的 `entity_id` 不再回退到名称模糊匹配，避免误控 friendly_name 恰好同名的实体；HA 返回 `not_found` 时直接视为未找到。
+- 状态缓存按实体时间戳判断新鲜度：事件流就绪时仅在缓存年龄不超过 `HA_STATE_CACHE_TTL` 时直接命中，过期或 `invalidate_states` 后强制回源 REST。
+- `call_service` 无论调用成败都在 `finally` 删除目标实体的内存快照与时间戳并失效全量缓存，避免 POST 已执行但回读旧状态造成假成功或漏报。
+- 实体控制锁内先 `get_state(force=True)` 刷新初始状态，修复并发 toggle 基于旧状态判断预期的问题。
+- 回读确认增加基于 `SERVICE_CONFIRM_TIMEOUT` 的硬截止，单次等待、休眠与状态读取均受剩余时间约束，慢设备不再远超超时时间。
+- `cover` 的 `open_cover`/`close_cover` 在回读为 `opening`/`closing` 时返回 `accepted_pending`，慢速门不再被误判失败。
+- 能力位修正：`fan.set_percentage` 使用 `SET_SPEED=1`，`vacuum` 使用 `START/STOP` 对应位，`climate` 仅在仅支持目标区间时不再暴露单温度动作。
+- 注册表不可用时，`list_devices`/`get_device_state`/`list_domains` 在配置了设备名排除关键字时失败关闭并返回 `registry_unavailable`；重复开关状态读取失败返回 `state_unavailable`。
+- 批量控制逐条解析的非预期异常被隔离，单个实体 HAError 不再中断整批；批量 `gather` 的 HAError 保留原错误码（`auth_failed`/`timeout` 等）而非统一降级为 `internal_error`。
+- 危险 `cover` 在缺少 `device_class` 时按 entity_id/friendly_name 的 garage/gate/window/door/车库/大门/窗户关键词兜底判定。
+- 数值校验补充 `brightness_pct`/`brightness`/`volume_level`/`position`/`percentage`/`tilt_position` 边界，华氏设备拒绝疑似摄氏值，RGB 分量拒绝浮点与布尔值。
+- 消除 WebUI 工具调用指标的重复计数；`pipe_process_to_websocket` 拒绝超过 16MiB 的单行消息并断开重连。
+
+### 安全
+
+- WebUI 危险闸门支持 `call_service` 的裸服务名、`scene.turn_on`/`toggle`、`homeassistant.turn_on` 指向 scene，以及 `data.entity_id`/`entities` 候选，先去重再限 20 个目标。
+- 登录失败限速改为锁内原子预留尝试，避免并发请求绕过阈值；`WEBUI_TOKEN` 比较改用 UTF-8 字节，非 ASCII 令牌不再触发 500。
+- 指标 HTTP 方法标签归一为固定集合，未知方法记为 `OTHER`，避免 Prometheus 标签基数无界增长。
+- CI 拆分 PR 构建与发布任务，PR 仅 `contents: read` 且不推送；发布任务最小权限；所有 Actions 固定提交 SHA；版本输入经正则校验，`latest` 仅在 tag 推送时追加。
+
 ## [1.15.4] - 2026-11-26
 
 登录失败来源表上限修正版本。

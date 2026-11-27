@@ -92,7 +92,9 @@ def _filter_actions(domain: str, actions: list, attributes: dict) -> list:
             out = [a for a in out if not (a in mapping and not (features & mapping[a]))]
     elif domain == "climate":
         if features is not None:
-            if "set_temperature" in out and not (features & 3):
+            # HA ClimateEntityFeature：TARGET_TEMPERATURE=1, TARGET_TEMPERATURE_RANGE=2。
+            # 只支持区间目标（仅位 2）的空调不能接受单一 temperature，避免调用必失败。
+            if "set_temperature" in out and not (features & 1) and (features & 2):
                 out.remove("set_temperature")
             if "set_fan_mode" in out and not (features & 8) and not attrs.get("fan_modes"):
                 out.remove("set_fan_mode")
@@ -102,12 +104,14 @@ def _filter_actions(domain: str, actions: list, attributes: dict) -> list:
                        "volume_mute": 8, "volume_unmute": 8, "turn_on": 128, "turn_off": 256}
             out = [a for a in out if not (a in mapping and not (features & mapping[a]))]
     elif domain == "fan":
-        if features is not None and "set_percentage" in out and not (features & 16):
+        # FanEntityFeature.SET_SPEED=1 才支持按百分比调速；16 是 TURN_OFF，不是调速位。
+        if features is not None and "set_percentage" in out and not (features & 1):
             out.remove("set_percentage")
     elif domain == "vacuum":
         if features is not None:
-            # VacuumEntityFeature：TURN_ON=1, TURN_OFF=2, PAUSE=4, STOP=8, START=8192。
-            mapping = {"turn_on": 1, "turn_off": 2, "pause": 4, "stop": 8,
+            # VacuumEntityFeature：PAUSE=4, STOP=8, START=8192。
+            # service.py 把 turn_on/open/continue/resume 映射到 vacuum.start，turn_off 映射到 vacuum.stop。
+            mapping = {"turn_on": 8192, "turn_off": 8, "pause": 4, "stop": 8,
                        "continue": 8192, "resume": 8192}
             out = [a for a in out if not (a in mapping and not (features & mapping[a]))]
     # lock 的 lock/unlock 属于基础服务，不依赖 supported_features；humidifier 无内置动作。

@@ -13,7 +13,7 @@ from websockets.asyncio.server import serve
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from homeassistant_xiaozhiserver.client import HAClient  # noqa: E402
+from homeassistant_xiaozhiserver.client import HAClient, HAError  # noqa: E402
 
 
 def make_client() -> HAClient:
@@ -49,6 +49,9 @@ async def run() -> None:
         if path == "/api/states/light.a":
             calls["state_one"] += 1
             return {"entity_id": "light.a", "state": "off", "attributes": {}}
+        if path == "/api/states/light.missing":
+            calls["state_one"] += 1
+            raise HAError("not_found", "Entity not found")
         if method == "POST":
             calls["service"] += 1
             return None
@@ -67,6 +70,12 @@ async def run() -> None:
     check(isinstance(resolved, dict) and resolved.get("entity_id") == "light.a" and not candidates
           and returned_states is first, "resolve_entity 可复用预加载状态")
     check(calls["state_one"] == 0, "resolve_entity 命中预加载 entity_id 时不再单独请求状态")
+    # 合法但不存在的 entity_id 不能回退到友好名称匹配，否则会误控同名设备。
+    extra_states = list(first) + [
+        {"entity_id": "light.other", "state": "on",
+         "attributes": {"friendly_name": "light.missing"}}]
+    missing, cands, _ = await ha.resolve_entity("light.missing", states=extra_states)
+    check(missing is None and not cands, "不存在的 entity_id 不回退到名称模糊匹配")
 
     await ha.get_services()
     await ha.get_services()
@@ -105,12 +114,26 @@ async def run() -> None:
     cached = await ha.get_states()
     check(len(cached) == 1 and calls["states"] == before, "事件流就绪时 get_states 走内存缓存")
 
+    no_rest_before = calls["state_one"]
     one = await ha.get_state("light.a")
-    check(one and one.get("state") == "on" and calls["state_one"] == 0, "事件流缓存新鲜时 get_state 直接返回内存快照")
+    check(one and one.get("state") == "on" and calls["state_one"] == no_rest_before,
+          "事件流缓存新鲜时 get_state 直接返回内存快照")
+    # 服务调用必须删除目标实体的内存快照，避免旧缓存直接满足回读。
+    await ha.call_service("light", "turn_on", {"entity_id": "light.a"})
+    one = await ha.get_state("light.a")
+    check(calls["state_one"] == no_rest_before + 1 and one is not None,
+          "服务调用后目标实体缓存被删除并回源")
+    # 事件流就绪时 invalidate_states 仍需让下一次 get_states 回源，不能返回旧快照。
+    ha._store_states([{"entity_id": "light.a", "state": "on", "attributes": {}}])
+    ha.invalidate_states()
+    before = calls["states"]
+    await ha.get_states()
+    check(calls["states"] == before + 1, "invalidate_states 后事件流缓存不再直接命中")
     ha.state_cache_ttl = 0.0
-    ha._state_entity_ts["light.a"] = time.monotonic() - 10
+    ha._state_entity_ts["light.a"] = time.time() - 10
+    stale_before = calls["state_one"]
     one = await ha.get_state("light.a")
-    check(one and calls["state_one"] == 1, "事件流缓存过期时 get_state 回源 REST 刷新")
+    check(one and calls["state_one"] == stale_before + 1, "事件流缓存过期时 get_state 回源 REST 刷新")
 
     await ha.aclose()
 

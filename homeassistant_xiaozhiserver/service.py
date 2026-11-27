@@ -318,6 +318,9 @@ def _rgb_components(value: Any, code: str = "invalid_value", label: str = "颜�
     if not isinstance(value, (list, tuple)) or len(value) != 3:
         raise HAError(code, label + " 必须是 [r,g,b] 三个 0-255 整数，收到：" + str(value))
     try:
+        # 显式拒绝浮点分量：int(1.5) 会静默截断成 1，造成颜色与用户输入不一致。
+        if any(isinstance(x, bool) or not isinstance(x, (int, float)) or float(x) != int(x) for x in value):
+            raise ValueError("non-integer")
         rgb = [int(x) for x in value]
     except (TypeError, ValueError) as exc:
         raise HAError(code, label + " 必须是 [r,g,b] 三个 0-255 整数，收到：" + str(value)) from exc
@@ -331,6 +334,15 @@ def validate_action_attributes(domain: str, extra: dict, attributes: Any) -> Non
     if not isinstance(extra, dict):
         return
     attrs = attributes if isinstance(attributes, dict) else {}
+    # 统一数值边界，避免 brightness_pct=1000 / volume_level=2 / position=999 直接发给 HA。
+    for key, (low, high) in {"brightness_pct": (0, 100), "brightness": (0, 255),
+                             "volume_level": (0.0, 1.0), "position": (0, 100),
+                             "percentage": (0, 100), "tilt_position": (0, 100)}.items():
+        if key in extra:
+            val = _num(extra.get(key))
+            if val is not None and (val < low or val > high):
+                raise HAError("invalid_value", key + " 必须在 " + str(low) + "-" + str(high)
+                              + " 之间，收到：" + str(extra.get(key)))
     if "temperature" in extra:
         value = _num(extra.get("temperature"))
         low, high = _num(attrs.get("min_temp")), _num(attrs.get("max_temp"))
@@ -338,6 +350,12 @@ def validate_action_attributes(domain: str, extra: dict, attributes: Any) -> Non
             raise HAError("invalid_value", "温度 " + str(value) + " 超出设备允许范围 "
                           + str(low if low is not None else "?") + "-"
                           + str(high if high is not None else "?") + "。")
+        # 华氏设备若收到典型摄氏度值（26），静默按华氏执行会严重偏差；明确提示改用设备单位。
+        unit = str(attrs.get("temperature_unit") or "")
+        if (value is not None and "f" in unit.lower()
+                and high is not None and high > 50 and value < 50):
+            raise HAError("invalid_value", "该设备温度单位为华氏度（" + unit + "），"
+                          + str(value) + " 可能是摄氏度；请使用华氏温度或 call_service 明确指定。")
     if "color_temp_kelvin" in extra:
         value = _num(extra.get("color_temp_kelvin"))
         low, high = _num(attrs.get("min_color_temp_kelvin")), _num(attrs.get("max_color_temp_kelvin"))
@@ -435,6 +453,20 @@ async def _apply_and_confirm(ha: "HAClient", st: dict, service_domain: str,
             ha, st, service_domain, service, payload, action_label
         )
     async with lock_factory(eid):
+        # 初始状态也必须在实体锁内读取：否则两个并发 toggle 都基于旧状态计算预期，
+        # 第二个可能把正确的最终状态误判为 mismatch。强制回源一次，锁内串行。
+        try:
+            fresh = await ha.get_state(eid, force=True)
+        except TypeError:
+            # 兼容未实现 force 参数的测试/自定义客户端。
+            try:
+                fresh = await ha.get_state(eid)
+            except HAError:
+                fresh = None
+        except HAError:
+            fresh = None
+        if isinstance(fresh, dict) and str(fresh.get("entity_id") or "") == eid:
+            st = fresh
         return await _apply_and_confirm_unlocked(
             ha, st, service_domain, service, payload, action_label
         )
@@ -470,6 +502,8 @@ async def _apply_and_confirm_unlocked(ha: "HAClient", st: dict, service_domain: 
     resp = await ha.call_service(service_domain, service, payload)
     resp_kind = _classify_service_response(resp)
 
+    # 硬截止时间：SERVICE_CONFIRM_TIMEOUT 是上限，不允许 interval=30 把单设备拖到约 120s。
+    deadline = started + max(0.1, float(SERVICE_CONFIRM_TIMEOUT))
     min_attempts = max(1, int(SERVICE_CONFIRM_RETRIES) + 1)
     interval = SERVICE_CONFIRM_INTERVAL if SERVICE_CONFIRM_INTERVAL > 0 else 0.0
     # RETRIES 只是最少回读次数，真正的上限是 TIMEOUT；否则慢设备会在 ~0.6s 就被判为无变化。
@@ -499,10 +533,13 @@ async def _apply_and_confirm_unlocked(ha: "HAClient", st: dict, service_domain: 
 
     while True:
         attempts += 1
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         after_st = None
         if can_events and stream_ready():
             try:
-                after_st = await wait_state(eid, _matches, timeout=max(0.05, interval))
+                after_st = await wait_state(eid, _matches, timeout=min(max(0.05, interval), remaining))
             except Exception as e:  # noqa: BLE001
                 log.debug("wait_for_state 失败，回退轮询：%s", e)
                 after_st = None
@@ -514,27 +551,34 @@ async def _apply_and_confirm_unlocked(ha: "HAClient", st: dict, service_domain: 
                 force = ((now - last_force) >= max(0.5, interval)
                          or attempts >= max_attempts)
                 try:
-                    after_st = await ha.get_state(eid, force=force)
+                    after_st = await asyncio.wait_for(
+                        ha.get_state(eid, force=force),
+                        timeout=max(0.05, deadline - time.monotonic()))
                     if force:
                         last_force = now
-                except HAError as e:
+                except (asyncio.TimeoutError, HAError) as e:
                     after_st = None
-                    if e.code not in readback_errors:
-                        readback_errors.append(e.code)
+                    code = e.code if isinstance(e, HAError) else "timeout"
+                    if code not in readback_errors:
+                        readback_errors.append(code)
         else:
             if attempts == 1:
                 if SERVICE_CONFIRM_DELAY > 0:
-                    await asyncio.sleep(SERVICE_CONFIRM_DELAY)
+                    await asyncio.sleep(min(SERVICE_CONFIRM_DELAY,
+                                            max(0.0, deadline - time.monotonic())))
             else:
                 # 即使配置为 0 也让出事件循环，避免在超时窗口内忙等轰击 HA。
-                await asyncio.sleep(max(0.05, interval))
+                await asyncio.sleep(min(max(0.05, interval), max(0.05, deadline - time.monotonic())))
             try:
-                after_st = await ha.get_state(eid)
-            except HAError as e:
+                after_st = await asyncio.wait_for(
+                    ha.get_state(eid),
+                    timeout=max(0.05, deadline - time.monotonic()))
+            except (asyncio.TimeoutError, HAError) as e:
                 after_st = None
                 # 服务已下发，回读失败不应伪造成“无变化”；记录错误供调用方判断。
-                if e.code not in readback_errors:
-                    readback_errors.append(e.code)
+                code = e.code if isinstance(e, HAError) else "timeout"
+                if code not in readback_errors:
+                    readback_errors.append(code)
         after = snapshot(after_st)
         changed = after is not None and after != before
         check = _check_after(after, expected, attr_expect)
@@ -560,6 +604,13 @@ async def _apply_and_confirm_unlocked(ha: "HAClient", st: dict, service_domain: 
     elif (service_domain, service) in FIRE_AND_FORGET_SERVICES and not changed:
         # 场景/脚本/停止等即发即忘服务：HA 已接受调用即可，不能因无状态变化判失败。
         status = "accepted"
+        verified = False
+    elif (service_domain == "cover"
+          and service in ("open_cover", "close_cover")
+          and isinstance(after, dict)
+          and str(after.get("state")) in ("opening", "closing")):
+        # 慢速卷帘/车库门在超时窗口内仍处于过渡态，不能判失败。
+        status = "accepted_pending"
         verified = False
     elif changed:
         # 无明确预期时只能确认「有变化」，不能判为 mismatch
