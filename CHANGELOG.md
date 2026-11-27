@@ -8,6 +8,15 @@
 
 暂无计划中的变更。
 
+## [1.15.13] - 2026-11-27
+
+### 修复
+- 英文安全名称含 window 时不再误判为门窗/车库风险：`window blind`、`window curtain`、`window shade`、`window screen` 名称安全；但名称中仍含 garage/gate/door（如 `window blind garage`、`window door curtain`）继续按高风险处理。
+- 批量 `control_devices` 的 `partial` 布尔值改为与 `status` 同源派生，修复 accepted_pending/mismatch 等已下发但无成功 voice 时 `status=partial` 却 `partial=false` 的矛盾。
+
+### 测试
+- 新增英文安全名称 window blind/curtain/shade/screen 不误判、混合强危险词仍判危，以及批量混合解析+accepted_pending 时 `status=partial` 且 `partial=true` 回归。
+
 ## [1.15.12] - 2026-11-27
 
 ### 修复

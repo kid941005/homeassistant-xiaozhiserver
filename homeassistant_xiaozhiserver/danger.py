@@ -35,7 +35,6 @@ def _danger_flags(entity_id: str, attributes: Optional[dict]) -> tuple:
         if dc in DANGEROUS_COVER_CLASSES:
             return True, "该 cover 设备类型（" + dc + "）属于高风险（门窗/车库等）"
         # 很多集成不填 device_class，只能靠实体 id / 名称兜底识别车库门/大门/窗。
-        ident = (str(entity_id or "") + " " + str(attrs.get("friendly_name") or "")).lower()
         # 英文关键词按词边界匹配，避免 doorbell 被 door 命中而把门铃误判为高风险；
         # 中文没有词边界，直接子串匹配。
         ascii_words = ("garage", "gate", "window", "door")
@@ -73,6 +72,11 @@ def _danger_flags(entity_id: str, attributes: Optional[dict]) -> tuple:
                                   for word in ("garage", "gate", "door")):
             id_text = re.sub(r"(?<![a-z])window(?![a-z])", "", id_text)
         residual = _drop_safe_words(name + " " + id_text)
+        # 英文安全名称本身可能含 window（window blind/curtain/shade/screen）：
+        # 先扣除安全词，只有在剩余文本没有 garage/gate/door 时才忽略这个孤立 window。
+        if typed_safe and not any(_ascii_word(residual, word)
+                                  for word in ("garage", "gate", "door")):
+            residual = re.sub(r"(?<![a-z])window(?![a-z])", "", residual)
         cn_hit = any(k in residual for k in ("门", "窗")) or any(
             k in residual for k in cn_hot)
         ascii_hit = any(_ascii_word(residual, w) for w in ascii_words)

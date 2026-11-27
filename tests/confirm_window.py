@@ -376,6 +376,12 @@ async def run() -> None:
               "安全词不得整体否决混合危险名称：" + mixed_name)
     check(_danger_flags("cover.garage_door", {"friendly_name": "百叶窗"})[0],
           "安全名称但 entity_id 含车库门时仍按高风险处理")
+    for en_safe in ("window blind", "window curtain", "window shade", "window screen"):
+        check(not _danger_flags("cover.x", {"friendly_name": en_safe})[0],
+              "英文安全名称含 window 不误判：" + en_safe)
+    for en_mix in ("window blind garage", "window door curtain"):
+        check(_danger_flags("cover.x", {"friendly_name": en_mix})[0],
+              "英文安全名称仍保留强危险词：" + en_mix)
     ha = SlowHA()
     st = {"entity_id": "light.slow", "state": "off", "attributes": {}}
     result = await _apply_and_confirm(
@@ -716,6 +722,21 @@ async def run() -> None:
           "批量混合解析错误的目标标记 not_sent")
     check(mixed_parse_out.get("status") == "partial",
           "批量有目标实际下发时顶层标记 partial")
+    mixed_pending_service = DeviceService(lambda: SafeStateHA())
+
+    async def _mixed_pending_apply(ha, st, *args, **kwargs):
+        return {"ok": False, "entity_id": str(st.get("entity_id")),
+                "status": "accepted_pending", "code": "pending_confirmation",
+                "dispatch_state": "may_be_dispatched", "message": "模拟已下发待确认"}
+
+    with patch.object(devices_module, "_resolve_entity_or_error", new=_mixed_parse), \
+            patch.object(devices_module, "_apply_and_confirm", new=_mixed_pending_apply):
+        mixed_pending_out = await mixed_pending_service.control_devices(
+            ["light.boom", "light.lamp"], "turn_on")
+    check(mixed_pending_out.get("status") == "partial",
+          "混合解析错误 + 已下发待确认时顶层 status=partial")
+    check(mixed_pending_out.get("partial") is True,
+          "混合解析错误 + 已下发待确认时 partial 布尔与 status 一致")
     expired_token = danger_module._issue_confirm_token(
         "cover.x", "cover", "open_cover", {"entity_id": "cover.x"})
     danger_module._CONFIRM_TOKENS[expired_token]["expires_at"] = time.monotonic() - 1

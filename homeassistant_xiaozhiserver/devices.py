@@ -1036,11 +1036,13 @@ class DeviceService:
                 detail = ""
                 if labels:
                     detail = "：" + "、".join(labels[:5]) + ("等" if len(labels) > 5 else "")
-                out["partial"] = ok is False and bool(voices)
                 dispatched_any = any(
                     item.get("ok") or item.get("status") not in (None, "not_sent")
                     for item in per)
                 out["status"] = "partial" if dispatched_any else "not_sent"
+                # status 与布尔 partial 必须来自同一语义，避免 accepted_pending/mismatch
+                # 等已下发但无 voice 的场景出现 status=partial 而 partial=false 的矛盾。
+                out["partial"] = out["status"] == "partial"
                 out["message"] = "部分设备未成功，共 " + str(failed_count) + " 个" + detail + "。"
                 if voices:
                     # 直出播报必须把未成功数量说出来，避免只播成功项造成“全部成功”的错觉。
