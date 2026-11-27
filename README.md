@@ -2,7 +2,7 @@
 
 > 把 **Home Assistant** 的实体与服务封装成标准 **MCP（Model Context Protocol）** 工具，供 **小智（xiaozhi-server）** 通过 **MCP 接入点** 用自然语言查询和控制智能家居设备。
 
-**当前版本：v1.15.11** · Python 3.12 · 传输方式：**stdio MCP server + WebSocket bridge** · 单容器部署（MCP bridge + WebUI）
+**当前版本：v1.15.12** · Python 3.12 · 传输方式：**stdio MCP server + WebSocket bridge** · 单容器部署（MCP bridge + WebUI）
 
 ---
 
@@ -213,8 +213,8 @@ docker compose logs -f homeassistant-xiaozhiserver
 看到以下日志表示 bridge 已连上小智：
 
 ```text
-2026-01-01 12:00:00.123 INFO    v1.15.11 MCP_PIPE [-] MCP接入点连接成功
-2026-01-01 12:00:00.456 INFO    v1.15.11 MCP_PIPE [-] 已启动 MCP server：...
+2026-01-01 12:00:00.123 INFO    v1.15.12 MCP_PIPE [-] MCP接入点连接成功
+2026-01-01 12:00:00.456 INFO    v1.15.12 MCP_PIPE [-] 已启动 MCP server：...
 ```
 
 WebUI 地址：`http://<宿主机IP>:8099/`（端口由 `WEBUI_PORT` 决定），首次打开会跳转登录页，输入 `.env` 的 `WEBUI_TOKEN` 后才能进入。compose 使用 `network_mode: host`，因此没有 `ports` 映射；如需只允许本机访问，把 `.env` 的 `WEBUI_HOST` 设为 `127.0.0.1`。
@@ -759,6 +759,7 @@ bash tests/run_local_test.sh
 
 | 版本 | 主要变化 |
 |---|---|
+| v1.15.12 | 第五轮对抗复核修复：单设备 control_device/call_service 在 POST 已发出后返回 invalid_response 或其他异常统一标记 accepted_pending/pending_confirmation/may_be_dispatched 并消费令牌；危险安全词不再整体否决混合名称（百叶窗式车库门/纱窗门/门磁式车库门仍判危）；批量解析非 HAError 错误项补 status=not_sent，顶层按是否实际下发区分 partial/not_sent；阶段一刷新后参数校验失败补 status=not_sent；过期令牌统一返回 confirm_token_expired |
 | v1.15.11 | 危险 cover 安全词排除同时作用于英文实体 ID 分支：百叶窗/纱窗/窗帘等英文 window 标识不再误报；新增 blind/curtain/shade/screen 安全词，screen door（纱门）仍按高风险处理 |
 | v1.15.10 | 第四轮对抗复核修复：确认令牌锁键统一 strip 规范化并对真实令牌使用全局共享锁，空白变体并发只执行一次且随机 token 不增长锁表；批量总时限覆盖令牌锁等待；注册表读取/实体解析非 HAError 统一 registry_unavailable/state_unavailable 与 not_sent；call_service 服务名语法预校验在危险确认前完成，非法服务名不消费令牌；危险 cover 中文词恢复 道闸/闸机/起落杆 并排除 百叶窗/纱窗 |
 | v1.15.9 | 第三轮对抗复核修复：late-danger 有已执行目标时不再返回可授权整批的令牌并消费自动令牌，重试整批不会重复执行；control_device/call_service 仅在实际 POST 边界消费令牌，锁等待取消与参数校验失败保留令牌；_consume_confirm_token 按 intent 校验避免普通操作误消费危险令牌；批量第二次 get_states 非 HAError 统一 state_unavailable，阶段一 state_unavailable 带 not_sent；deadline 过期不再发起 0.01s 操作；late-danger 部分结果保留 errors/deduplicated |

@@ -47,16 +47,36 @@ def _danger_flags(entity_id: str, attributes: Optional[dict]) -> tuple:
         # 百叶窗/纱窗/窗帘等英文 entity_id 常含 window，安全词必须同时作用于英文分支，
         # 否则 friendly_name=百叶窗 但 entity_id=cover.living_room_window 仍会误报。
         ascii_safe = ("doorbell", "door_bell", "curtain", "blind", "shade")
-        safe_hit = any(k in ident for k in cn_safe) or any(
-            re.search(r"(?<![a-z])" + w + r"(?![a-z])", ident) for w in ascii_safe)
-        # screen 单独出现多为投影幕/纱窗；仅当同时含独立 door 时才视为纱门（真实门体）。
-        if re.search(r"(?<![a-z])screen(?![a-z])", ident) and not re.search(
-                r"(?<![a-z])door(?![a-z])", ident):
-            safe_hit = True
-        cn_hit = (any(k in ident for k in ("门", "窗")) or any(k in ident for k in cn_hot)) \
-            and not safe_hit
-        ascii_hit = any(re.search(r"(?<![a-z])" + w + r"(?![a-z])", ident) for w in ascii_words)
-        if (ascii_hit or cn_hit) and not safe_hit:
+        name = str(attrs.get("friendly_name") or "").lower()
+        id_text = str(entity_id or "").lower()
+
+        def _ascii_word(text: str, word: str):
+            return re.search(r"(?<![a-z])" + word + r"(?![a-z])", text)
+
+        def _drop_safe_words(text: str) -> str:
+            # 安全词只能从名称中“扣除自己”，不能整体否决剩余危险词。
+            for word in cn_safe:
+                text = text.replace(word, "")
+            for word in ascii_safe:
+                text = re.sub(r"(?<![a-z])" + word + r"(?![a-z])", "", text)
+            if _ascii_word(text, "screen") and not _ascii_word(text, "door"):
+                text = re.sub(r"(?<![a-z])screen(?![a-z])", "", text)
+            return text
+
+        typed_safe = bool(name) and (
+            any(word in name for word in cn_safe)
+            or any(_ascii_word(name, word) for word in ascii_safe)
+            or (_ascii_word(name, "screen") and not _ascii_word(name, "door")))
+        # friendly_name 已明确是窗帘/纱窗时，entity_id 里泛化的 window 不再单独判危；
+        # 但 garage/gate/door 等强危险词仍保留，避免“百叶窗式车库门”被整体放行。
+        if typed_safe and not any(_ascii_word(id_text, word)
+                                  for word in ("garage", "gate", "door")):
+            id_text = re.sub(r"(?<![a-z])window(?![a-z])", "", id_text)
+        residual = _drop_safe_words(name + " " + id_text)
+        cn_hit = any(k in residual for k in ("门", "窗")) or any(
+            k in residual for k in cn_hot)
+        ascii_hit = any(_ascii_word(residual, w) for w in ascii_words)
+        if ascii_hit or cn_hit:
             return True, "该 cover 设备（" + str(entity_id) + "）名称/标识疑似门窗或车库，按高风险处理"
     return False, None
 
@@ -178,8 +198,10 @@ def _confirm_token_exists(token: Optional[str]) -> bool:
     tok = (token or "").strip()
     if not tok:
         return False
-    _prune_confirm_tokens()
-    return tok in _CONFIRM_TOKENS
+    rec = _CONFIRM_TOKENS.get(tok)
+    if rec is None:
+        return False
+    return float(rec.get("expires_at", 0)) > time.monotonic()
 
 
 def _danger_block(st: dict, service_domain: str, service: str,
@@ -194,7 +216,6 @@ def _danger_block(st: dict, service_domain: str, service: str,
     """
     if not DANGER_CONFIRM_ENABLED:
         return None
-    _prune_confirm_tokens()
     eid = str(st.get("entity_id"))
     entity_dangerous, reason = _danger_flags(eid, st.get("attributes") or {})
     dangerous = entity_dangerous

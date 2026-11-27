@@ -615,19 +615,24 @@ class DeviceService:
                 _consume_confirm_token(confirm_token, token_intent)
             raise
         except HAError as e:
-            if confirm_token and dispatch_state.get("dispatched"):
+            dispatched = bool(dispatch_state.get("dispatched"))
+            if confirm_token and dispatched:
                 _consume_confirm_token(confirm_token, token_intent)
-            if e.code == "post_timeout":
+            if e.code == "post_timeout" or dispatched:
                 return {"ok": False, "status": "accepted_pending", "code": "pending_confirmation",
-                        "dispatch_state": "may_be_dispatched",
-                        "message": "调用已发出但超时或网络中断，无法确认是否执行。",
+                        "dispatch_state": "may_be_dispatched", "last_error_code": e.code,
+                        "message": "调用已发出但响应异常或超时，无法确认是否执行。",
                         "hint": "请稍后用 get_device_state 核对设备状态，避免直接重试 toggle。"}
             return {"ok": False, **e.to_dict(), "hint": "可先用 list_devices / get_device_state 确认设备与能力后重试。"}
         except Exception as e:  # noqa: BLE001
             if confirm_token and dispatch_state.get("dispatched"):
                 _consume_confirm_token(confirm_token, token_intent)
             out = {"ok": False, "code": "internal_error", "message": "控制设备失败：" + str(e)}
-            if not dispatch_state.get("dispatched"):
+            if dispatch_state.get("dispatched"):
+                out.update({"status": "accepted_pending", "code": "pending_confirmation",
+                            "dispatch_state": "may_be_dispatched", "last_error_code": "internal_error",
+                            "hint": "调用已发出但本地处理异常，无法确认是否执行；请先回读设备状态，避免直接重试。"})
+            else:
                 out["status"] = "not_sent"
             return out
         finally:
@@ -735,11 +740,13 @@ class DeviceService:
                 except asyncio.CancelledError:
                     raise
                 except HAError as exc:
-                    errors.append({"entity": ref, "entity_id": ref, "code": exc.code,
+                    errors.append({"entity": ref, "entity_id": ref, "status": "not_sent",
+                                   "code": exc.code,
                                    "message": "『" + ref + "』解析失败：" + exc.message})
                     continue
                 except Exception as exc:  # noqa: BLE001
-                    errors.append({"entity": ref, "entity_id": ref, "code": "state_unavailable",
+                    errors.append({"entity": ref, "entity_id": ref, "status": "not_sent",
+                                   "code": "state_unavailable",
                                    "message": "『" + ref + "』解析失败：" + str(exc)})
                     continue
                 if error is not None:
@@ -780,6 +787,8 @@ class DeviceService:
                                  "extra": extra, "payload": payload})
 
             if not resolved:
+                for item in errors:
+                    item.setdefault("status", "not_sent")
                 return {"ok": False, "status": "not_sent", "code": "no_valid_entities",
                         "message": "没有可执行的目标设备。", "errors": errors or None}
 
@@ -817,7 +826,8 @@ class DeviceService:
                 try:
                     validate_action_attributes(op["domain"], op["extra"], fresh.get("attributes"))
                 except HAError as exc:
-                    return {"ok": False, "code": exc.code, "entity_id": op["entity_id"],
+                    return {"ok": False, "status": "not_sent", "code": exc.code,
+                            "entity_id": op["entity_id"],
                             "message": "『" + _friendly_name(fresh) + "』刷新后动作参数无效：" + exc.message}
             guard_payload = {
                 "entity_id": [op["entity_id"] for op in resolved],
@@ -996,6 +1006,8 @@ class DeviceService:
                     late_guard["executed_entities"] = executed
                     late_guard["results"] = per
                     if errors:
+                        for item in errors:
+                            item.setdefault("status", "not_sent")
                         late_guard["errors"] = errors
                     if deduped:
                         late_guard["deduplicated"] = deduped
@@ -1011,6 +1023,8 @@ class DeviceService:
             out = {"ok": ok, "count": len(per), "action": "RESPONSE" if voices else None,
                    "response": "；".join(voices) if voices else "", "results": per}
             if errors:
+                for item in errors:
+                    item.setdefault("status", "not_sent")
                 out["errors"] = errors
             if deduped:
                 out["deduplicated"] = deduped
@@ -1023,6 +1037,10 @@ class DeviceService:
                 if labels:
                     detail = "：" + "、".join(labels[:5]) + ("等" if len(labels) > 5 else "")
                 out["partial"] = ok is False and bool(voices)
+                dispatched_any = any(
+                    item.get("ok") or item.get("status") not in (None, "not_sent")
+                    for item in per)
+                out["status"] = "partial" if dispatched_any else "not_sent"
                 out["message"] = "部分设备未成功，共 " + str(failed_count) + " 个" + detail + "。"
                 if voices:
                     # 直出播报必须把未成功数量说出来，避免只播成功项造成“全部成功”的错觉。
@@ -1043,14 +1061,28 @@ class DeviceService:
                 _consume_confirm_token(confirm_token, batch_intent)
             raise
         except HAError as e:
-            if confirm_token and any(ds.get("dispatched") for ds in dispatch_states):
+            dispatched = any(ds.get("dispatched") for ds in dispatch_states)
+            if confirm_token and dispatched:
                 _consume_confirm_token(confirm_token, batch_intent)
-            return {"ok": False, **e.to_dict(), "hint": _hint()}
+            out = {"ok": False, **e.to_dict(), "hint": _hint()}
+            if dispatched:
+                out.update({"status": "accepted_pending", "code": "pending_confirmation",
+                            "dispatch_state": "may_be_dispatched", "last_error_code": e.code})
+            else:
+                out["status"] = "not_sent"
+            return out
         except Exception as e:  # noqa: BLE001
-            if confirm_token and any(ds.get("dispatched") for ds in dispatch_states):
+            dispatched = any(ds.get("dispatched") for ds in dispatch_states)
+            if confirm_token and dispatched:
                 _consume_confirm_token(confirm_token, batch_intent)
-            return {"ok": False, "status": "not_sent", "code": "internal_error",
-                    "message": "批量控制失败：" + str(e)}
+            out = {"ok": False, "code": "internal_error", "message": "批量控制失败：" + str(e)}
+            if dispatched:
+                out.update({"status": "accepted_pending", "code": "pending_confirmation",
+                            "dispatch_state": "may_be_dispatched", "last_error_code": "internal_error",
+                            "hint": "部分目标可能已下发，无法确认是否执行；请先回读设备状态，避免直接重试。"})
+            else:
+                out["status"] = "not_sent"
+            return out
         finally:
             if token_acquired and token_lock is not None:
                 token_lock.release()
@@ -1255,10 +1287,12 @@ class DeviceService:
             if confirm_token and dispatch_state.get("dispatched"):
                 _consume_confirm_token(confirm_token, token_intent)
             out = {"ok": False, **e.to_dict()}
-            if e.code == "post_timeout":
+            if e.code == "post_timeout" or dispatch_state.get("dispatched"):
                 out["status"] = "accepted_pending"
                 out["code"] = "pending_confirmation"
                 out["dispatch_state"] = "may_be_dispatched"
+                out["last_error_code"] = e.code
+                out["hint"] = "调用已发出但响应异常或超时，无法确认是否执行；请先回读设备状态，避免直接重试。"
             elif e.code in ("not_found", "http_error", "upstream_error", "invalid_data", "invalid_value"):
                 out["hint"] = ("该服务可能不存在或参数不匹配。可先用 list_services(domain=…) 查询支持的服"
                                "务与字段，再核对 data 参数名。")
@@ -1269,7 +1303,11 @@ class DeviceService:
             if confirm_token and dispatch_state.get("dispatched"):
                 _consume_confirm_token(confirm_token, token_intent)
             out = {"ok": False, "code": "internal_error", "message": "调用服务失败：" + str(e)}
-            if not dispatch_state.get("dispatched"):
+            if dispatch_state.get("dispatched"):
+                out.update({"status": "accepted_pending", "code": "pending_confirmation",
+                            "dispatch_state": "may_be_dispatched", "last_error_code": "internal_error",
+                            "hint": "调用已发出但本地处理异常，无法确认是否执行；请先回读设备状态，避免直接重试。"})
+            else:
                 out["status"] = "not_sent"
             return out
         finally:

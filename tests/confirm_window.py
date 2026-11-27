@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from homeassistant_xiaozhiserver import danger as danger_module  # noqa: E402
 from homeassistant_xiaozhiserver import devices as devices_module  # noqa: E402
 from homeassistant_xiaozhiserver.danger import _danger_flags  # noqa: E402
 from homeassistant_xiaozhiserver.devices import DeviceService  # noqa: E402
@@ -192,6 +193,16 @@ class ResolveCrashHA(DangerSwapHA):
         raise RuntimeError("模拟解析崩溃")
 
 
+class SafeStateHA(DangerSwapHA):
+    """所有实体刷新都返回安全状态，用于批量混合解析错误测试。"""
+
+    async def get_state(self, entity_id: str, force: bool = False):
+        return {"entity_id": entity_id, "state": "off", "attributes": {}}
+
+    async def get_states(self):
+        return []
+
+
 class CancelGarageHA(DangerSwapHA):
     """锁内 fresh 始终是车库门，POST 开始后挂起，用于验证取消后的令牌消费。"""
 
@@ -360,6 +371,11 @@ async def run() -> None:
           "投影幕 screen 不误判")
     check(_danger_flags("cover.screen_door", {"friendly_name": "纱门"})[0],
           "纱门仍按高风险处理")
+    for mixed_name in ("百叶窗式车库门", "纱窗门", "门磁式车库门", "窗帘式车库门"):
+        check(_danger_flags("cover.x", {"friendly_name": mixed_name})[0],
+              "安全词不得整体否决混合危险名称：" + mixed_name)
+    check(_danger_flags("cover.garage_door", {"friendly_name": "百叶窗"})[0],
+          "安全名称但 entity_id 含车库门时仍按高风险处理")
     ha = SlowHA()
     st = {"entity_id": "light.slow", "state": "off", "attributes": {}}
     result = await _apply_and_confirm(
@@ -439,6 +455,37 @@ async def run() -> None:
     check(reused_invalid.get("code") == "invalid_confirm_token",
           "批量 POST 后 invalid_response 也必须消费令牌")
     check(invalid_ha.called is True, "invalid_response 测试经过真实 call_service 边界")
+    single_invalid_ha = InvalidResponseHA()
+    single_invalid_service = DeviceService(lambda: single_invalid_ha)
+    with patch.object(devices_module, "_resolve_entity_or_error", new=_fake_resolve):
+        first_single_invalid = await single_invalid_service.control_device("cover.x", "open")
+        single_invalid_token = str(first_single_invalid.get("confirm_token") or "")
+        check(bool(single_invalid_token), "单设备 invalid_response 场景首次返回确认令牌")
+        single_invalid_out = await single_invalid_service.control_device(
+            "cover.x", "open", confirm_token=single_invalid_token)
+        check(single_invalid_out.get("status") == "accepted_pending",
+              "单设备 control_device 已下发后 invalid_response 标记 accepted_pending")
+        check(single_invalid_out.get("dispatch_state") == "may_be_dispatched",
+              "单设备 invalid_response 标记 may_be_dispatched")
+        reused_single_invalid = await single_invalid_service.control_device(
+            "cover.x", "open", confirm_token=single_invalid_token)
+    check(reused_single_invalid.get("code") == "invalid_confirm_token",
+          "单设备 invalid_response 后令牌必须消费")
+    call_invalid_ha = InvalidResponseHA()
+    call_invalid_service = DeviceService(lambda: call_invalid_ha)
+    with patch.object(devices_module, "_resolve_entity_or_error", new=_fake_resolve):
+        first_call_invalid = await call_invalid_service.call_service(
+            "cover.x", "cover.open_cover")
+        call_invalid_token = str(first_call_invalid.get("confirm_token") or "")
+        check(bool(call_invalid_token), "call_service invalid_response 场景首次返回确认令牌")
+        call_invalid_out = await call_invalid_service.call_service(
+            "cover.x", "cover.open_cover", confirm_token=call_invalid_token)
+        check(call_invalid_out.get("status") == "accepted_pending",
+              "call_service 已下发后 invalid_response 标记 accepted_pending")
+        reused_call_invalid = await call_invalid_service.call_service(
+            "cover.x", "cover.open_cover", confirm_token=call_invalid_token)
+    check(reused_call_invalid.get("code") == "invalid_confirm_token",
+          "call_service invalid_response 后令牌必须消费")
     cancel_ha = CancelDangerHA()
     cancel_service = DeviceService(lambda: cancel_ha)
     with patch.object(devices_module, "_resolve_entity_or_error", new=_fake_resolve):
@@ -648,6 +695,35 @@ async def run() -> None:
     check(valid_after.get("code") != "invalid_confirm_token",
           "非法服务名预校验失败不消费确认令牌")
     check(invalid_service_ha.calls == 1, "同一令牌随后一次有效调用可正常执行")
+    mixed_parse_ha = SafeStateHA()
+    mixed_parse_service = DeviceService(lambda: mixed_parse_ha)
+
+    async def _mixed_parse(ha, ref, *args):
+        if "boom" in str(ref):
+            raise RuntimeError("模拟单个目标解析崩溃")
+        return {"entity_id": "light.lamp", "state": "off", "attributes": {}}, None
+
+    async def _mixed_ok_apply(ha, st, *args, **kwargs):
+        return {"ok": True, "entity_id": str(st.get("entity_id")), "status": "confirmed"}
+
+    with patch.object(devices_module, "_resolve_entity_or_error", new=_mixed_parse), \
+            patch.object(devices_module, "_apply_and_confirm", new=_mixed_ok_apply):
+        mixed_parse_out = await mixed_parse_service.control_devices(
+            ["light.boom", "light.lamp"], "turn_on")
+    mixed_errors = mixed_parse_out.get("errors") or []
+    check(any(e.get("entity_id") == "light.boom" and e.get("status") == "not_sent"
+              for e in mixed_errors),
+          "批量混合解析错误的目标标记 not_sent")
+    check(mixed_parse_out.get("status") == "partial",
+          "批量有目标实际下发时顶层标记 partial")
+    expired_token = danger_module._issue_confirm_token(
+        "cover.x", "cover", "open_cover", {"entity_id": "cover.x"})
+    danger_module._CONFIRM_TOKENS[expired_token]["expires_at"] = time.monotonic() - 1
+    expired_guard = danger_module._danger_block(
+        {"entity_id": "cover.x", "attributes": {"device_class": "garage"}},
+        "cover", "open_cover", {"entity_id": "cover.x"}, expired_token)
+    check(bool(expired_guard) and expired_guard.get("code") == "confirm_token_expired",
+          "过期令牌返回 confirm_token_expired 而非 invalid_confirm_token")
     print("CONFIRM WINDOW OK")
 
 

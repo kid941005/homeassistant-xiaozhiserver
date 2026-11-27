@@ -8,6 +8,18 @@
 
 暂无计划中的变更。
 
+## [1.15.12] - 2026-11-27
+
+### 修复
+- 单设备 `control_device`/`call_service` 在 POST 已发出后返回 `invalid_response` 或其他发送后异常统一标记 `accepted_pending`/`pending_confirmation`/`may_be_dispatched`，并附 `last_error_code` 提示先回读，不再误报普通失败诱导重试。
+- 危险 cover 安全词只抵消安全对象本体，不再整体否决同一名称中的危险词：`百叶窗式车库门`、`纱窗门`、`门磁式车库门`、`窗帘式车库门` 仍判为高风险。
+- 批量多目标解析抛出非 `HAError` 异常时，错误项补 `status=not_sent`；顶层按是否有目标实际下发区分 `partial`/`not_sent`。
+- 阶段一刷新后动作参数校验失败补 `status=not_sent`，与未下发语义一致。
+- 过期确认令牌统一返回 `confirm_token_expired`，不再与无效令牌混淆。
+
+### 测试
+- 新增单设备 `control_device`/`call_service` invalid_response 映射 accepted_pending 且令牌消费、混合危险名称仍判危、过期令牌 `confirm_token_expired` 回归。
+
 ## [1.15.11] - 2026-11-27
 
 ### 修复
