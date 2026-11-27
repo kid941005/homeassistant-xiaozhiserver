@@ -785,11 +785,17 @@ async def run() -> None:
           "中文“车库”名称仍判高风险")
     check(danger_module._danger_flags("cover.x", {"friendly_name": "百叶窗式车库"})[0],
           "百叶窗式车库仍判高风险")
+    check(danger_module._danger_flags("cover.cheku", {})[0],
+          "entity_id=cover.cheku 无名称时仍判高风险")
+    first_token = danger_module._issue_confirm_token(
+        "cover.x", "cover", "open_cover", {"entity_id": "cover.x"})
     for _ in range(600):
         danger_module._issue_confirm_token(
             "cover.x", "cover", "open_cover", {"entity_id": "cover.x"})
     check(len(danger_module._CONFIRM_TOKENS) <= danger_module._MAX_CONFIRM_TOKENS,
           "活动确认令牌数量不超过硬上限")
+    check(first_token in danger_module._CONFIRM_TOKENS,
+          "容量满时拒绝新签发，不淘汰仍在有效期的令牌")
     print("CONFIRM WINDOW OK")
 
 

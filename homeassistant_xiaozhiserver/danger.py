@@ -87,7 +87,7 @@ def _danger_flags(entity_id: str, attributes: Optional[dict]) -> tuple:
                                   for word in ("garage", "gate", "door")):
             residual = re.sub(r"(?<![a-z])window(?![a-z])", "", residual)
         cn_hit = any(k in residual for k in ("门", "窗")) or any(
-            k in residual for k in cn_hot)
+            k in residual for k in cn_hot) or "cheku" in flat
         ascii_hit = any(_ascii_word(residual, w) for w in ascii_words)
         if ascii_hit or cn_hit:
             return True, "该 cover 设备（" + str(entity_id) + "）名称/标识疑似门窗或车库，按高风险处理"
@@ -203,12 +203,10 @@ def _confirm_intent(service_domain: str, service: str, payload: dict) -> str:
 
 def _issue_confirm_token(entity_id: str, service_domain: str, service: str, payload: dict) -> str:
     _prune_confirm_tokens()
-    # 预留一个槽位再插入，避免“先裁到上限再插入”导致实际数量稳定在上限+1。
-    overflow = len(_CONFIRM_TOKENS) - (_MAX_CONFIRM_TOKENS - 1)
-    if overflow > 0:
-        oldest = sorted(_CONFIRM_TOKENS, key=lambda k: float(_CONFIRM_TOKENS[k].get("expires_at", 0)))
-        for tok in oldest[:overflow]:
-            _CONFIRM_TOKENS.pop(tok, None)
+    # 达到硬上限时拒绝新签发（返回空串由调用方转 capacity 错误），
+    # 不静默淘汰仍在有效期内的合法令牌。
+    if len(_CONFIRM_TOKENS) >= _MAX_CONFIRM_TOKENS:
+        return ""
     token = secrets.token_urlsafe(12)
     _CONFIRM_TOKENS[token] = {
         "intent": _confirm_intent(service_domain, service, payload),
@@ -243,6 +241,11 @@ def _confirm_token_exists(token: Optional[str]) -> bool:
     return float(rec.get("expires_at", 0)) > time.monotonic()
 
 
+def _token_capacity_block(base: dict) -> dict:
+    return {**base, "code": "confirm_capacity_exceeded",
+            "message": "确认令牌数量已达上限，请稍后重试。"}
+
+
 def _danger_block(st: dict, service_domain: str, service: str,
                   payload: dict, confirm_token: Optional[str],
                   intent_domain: Optional[str] = None,
@@ -274,6 +277,8 @@ def _danger_block(st: dict, service_domain: str, service: str,
     token = (confirm_token or "").strip()
     if not token:
         new_token = _issue_confirm_token(eid, intent_sd, intent_svc, payload)
+        if not new_token:
+            return _token_capacity_block(base)
         log.warning("danger confirmation required entity=%s service=%s reason=%s", eid, svc_str, reason)
         subject = "是危险设备" if entity_dangerous else "的本次操作是高风险操作"
         return {**base, "code": "confirmation_required",
@@ -285,6 +290,8 @@ def _danger_block(st: dict, service_domain: str, service: str,
     if rec is None:
         if token in _EXPIRED_CONFIRM_TOKENS:
             new_token = _issue_confirm_token(eid, intent_sd, intent_svc, payload)
+            if not new_token:
+                return _token_capacity_block(base)
             log.warning("danger confirmation rejected entity=%s service=%s code=confirm_token_expired", eid, svc_str)
             return {**base, "code": "confirm_token_expired", "confirm_token": new_token,
                     "expires_in": ttl,
@@ -296,6 +303,8 @@ def _danger_block(st: dict, service_domain: str, service: str,
         _CONFIRM_TOKENS.pop(token, None)
         _remember_expired_token(token)
         new_token = _issue_confirm_token(eid, intent_sd, intent_svc, payload)
+        if not new_token:
+            return _token_capacity_block(base)
         log.warning("danger confirmation rejected entity=%s service=%s code=confirm_token_expired", eid, svc_str)
         return {**base, "code": "confirm_token_expired", "confirm_token": new_token,
                 "expires_in": ttl,
