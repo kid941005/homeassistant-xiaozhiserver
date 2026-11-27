@@ -19,7 +19,7 @@ from .config import (
     EXCLUDED_DOMAINS,
     MAX_LIST_LIMIT,
 )
-from .danger import _danger_block, _danger_flags, _service_is_dangerous
+from .danger import _consume_confirm_token, _danger_block, _danger_flags, _service_is_dangerous
 from .service import (
     DIRECT_RESPONSE_SERVICES,
     DOMAIN_ACTIONS,
@@ -555,11 +555,13 @@ class DeviceService:
             validate_action_attributes(domain, extra, st.get("attributes"))
             payload = {"entity_id": eid}
             payload.update(extra)
-            guard = _danger_block(st, sd, svc, payload, confirm_token)
+            # 初始状态可能缺少 device_class：令牌校验放在锁内 fresh 复查时消费，
+            # 避免“缓存看似安全 + 任意非空 token”跳过刷新后的危险判断。
+            guard = _danger_block(st, sd, svc, payload, confirm_token, consume=False)
             if guard is not None:
                 return guard
-            precheck = None if confirm_token else (
-                lambda fresh: _danger_block(fresh, sd, svc, payload, None))
+            precheck = lambda fresh: _danger_block(  # noqa: E731
+                fresh, sd, svc, payload, confirm_token, consume=True)
             result = await _apply_and_confirm(ha, st, sd, svc, payload, action_name,
                                               precheck=precheck)
             if "_danger_guard" in result:
@@ -607,6 +609,11 @@ class DeviceService:
             if len(refs) > 20:
                 return {"ok": False, "code": "invalid_argument", "message": "单次最多批量控制 20 个设备，收到 " + str(len(refs)) + " 个。"}
 
+            # 总时限从入口开始计算，状态/注册表加载和实体解析也计入，避免预检阶段无限拖长。
+            deadline = time.monotonic() + CONTROL_BATCH_TIMEOUT
+            not_sent = {"ok": False, "status": "not_sent", "code": "batch_timeout",
+                        "message": "批量控制超时，指令未下发。"}
+
             resolved: list = []
             errors: list = []
             seen: set[str] = set()
@@ -618,15 +625,21 @@ class DeviceService:
             batch_registry_error: Optional[Exception] = None
             batch_registry_loaded = False
             try:
-                batch_states = await ha.get_states()
+                batch_states = await asyncio.wait_for(
+                    ha.get_states(), timeout=max(0.01, deadline - time.monotonic()))
+            except asyncio.TimeoutError:
+                return not_sent
             except HAError:
                 batch_states = None
             try:
-                reg = await ha.get_registries()
+                reg = await asyncio.wait_for(
+                    ha.get_registries(), timeout=max(0.01, deadline - time.monotonic()))
                 if reg is None:
                     batch_registry_error = HAError("registry_unavailable", "暂时无法读取设备注册表。")
                 else:
                     batch_maps = _registry_maps(reg)[:2]
+            except asyncio.TimeoutError:
+                return not_sent
             except HAError as exc:
                 batch_registry_error = exc
             batch_registry_loaded = True
@@ -636,10 +649,17 @@ class DeviceService:
             except HAError:
                 batch_hidden = None
             for ref in refs:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return not_sent
                 try:
-                    st, error = await _resolve_entity_or_error(
-                        ha, ref, "控制", batch_states, batch_hidden,
-                        batch_maps, batch_registry_error, batch_registry_loaded)
+                    st, error = await asyncio.wait_for(
+                        _resolve_entity_or_error(
+                            ha, ref, "控制", batch_states, batch_hidden,
+                            batch_maps, batch_registry_error, batch_registry_loaded),
+                        timeout=remaining)
+                except asyncio.TimeoutError:
+                    return not_sent
                 except HAError as exc:
                     errors.append({"entity": ref, "entity_id": ref, "code": exc.code,
                                    "message": "『" + ref + "』解析失败：" + exc.message})
@@ -685,8 +705,6 @@ class DeviceService:
                 return {"ok": False, "code": "no_valid_entities",
                         "message": "没有可执行的目标设备。", "errors": errors or None}
 
-            # 批量总时限必须覆盖阶段一刷新，否则大量目标时预检可以无限拖长。
-            deadline = time.monotonic() + CONTROL_BATCH_TIMEOUT
             # 阶段一：先把所有目标刷新到最新状态并重新校验参数/危险属性，全部通过后
             # 才进入阶段二统一下发。否则可能出现部分设备已执行、另一台才发现需要确认，
             # 此时已产生的副作用无法回滚，结果也会被误当成整批确认请求丢掉。
@@ -719,6 +737,12 @@ class DeviceService:
                 except HAError as exc:
                     return {"ok": False, "code": exc.code, "entity_id": op["entity_id"],
                             "message": "『" + _friendly_name(fresh) + "』刷新后动作参数无效：" + exc.message}
+            guard_payload = {
+                "entity_id": [op["entity_id"] for op in resolved],
+                "batch": [{"entity_id": op["entity_id"],
+                           "service": op["service_domain"] + "." + op["service"],
+                           "data": op["extra"]} for op in resolved],
+            }
             dangerous_ops = []
             for op in resolved:
                 dangerous, _reason = _danger_flags(op["entity_id"], op["st"].get("attributes") or {})
@@ -728,14 +752,13 @@ class DeviceService:
                 if dangerous:
                     dangerous_ops.append(op)
             if dangerous_ops:
-                combined = [{"entity_id": op["entity_id"],
-                             "service": op["service_domain"] + "." + op["service"],
-                             "data": op["extra"]} for op in resolved]
-                guard_payload = {"entity_id": [op["entity_id"] for op in resolved], "batch": combined}
                 first = dangerous_ops[0]
+                # 先只校验令牌不消费，锁内 fresh 复查每个目标后再统一消费，避免令牌
+                # 在批量中途被第一个目标消费、其余目标或 late-danger 检查全部失效。
                 guard = _danger_block(first["st"], first["service_domain"], first["service"],
                                       guard_payload, confirm_token,
-                                      intent_domain="batch", intent_service="control_devices")
+                                      intent_domain="batch", intent_service="control_devices",
+                                      consume=False)
                 if guard is not None:
                     guard["entities"] = [op["entity_id"] for op in resolved]
                     return guard
@@ -748,9 +771,14 @@ class DeviceService:
                     if remaining <= 0:
                         raise _BatchNotDispatched()
                     dispatch_state: dict = {"dispatched": False}
-                    # 危险属性已在阶段一用 force 刷新并整批确认；这里不再做锁内二次拦截，
-                    # 否则单台 late guard 会在其他设备已下发后丢弃整批结果。
-                    precheck = None
+                    # 阶段一到阶段二之间设备属性仍可能变化：在实体锁内 fresh 状态上
+                    # 再判一次危险，令牌只校验不消费，整批结束后统一消费。
+                    def _fresh_guard(fresh, op=op):
+                        return _danger_block(
+                            fresh, op["service_domain"], op["service"], guard_payload,
+                            confirm_token, intent_domain="batch",
+                            intent_service="control_devices", consume=False)
+                    precheck = _fresh_guard
                     try:
                         return await asyncio.wait_for(
                             _apply_and_confirm(ha, op["st"], op["service_domain"],
@@ -781,6 +809,7 @@ class DeviceService:
                     if result.dispatched:
                         per.append({"ok": False, "entity_id": op["entity_id"],
                                     "status": "accepted_pending", "code": "pending_confirmation",
+                                    "dispatch_state": "may_be_dispatched",
                                     "device_action": action_name,
                                     "message": "批量控制超时，指令可能已下发但未在时限内确认。"})
                     else:
@@ -794,6 +823,7 @@ class DeviceService:
                 if isinstance(result, asyncio.TimeoutError):
                     per.append({"ok": False, "entity_id": op["entity_id"],
                                 "status": "accepted_pending", "code": "pending_confirmation",
+                                "dispatch_state": "may_be_dispatched",
                                 "device_action": action_name,
                                 "message": "批量控制超时，指令可能已下发但未在时限内确认。"})
                     failed.append(op["entity_id"])
@@ -858,6 +888,10 @@ class DeviceService:
                     out["response"] = out["response"] + "；另有 " + str(failed_count) + " 个设备未成功" + detail + "。"
             if not out["response"]:
                 out.pop("response", None)
+            # 只有整批最终检查全部通过并完成下发才消费令牌；若中途返回 late-danger
+            # 确认请求，令牌保留以便用户确认后用同一批操作重试。
+            if confirm_token:
+                _consume_confirm_token(confirm_token)
             return out
         except HAError as e:
             return {"ok": False, **e.to_dict(), "hint": _hint()}

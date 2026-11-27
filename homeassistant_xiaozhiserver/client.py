@@ -493,21 +493,33 @@ class HAClient:
             age = time.monotonic() - self._state_entity_ts.get(eid, 0.0)
             if isinstance(cached, dict) and age <= self.state_cache_ttl:
                 return cached
-        try:
-            data = await self._request("GET", "/api/states/" + eid)
-        except HAError as e:
-            if e.code == "not_found":
-                return None
-            raise
-        if not isinstance(data, dict):
-            raise HAError("invalid_response", "Home Assistant 返回的实体状态不是 JSON 对象。")
-        self._state_entities[eid] = data
-        self._state_entity_ts[eid] = time.monotonic()
-        # 单实体写入也让在途全量快照失效，避免较旧全量数据覆盖这条新状态。
-        self._states_generation += 1
-        if self._states_cache is not None:
-            self._states_dirty = True
-            self._states_ts = time.monotonic()
+        # force 回源时事件流仍可能在本请求期间收到更新的 state_changed。REST 响应必须
+        # 与 generation/实体时间戳对齐：若期间已有该实体更新，采用更新的 WS 快照而不是
+        # 用旧 REST 响应覆盖缓存，否则锁内“fresh”可能退回旧状态并绕过危险判断。
+        for attempt in range(2):
+            generation = self._states_generation
+            started = time.monotonic()
+            try:
+                data = await self._request("GET", "/api/states/" + eid)
+            except HAError as e:
+                if e.code == "not_found":
+                    return None
+                raise
+            if not isinstance(data, dict):
+                raise HAError("invalid_response", "Home Assistant 返回的实体状态不是 JSON 对象。")
+            event_ts = self._state_entity_ts.get(eid)
+            cached = self._state_entities.get(eid)
+            if isinstance(cached, dict) and event_ts is not None and event_ts >= started:
+                return cached
+            if generation == self._states_generation or attempt == 1:
+                self._state_entities[eid] = data
+                self._state_entity_ts[eid] = time.monotonic()
+                # 单实体写入也让在途全量快照失效，避免较旧全量数据覆盖这条新状态。
+                self._states_generation += 1
+                if self._states_cache is not None:
+                    self._states_dirty = True
+                    self._states_ts = time.monotonic()
+                return data
         return data
 
     async def call_service(self, domain: str, service: str, data: dict) -> Any:

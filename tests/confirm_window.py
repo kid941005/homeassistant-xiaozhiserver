@@ -6,9 +6,12 @@ import asyncio
 import sys
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from homeassistant_xiaozhiserver import devices as devices_module  # noqa: E402
+from homeassistant_xiaozhiserver.devices import DeviceService  # noqa: E402
 from homeassistant_xiaozhiserver.service import (  # noqa: E402
     HAError, _apply_and_confirm, _rgb_components, build_service,
     validate_action_attributes,
@@ -67,6 +70,41 @@ class RefreshFailHA:
 
     def state_stream_ready(self) -> bool:
         return False
+
+
+class DangerSwapHA:
+    """初始缓存缺少 device_class（看似安全），force 刷新后发现是车库门。"""
+
+    def __init__(self, first_benign: bool = False) -> None:
+        self._lock = asyncio.Lock()
+        self.reads = 0
+        self.called = False
+        self.first_benign = first_benign
+
+    def entity_lock(self, entity_id: str) -> asyncio.Lock:
+        return self._lock
+
+    async def get_state(self, entity_id: str, force: bool = False):
+        self.reads += 1
+        attrs = {} if (self.first_benign and self.reads == 1) else {"device_class": "garage"}
+        return {"entity_id": entity_id, "state": "closed", "attributes": attrs}
+
+    async def call_service(self, domain: str, service: str, payload: dict):
+        self.called = True
+        return None
+
+    async def get_states(self):
+        return [{"entity_id": "cover.x", "state": "closed", "attributes": {}}]
+
+    async def get_registries(self):
+        return {"devices": [], "entities": [], "areas": []}
+
+    def state_stream_ready(self) -> bool:
+        return False
+
+
+async def _fake_resolve(ha, entity, verb, *args):
+    return {"entity_id": "cover.x", "state": "closed", "attributes": {}}, None
 
 
 class StaticHA:
@@ -175,6 +213,20 @@ async def run() -> None:
         "cover", "stop_cover", {"entity_id": "cover.c"}, "停止")
     check(accepted.get("status") == "accepted", "即发即忘服务返回 accepted 而非失败")
     check(static.reads <= 6, "即发即忘服务不会等满回读超时")
+    swap = DangerSwapHA()
+    service = DeviceService(lambda: swap)
+    with patch.object(devices_module, "_resolve_entity_or_error", new=_fake_resolve):
+        blocked = await service.control_device("cover.x", "open", confirm_token="bogus")
+    check(blocked.get("code") == "invalid_confirm_token",
+          "缓存未识别危险时任意非空令牌不会跳过锁内 fresh 复查")
+    check(swap.called is False, "锁内 fresh 发现车库门后拒绝下发")
+    swap2 = DangerSwapHA(first_benign=True)
+    service2 = DeviceService(lambda: swap2)
+    with patch.object(devices_module, "_resolve_entity_or_error", new=_fake_resolve):
+        batch_blocked = await service2.control_devices(["cover.x"], "open", confirm_token="bogus")
+    check(batch_blocked.get("code") == "invalid_confirm_token",
+          "批量阶段二 late-danger 仍复核确认令牌")
+    check(swap2.called is False, "批量 late-danger 时不调用 call_service")
     fail = RefreshFailHA()
     guarded = await _apply_and_confirm(
         fail, {"entity_id": "cover.garage", "state": "closed", "attributes": {}},

@@ -23,11 +23,20 @@ from .client import HAError, HAClient
 log = logging.getLogger("homeassistant_xiaozhiserver.service")
 
 def _accepts_force(get_state: Any) -> bool:
-    """判断客户端 get_state 是否显式接受 force 参数，避免用宽泛 TypeError 兜底掩盖真实故障。"""
+    """判断客户端 get_state 是否强制接受 force 参数。
+
+    通过 signature.bind 判断，兼容 get_state(eid, *args, **kwargs) 这类包装函数；
+    签名不可读时保守地按支持处理，真实调用异常由上层失败关闭。
+    """
     try:
-        return "force" in inspect.signature(get_state).parameters
+        sig = inspect.signature(get_state)
     except (TypeError, ValueError):
         return True
+    try:
+        sig.bind("__entity__", force=True)
+        return True
+    except TypeError:
+        return False
 
 
 SUPPORTED_ACTIONS = [
@@ -504,7 +513,11 @@ async def _apply_and_confirm(ha: "HAClient", st: dict, service_domain: str,
                 fresh = await ha.get_state(eid, force=True)
             else:
                 fresh = await ha.get_state(eid)
-        except HAError:
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            # 除取消外，任何刷新异常都按“无法确认最新状态”失败关闭，绝不用旧缓存
+            # 去执行门锁/车库门等危险动作。
             fresh = None
         if isinstance(fresh, dict) and str(fresh.get("entity_id") or "") == eid:
             st = fresh

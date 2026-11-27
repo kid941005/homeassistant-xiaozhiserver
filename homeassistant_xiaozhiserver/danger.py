@@ -40,7 +40,7 @@ def _danger_flags(entity_id: str, attributes: Optional[dict]) -> tuple:
         # 中文没有词边界，直接子串匹配。
         ascii_words = ("garage", "gate", "window", "door")
         if any(re.search(r"(?<![a-z])" + w + r"(?![a-z])", ident) for w in ascii_words) \
-                or any(k in ident for k in ("车库", "大门", "窗户")):
+                or any(k in ident for k in ("车库", "大门", "窗户", "前门", "后门", "侧门", "卷帘门")):
             return True, "该 cover 设备（" + str(entity_id) + "）名称/标识疑似门窗或车库，按高风险处理"
     return False, None
 
@@ -144,10 +144,18 @@ def _issue_confirm_token(entity_id: str, service_domain: str, service: str, payl
     return token
 
 
+def _consume_confirm_token(token: Optional[str]) -> None:
+    """批量确认：整批最终检查全部通过后统一消费令牌，避免被单台目标提前消费后其余目标失效。"""
+    tok = (token or "").strip()
+    if tok:
+        _CONFIRM_TOKENS.pop(tok, None)
+
+
 def _danger_block(st: dict, service_domain: str, service: str,
                   payload: dict, confirm_token: Optional[str],
                   intent_domain: Optional[str] = None,
-                  intent_service: Optional[str] = None) -> Optional[dict]:
+                  intent_service: Optional[str] = None,
+                  consume: bool = True) -> Optional[dict]:
     """危险设备二次确认闸门：返回拦截结果；非危险或确认通过返回 None。
 
     intent_domain/intent_service 用于批量确认：令牌 intent 必须只取决于规范化后的
@@ -198,6 +206,7 @@ def _danger_block(st: dict, service_domain: str, service: str,
         log.warning("danger confirmation rejected entity=%s service=%s code=confirm_token_mismatch", eid, svc_str)
         return {**base, "code": "confirm_token_mismatch",
                 "message": "确认令牌与本次操作不匹配（设备、服务或参数已变化）。请重新发起原操作获取新的 confirm_token。"}
-    _CONFIRM_TOKENS.pop(token, None)  # 一次性：校验通过即消费
+    if consume:
+        _CONFIRM_TOKENS.pop(token, None)  # 一次性：校验通过即消费；锁内 fresh 复查由最终检查消费
     log.info("danger confirmation passed entity=%s service=%s", eid, svc_str)
     return None

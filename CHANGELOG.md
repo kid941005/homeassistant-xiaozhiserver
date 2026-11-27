@@ -8,6 +8,24 @@
 
 暂无计划中的变更。
 
+## [1.15.7] - 2026-11-27
+
+最终对抗复核问题修复版本。
+
+### 修复
+
+- 危险确认令牌不再仅凭非空跳过锁内 fresh 复查：初始缓存看似安全时，force 刷新发现车库门/高风险设备仍会拒绝无效令牌并返回 invalid_confirm_token。
+- 批量阶段一到阶段二之间的 late-danger 在实体锁内 fresh 状态重新判定；令牌只在整批全部通过后统一消费，避免被首台目标提前消费导致其余目标或 late-danger 失效。
+- 批量确认令牌 intent 使用稳定的 batch/control_devices 前缀，输入顺序变化不再触发 confirm_token_mismatch。
+- 批量总时限从入口开始计时，状态/注册表加载与实体解析也受 CONTROL_BATCH_TIMEOUT 约束，超时返回 not_sent/batch_timeout。
+- force GET 不再覆盖请求期间到达的较新 WebSocket 事件（实体时间戳/generation 双重校验，必要时重试）。
+- 锁内刷新失败统一返回 state_unavailable（含非 HAError 异常），带 confirm_token 也不降级；`_accepts_force` 改为签名 bind 判断。
+- 危险 cover 中文关键词补充 前门/后门/侧门/卷帘门；批量超时分支补充 dispatch_state=may_be_dispatched。
+
+### 测试
+
+- 新增 confirm_window 回归：缓存未识别危险 + 任意非空令牌、批量 late-danger 均拒绝且不调用 call_service。
+
 ## [1.15.6] - 2026-11-27
 
 对抗性复核问题修复版本。
