@@ -349,6 +349,17 @@ async def run() -> None:
     for cn_safe in ("窗帘", "窗纱", "门铃", "门磁", "门帘", "百叶窗", "纱窗"):
         check(not _danger_flags("cover.x", {"friendly_name": cn_safe})[0],
               "非门窗本体不误判：" + cn_safe)
+    for safe_name, eid in (("百叶窗", "cover.living_room_window"),
+                           ("纱窗", "cover.bedroom_window"),
+                           ("窗帘", "cover.living_room_window")):
+        check(not _danger_flags(eid, {"friendly_name": safe_name})[0],
+              "英文 entity_id 含 window 时安全窗帘/纱窗不误判：" + eid + "/" + safe_name)
+    check(not _danger_flags("cover.window_screen", {"friendly_name": "纱窗"})[0],
+          "窗纱 entity_id 不误判")
+    check(not _danger_flags("cover.projection_screen", {"friendly_name": "投影幕"})[0],
+          "投影幕 screen 不误判")
+    check(_danger_flags("cover.screen_door", {"friendly_name": "纱门"})[0],
+          "纱门仍按高风险处理")
     ha = SlowHA()
     st = {"entity_id": "light.slow", "state": "off", "attributes": {}}
     result = await _apply_and_confirm(

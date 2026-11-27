@@ -44,9 +44,19 @@ def _danger_flags(entity_id: str, attributes: Optional[dict]) -> tuple:
         # 先排除门铃/门磁/窗帘/窗纱/门帘/百叶窗/纱窗等并非门窗本体的设备，避免误报。
         cn_safe = ("门铃", "门磁", "窗帘", "窗纱", "门帘", "百叶窗", "纱窗")
         cn_hot = ("道闸", "闸机", "起落杆", "闸杆", "卷闸")
+        # 百叶窗/纱窗/窗帘等英文 entity_id 常含 window，安全词必须同时作用于英文分支，
+        # 否则 friendly_name=百叶窗 但 entity_id=cover.living_room_window 仍会误报。
+        ascii_safe = ("doorbell", "door_bell", "curtain", "blind", "shade")
+        safe_hit = any(k in ident for k in cn_safe) or any(
+            re.search(r"(?<![a-z])" + w + r"(?![a-z])", ident) for w in ascii_safe)
+        # screen 单独出现多为投影幕/纱窗；仅当同时含独立 door 时才视为纱门（真实门体）。
+        if re.search(r"(?<![a-z])screen(?![a-z])", ident) and not re.search(
+                r"(?<![a-z])door(?![a-z])", ident):
+            safe_hit = True
         cn_hit = (any(k in ident for k in ("门", "窗")) or any(k in ident for k in cn_hot)) \
-            and not any(k in ident for k in cn_safe)
-        if any(re.search(r"(?<![a-z])" + w + r"(?![a-z])", ident) for w in ascii_words) or cn_hit:
+            and not safe_hit
+        ascii_hit = any(re.search(r"(?<![a-z])" + w + r"(?![a-z])", ident) for w in ascii_words)
+        if (ascii_hit or cn_hit) and not safe_hit:
             return True, "该 cover 设备（" + str(entity_id) + "）名称/标识疑似门窗或车库，按高风险处理"
     return False, None
 
