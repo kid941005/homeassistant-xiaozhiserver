@@ -501,6 +501,23 @@ async def _apply_and_confirm(ha: "HAClient", st: dict, service_domain: str,
     eid = str(st.get("entity_id"))
     lock_factory = getattr(ha, "entity_lock", None)
     if not callable(lock_factory):
+        # 无实体锁的后备路径也必须先 force 回源，再在最新状态上执行危险
+        # precheck，不能直接拿旧缓存下发（P3-9）。
+        if precheck is not None:
+            try:
+                if _accepts_force(ha.get_state):
+                    fresh = await ha.get_state(eid, force=True)
+                else:
+                    fresh = await ha.get_state(eid)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                fresh = None
+            if not isinstance(fresh, dict) or str(fresh.get("entity_id") or "") != eid:
+                return {"_danger_guard": {
+                    "ok": False, "code": "state_unavailable",
+                    "message": "无法刷新设备最新状态，无法确认是否属于危险设备，已拒绝执行。"}}
+            st = fresh
         return await _apply_and_confirm_unlocked(
             ha, st, service_domain, service, payload, action_label,
             precheck=precheck, dispatch_state=dispatch_state

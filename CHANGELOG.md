@@ -8,6 +8,25 @@
 
 暂无计划中的变更。
 
+## [1.15.8] - 2026-11-27
+
+第二轮最终对抗复核问题修复版本。
+
+### 修复
+
+- 通用 call_service 与 control_device 一致：初始缓存可能缺少危险属性时，非空 confirm_token 不再跳过锁内 fresh 危险复查，任意伪造令牌无法打开车库门/门锁；令牌校验通过后在真实下发边界统一消费。
+- 有效令牌在锁内 fresh 刷新后设备已不再判定为危险时也会被消费，避免同一令牌在 TTL 内重放执行第二次。
+- 批量阶段二发现 late-danger 时不再直接丢弃并发 gather 中其他已执行目标的副作用，返回确认请求同时附带 executed_entities/results 部分结果。
+- 批量入口第二次 get_states（状态首次加载失败时由 _redundant_switch_context 触发）纳入 CONTROL_BATCH_TIMEOUT，超时返回 not_sent/batch_timeout。
+- 批量阶段一 force 刷新遇到非 HAError（RuntimeError/TypeError 等）同样按 state_unavailable 失败关闭，不再冒泡 internal_error。
+- 无 entity_lock 的后备执行路径也先 force 回源并在最新状态上做危险 precheck，不再直接使用旧缓存。
+- 批量令牌消费契约明确：任一目标实际开始下发即消费令牌，全部 not_sent 时保留，避免部分执行后令牌重放。
+- 危险 cover 中文关键词补充 入户门/庭院门/电动门/道闸/闸机。
+
+### 测试
+
+- confirm_window 新增：通用 call_service 任意非空令牌被 fresh 拒绝；同一有效令牌只能执行一次；批量双目标 late-danger 返回部分结果且已下发目标不丢失；批量 POST 后 invalid_response、control_device/call_service 取消、批量控制取消场景均消费令牌。
+
 ## [1.15.7] - 2026-11-27
 
 最终对抗复核问题修复版本。

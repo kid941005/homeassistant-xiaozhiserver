@@ -566,6 +566,10 @@ class DeviceService:
                                               precheck=precheck)
             if "_danger_guard" in result:
                 return result["_danger_guard"]
+            # 令牌一旦用于实际下发就必须失效：即使锁内 fresh 刷新后已不再判定为危险，
+            # 也不能保留到 TTL 结束造成重放。
+            if confirm_token:
+                _consume_confirm_token(confirm_token)
             result["ok"] = _result_ok(result)
             if not result["ok"]:
                 result["code"] = _failure_code(result)
@@ -581,7 +585,13 @@ class DeviceService:
                 result.pop("action", None)
                 result.pop("response", None)
             return result
+        except asyncio.CancelledError:
+            if confirm_token:
+                _consume_confirm_token(confirm_token)
+            raise
         except HAError as e:
+            if confirm_token:
+                _consume_confirm_token(confirm_token)
             if e.code == "post_timeout":
                 return {"ok": False, "status": "accepted_pending", "code": "pending_confirmation",
                         "dispatch_state": "may_be_dispatched",
@@ -589,6 +599,8 @@ class DeviceService:
                         "hint": "请稍后用 get_device_state 核对设备状态，避免直接重试 toggle。"}
             return {"ok": False, **e.to_dict(), "hint": "可先用 list_devices / get_device_state 确认设备与能力后重试。"}
         except Exception as e:  # noqa: BLE001
+            if confirm_token:
+                _consume_confirm_token(confirm_token)
             return {"ok": False, "code": "internal_error", "message": "控制设备失败：" + str(e)}
 
     async def control_devices(self, entities: list[str], action: str, value: Optional[Any] = None,
@@ -600,6 +612,7 @@ class DeviceService:
         任一目标属于危险设备或本次服务高风险时，整批只申请一次 confirm_token；
         用户确认后带同一 token 重试整批即可。单次最多 20 个设备。
         """
+        dispatch_states: list = []
         try:
             ha = self._ha_provider()
             action_name = (action or "").strip().lower()
@@ -644,8 +657,13 @@ class DeviceService:
                 batch_registry_error = exc
             batch_registry_loaded = True
             try:
-                batch_hidden, _ = await _redundant_switch_context(
-                    ha, batch_states, batch_maps, batch_registry_loaded)
+                # batch_states 首次 get_states 失败时，_redundant_switch_context 内部
+                # 还会再拉一次全量状态；这里同样受批量总时限约束，避免绕过 deadline。
+                batch_hidden, _ = await asyncio.wait_for(
+                    _redundant_switch_context(ha, batch_states, batch_maps, batch_registry_loaded),
+                    timeout=max(0.01, deadline - time.monotonic()))
+            except asyncio.TimeoutError:
+                return not_sent
             except HAError:
                 batch_hidden = None
             for ref in refs:
@@ -725,7 +743,11 @@ class DeviceService:
                     return {"ok": False, "status": "not_sent", "code": "batch_timeout",
                             "entity_id": op["entity_id"],
                             "message": "批量控制超时，指令未下发。"}
-                except HAError:
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001
+                    # 非 HAError（RuntimeError/TypeError 等）同样按无法确认最新状态处理，
+                    # 不能冒泡成 internal_error 掩盖危险失败关闭语义（P2-7）。
                     fresh = None
                 if not isinstance(fresh, dict) or str(fresh.get("entity_id") or "") != op["entity_id"]:
                     return {"ok": False, "code": "state_unavailable",
@@ -771,6 +793,7 @@ class DeviceService:
                     if remaining <= 0:
                         raise _BatchNotDispatched()
                     dispatch_state: dict = {"dispatched": False}
+                    dispatch_states.append(dispatch_state)
                     # 阶段一到阶段二之间设备属性仍可能变化：在实体锁内 fresh 状态上
                     # 再判一次危险，令牌只校验不消费，整批结束后统一消费。
                     def _fresh_guard(fresh, op=op):
@@ -787,15 +810,35 @@ class DeviceService:
                             timeout=remaining)
                     except asyncio.TimeoutError as exc:
                         raise _BatchTimeout(dispatch_state.get("dispatched", False)) from exc
+                    except asyncio.CancelledError:
+                        # 取消时若 POST 已开始，令牌必须失效，避免取消后重放。
+                        if dispatch_state.get("dispatched"):
+                            _consume_confirm_token(confirm_token)
+                        raise
+                    except BaseException as exc:  # noqa: BLE001
+                        # 保留“是否已开始下发”，供外层决定令牌消费与 accepted_pending 语义。
+                        try:
+                            exc.dispatched = bool(dispatch_state.get("dispatched"))
+                        except Exception:  # noqa: BLE001
+                            pass
+                        raise
 
             tasks = [_run_one(op) for op in resolved]
-            raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+            try:
+                raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+            except asyncio.CancelledError:
+                if confirm_token and any(ds.get("dispatched") for ds in dispatch_states):
+                    _consume_confirm_token(confirm_token)
+                raise
             per: list = []
             voices: list = []
             failed: list = []
             failed_names: list = []
+            late_guard: Optional[dict] = None
             for op, result in zip(resolved, raw_results, strict=True):
                 if isinstance(result, asyncio.CancelledError):
+                    if confirm_token and any(ds.get("dispatched") for ds in dispatch_states):
+                        _consume_confirm_token(confirm_token)
                     raise result
                 if isinstance(result, _BatchNotDispatched):
                     per.append({"ok": False, "entity_id": op["entity_id"],
@@ -830,24 +873,36 @@ class DeviceService:
                     failed_names.append(_friendly_name(op["st"]))
                     continue
                 if isinstance(result, dict) and "_danger_guard" in result:
-                    # 锁内 force 刷新后才发现是危险设备：整批未下发该项，返回确认请求。
-                    guard = result["_danger_guard"]
-                    guard["entities"] = [op2["entity_id"] for op2 in resolved]
-                    return guard
+                    # 锁内 force 刷新后才发现是危险设备。并发 gather 中其他目标可能
+                    # 已经下发成功，不能直接丢弃这些副作用；先记录，全部收集后
+                    # 返回“确认请求 + 已执行目标”的部分结果（P1-2）。
+                    late_guard = dict(result["_danger_guard"])
+                    late_guard["entities"] = [op2["entity_id"] for op2 in resolved]
+                    continue
                 if isinstance(result, BaseException):
+                    dispatched = bool(getattr(result, "dispatched", False))
                     if isinstance(result, HAError):
-                        if result.code == "post_timeout":
+                        if result.code == "post_timeout" or dispatched:
                             per.append({"ok": False, "entity_id": op["entity_id"],
                                         "status": "accepted_pending", "code": "pending_confirmation",
                                         "dispatch_state": "may_be_dispatched",
                                         "device_action": action_name,
-                                        "message": "调用已发出但超时或网络中断，无法确认是否执行。"})
+                                        "error_code": result.code,
+                                        "message": "调用可能已下发但返回异常，无法确认是否执行。"})
                         else:
                             per.append({"ok": False, "entity_id": op["entity_id"],
                                         "device_action": action_name, **result.to_dict()})
                     else:
-                        per.append({"ok": False, "entity_id": op["entity_id"], "code": "internal_error",
-                                    "device_action": action_name, "message": str(result)})
+                        if dispatched:
+                            per.append({"ok": False, "entity_id": op["entity_id"],
+                                        "status": "accepted_pending", "code": "pending_confirmation",
+                                        "dispatch_state": "may_be_dispatched",
+                                        "device_action": action_name,
+                                        "error_code": "internal_error",
+                                        "message": "调用可能已下发但返回异常，无法确认是否执行。"})
+                        else:
+                            per.append({"ok": False, "entity_id": op["entity_id"], "code": "internal_error",
+                                        "device_action": action_name, "message": str(result)})
                     failed.append(op["entity_id"])
                     failed_names.append(_friendly_name(op["st"]))
                     continue
@@ -866,6 +921,22 @@ class DeviceService:
                     failed_names.append(_friendly_name(op["st"]))
                 per.append(result)
 
+            if late_guard is not None:
+                executed = [item.get("entity_id") for item in per
+                            if item.get("ok") or item.get("status") not in (None, "not_sent")
+                            or item.get("dispatch_state") == "may_be_dispatched"]
+                if executed:
+                    late_guard["partial"] = True
+                    late_guard["executed_entities"] = executed
+                    late_guard["results"] = per
+                    late_guard["message"] = (
+                        str(late_guard.get("message") or "")
+                        + "；其中 " + str(len(executed)) + " 个目标已下发成功："
+                        + "、".join(executed) + "。"
+                    )
+                    if confirm_token:
+                        _consume_confirm_token(confirm_token)
+                return late_guard
             ok = bool(per) and all(bool(item.get("ok")) for item in per) and not errors
             out = {"ok": ok, "count": len(per), "action": "RESPONSE" if voices else None,
                    "response": "；".join(voices) if voices else "", "results": per}
@@ -888,14 +959,26 @@ class DeviceService:
                     out["response"] = out["response"] + "；另有 " + str(failed_count) + " 个设备未成功" + detail + "。"
             if not out["response"]:
                 out.pop("response", None)
-            # 只有整批最终检查全部通过并完成下发才消费令牌；若中途返回 late-danger
-            # 确认请求，令牌保留以便用户确认后用同一批操作重试。
+            # 契约：只要有任意目标实际开始下发（成功、mismatch、accepted_pending 等），
+            # 令牌就消费，避免部分执行后令牌保留造成重放；全部 not_sent 时保留令牌。
             if confirm_token:
-                _consume_confirm_token(confirm_token)
+                dispatched_any = any(
+                    item.get("ok") or item.get("status") not in (None, "not_sent")
+                    for item in per)
+                if dispatched_any:
+                    _consume_confirm_token(confirm_token)
             return out
+        except asyncio.CancelledError:
+            if confirm_token and any(ds.get("dispatched") for ds in dispatch_states):
+                _consume_confirm_token(confirm_token)
+            raise
         except HAError as e:
+            if confirm_token and any(ds.get("dispatched") for ds in dispatch_states):
+                _consume_confirm_token(confirm_token)
             return {"ok": False, **e.to_dict(), "hint": _hint()}
         except Exception as e:  # noqa: BLE001
+            if confirm_token and any(ds.get("dispatched") for ds in dispatch_states):
+                _consume_confirm_token(confirm_token)
             return {"ok": False, "code": "internal_error", "message": "批量控制失败：" + str(e)}
 
     async def list_services(self, entity: Optional[str] = None, domain: Optional[str] = None,
@@ -1050,15 +1133,19 @@ class DeviceService:
             validate_action_attributes(service_domain, extra, st.get("attributes"))
             payload = {"entity_id": eid}
             payload.update(extra)
-            guard = _danger_block(st, service_domain, svc, payload, confirm_token)
+            # 与 control_device 一致：初始缓存可能缺少危险属性，非空令牌不能跳过
+            # 锁内 fresh 复查，且校验通过后在真实下发边界统一消费。
+            guard = _danger_block(st, service_domain, svc, payload, confirm_token, consume=False)
             if guard is not None:
                 return guard
-            precheck = None if confirm_token else (
-                lambda fresh: _danger_block(fresh, service_domain, svc, payload, None))
+            precheck = lambda fresh: _danger_block(  # noqa: E731
+                fresh, service_domain, svc, payload, confirm_token, consume=True)
             result = await _apply_and_confirm(ha, st, service_domain, svc, payload, spec,
                                               precheck=precheck)
             if "_danger_guard" in result:
                 return result["_danger_guard"]
+            if confirm_token:
+                _consume_confirm_token(confirm_token)
             result["ok"] = _result_ok(result)
             if not result["ok"]:
                 result["code"] = _failure_code(result)
@@ -1074,7 +1161,13 @@ class DeviceService:
                 result.pop("action", None)
                 result.pop("response", None)
             return result
+        except asyncio.CancelledError:
+            if confirm_token:
+                _consume_confirm_token(confirm_token)
+            raise
         except HAError as e:
+            if confirm_token:
+                _consume_confirm_token(confirm_token)
             out = {"ok": False, **e.to_dict()}
             if e.code == "post_timeout":
                 out["status"] = "accepted_pending"
@@ -1087,6 +1180,8 @@ class DeviceService:
                 out["hint"] = _hint()
             return out
         except Exception as e:  # noqa: BLE001
+            if confirm_token:
+                _consume_confirm_token(confirm_token)
             return {"ok": False, "code": "internal_error", "message": "调用服务失败：" + str(e)}
 
     async def list_domains(self, ) -> dict:

@@ -103,8 +103,107 @@ class DangerSwapHA:
         return False
 
 
+class ReplayHA(DangerSwapHA):
+    """令牌消费回归：首次危险确认，令牌下发一次后必须失效。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.opened = False
+
+    async def get_state(self, entity_id: str, force: bool = False):
+        self.reads += 1
+        state = "open" if self.opened else "closed"
+        return {"entity_id": entity_id, "state": state,
+                "attributes": {"device_class": "garage"}}
+
+    async def call_service(self, domain: str, service: str, payload: dict):
+        self.called = True
+        self.opened = True
+        return None
+
+
+class TimeoutDangerHA(DangerSwapHA):
+    """首次确认后 fresh 变安全但 POST 超时：令牌仍必须消费。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    async def get_state(self, entity_id: str, force: bool = False):
+        self.reads += 1
+        attrs = {"device_class": "garage"} if self.reads in (1, 3) else {}
+        return {"entity_id": entity_id, "state": "closed", "attributes": attrs}
+
+    async def call_service(self, domain: str, service: str, payload: dict):
+        self.called = True
+        self.calls += 1
+        raise HAError("post_timeout", "模拟 POST 超时")
+
+
+class CancelDangerHA(DangerSwapHA):
+    """锁内 fresh 变安全后调用被取消：令牌仍必须消费。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.called = False
+
+    async def get_state(self, entity_id: str, force: bool = False):
+        self.reads += 1
+        attrs = {"device_class": "garage"} if self.reads in (1, 3) else {}
+        return {"entity_id": entity_id, "state": "closed", "attributes": attrs}
+
+    async def call_service(self, domain: str, service: str, payload: dict):
+        self.called = True
+        await asyncio.Event().wait()
+
+
+class PartialDangerHA:
+    """批量阶段二 late-danger：一个目标已下发，另一个才发现是车库门。"""
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self.called = 0
+        self.opened: set[str] = set()
+        self.cover_reads = 0
+
+    def entity_lock(self, entity_id: str) -> asyncio.Lock:
+        return self._lock
+
+    async def get_state(self, entity_id: str, force: bool = False):
+        attrs: dict = {}
+        if entity_id == "cover.b":
+            self.cover_reads += 1
+            if self.cover_reads > 1:
+                attrs = {"device_class": "garage"}
+        return {"entity_id": entity_id,
+                "state": "open" if entity_id in self.opened else "closed",
+                "attributes": attrs}
+
+    async def call_service(self, domain: str, service: str, payload: dict):
+        self.called += 1
+        eid = str(payload.get("entity_id") or "")
+        self.opened.add(eid)
+        return None
+
+    async def get_states(self):
+        return [{"entity_id": "cover.a", "state": "closed", "attributes": {}},
+                {"entity_id": "cover.b", "state": "closed", "attributes": {}}]
+
+    async def get_registries(self):
+        return {"devices": [], "entities": [], "areas": []}
+
+    def state_stream_ready(self) -> bool:
+        return False
+
+
 async def _fake_resolve(ha, entity, verb, *args):
     return {"entity_id": "cover.x", "state": "closed", "attributes": {}}, None
+
+
+async def _fake_resolve_any(ha, entity, verb, *args):
+    eid = str(entity)
+    state = "open" if eid in getattr(ha, "opened", set()) else "closed"
+    return {"entity_id": eid, "state": state, "attributes": {}}, None
 
 
 class StaticHA:
@@ -227,6 +326,174 @@ async def run() -> None:
     check(batch_blocked.get("code") == "invalid_confirm_token",
           "批量阶段二 late-danger 仍复核确认令牌")
     check(swap2.called is False, "批量 late-danger 时不调用 call_service")
+    call_swap = DangerSwapHA()
+    call_service = DeviceService(lambda: call_swap)
+    with patch.object(devices_module, "_resolve_entity_or_error", new=_fake_resolve):
+        call_blocked = await call_service.call_service(
+            "cover.x", "cover.open_cover", confirm_token="bogus")
+    check(call_blocked.get("code") == "invalid_confirm_token",
+          "通用 call_service 非空令牌不能跳过锁内 fresh 危险复查")
+    check(call_swap.called is False, "call_service 锁内 fresh 发现车库门后拒绝下发")
+    timeout_ha = TimeoutDangerHA()
+    timeout_service = DeviceService(lambda: timeout_ha)
+    with patch.object(devices_module, "_resolve_entity_or_error", new=_fake_resolve):
+        first_timeout = await timeout_service.control_device("cover.x", "open")
+        timeout_token = str(first_timeout.get("confirm_token") or "")
+        check(bool(timeout_token), "超时场景首次仍返回确认令牌")
+        timed_out = await timeout_service.control_device(
+            "cover.x", "open", confirm_token=timeout_token)
+        check(timed_out.get("code") == "pending_confirmation",
+              "fresh 变安全后 POST 超时返回 pending_confirmation")
+        reused_timeout = await timeout_service.control_device(
+            "cover.x", "open", confirm_token=timeout_token)
+    check(reused_timeout.get("code") == "invalid_confirm_token",
+          "POST 超时后令牌也必须失效，不能重放")
+    call_timeout_ha = TimeoutDangerHA()
+    call_timeout_service = DeviceService(lambda: call_timeout_ha)
+    with patch.object(devices_module, "_resolve_entity_or_error", new=_fake_resolve):
+        first_call_timeout = await call_timeout_service.call_service(
+            "cover.x", "cover.open_cover")
+        call_timeout_token = str(first_call_timeout.get("confirm_token") or "")
+        check(bool(call_timeout_token), "call_service 超时场景首次仍返回确认令牌")
+        call_timed_out = await call_timeout_service.call_service(
+            "cover.x", "cover.open_cover", confirm_token=call_timeout_token)
+        check(call_timed_out.get("code") == "pending_confirmation",
+              "call_service fresh 变安全后 POST 超时返回 pending_confirmation")
+        reused_call_timeout = await call_timeout_service.call_service(
+            "cover.x", "cover.open_cover", confirm_token=call_timeout_token)
+    check(reused_call_timeout.get("code") == "invalid_confirm_token",
+          "call_service POST 超时后令牌同样必须失效")
+    invalid_ha = DangerSwapHA()
+    invalid_service = DeviceService(lambda: invalid_ha)
+
+    async def _fake_invalid_apply(ha, st, *args, dispatch_state=None, **kwargs):
+        if dispatch_state is not None:
+            dispatch_state["dispatched"] = True
+        raise HAError("invalid_response", "模拟 POST 后响应非法")
+
+    with patch.object(devices_module, "_resolve_entity_or_error", new=_fake_resolve_any), \
+            patch.object(devices_module, "_apply_and_confirm", new=_fake_invalid_apply):
+        first_invalid = await invalid_service.control_devices(["cover.x"], "open")
+        invalid_token = str(first_invalid.get("confirm_token") or "")
+        check(bool(invalid_token), "批量非超时异常场景首次返回确认令牌")
+        invalid_out = await invalid_service.control_devices(
+            ["cover.x"], "open", confirm_token=invalid_token)
+        check((invalid_out.get("results") or [{}])[0].get("status") == "accepted_pending",
+              "已下发后返回 invalid_response 标记 accepted_pending")
+        reused_invalid = await invalid_service.control_devices(
+            ["cover.x"], "open", confirm_token=invalid_token)
+    check(reused_invalid.get("code") == "invalid_confirm_token",
+          "批量 POST 后 invalid_response 也必须消费令牌")
+    cancel_ha = CancelDangerHA()
+    cancel_service = DeviceService(lambda: cancel_ha)
+    with patch.object(devices_module, "_resolve_entity_or_error", new=_fake_resolve):
+        first_cancel = await cancel_service.control_device("cover.x", "open")
+        cancel_token = str(first_cancel.get("confirm_token") or "")
+        cancel_task = asyncio.create_task(
+            cancel_service.control_device("cover.x", "open", confirm_token=cancel_token))
+        for _ in range(100):
+            if cancel_ha.called:
+                break
+            await asyncio.sleep(0.01)
+        cancel_task.cancel()
+        try:
+            await cancel_task
+        except asyncio.CancelledError:
+            pass
+        reused_cancel = await cancel_service.control_device(
+            "cover.x", "open", confirm_token=cancel_token)
+    check(reused_cancel.get("code") == "invalid_confirm_token",
+          "control_device 取消后令牌必须失效")
+    call_cancel_ha = CancelDangerHA()
+    call_cancel_service = DeviceService(lambda: call_cancel_ha)
+    with patch.object(devices_module, "_resolve_entity_or_error", new=_fake_resolve):
+        first_call_cancel = await call_cancel_service.call_service("cover.x", "cover.open_cover")
+        call_cancel_token = str(first_call_cancel.get("confirm_token") or "")
+        call_cancel_task = asyncio.create_task(
+            call_cancel_service.call_service("cover.x", "cover.open_cover",
+                                             confirm_token=call_cancel_token))
+        for _ in range(100):
+            if call_cancel_ha.called:
+                break
+            await asyncio.sleep(0.01)
+        call_cancel_task.cancel()
+        try:
+            await call_cancel_task
+        except asyncio.CancelledError:
+            pass
+        reused_call_cancel = await call_cancel_service.call_service(
+            "cover.x", "cover.open_cover", confirm_token=call_cancel_token)
+    check(reused_call_cancel.get("code") == "invalid_confirm_token",
+          "call_service 取消后令牌必须失效")
+    batch_cancel_ha = DangerSwapHA()
+    batch_cancel_service = DeviceService(lambda: batch_cancel_ha)
+
+    async def _fake_wait_apply(ha, st, *args, dispatch_state=None, **kwargs):
+        batch_cancel_ha.called = True
+        if dispatch_state is not None:
+            dispatch_state["dispatched"] = True
+        await asyncio.Event().wait()
+
+    with patch.object(devices_module, "_resolve_entity_or_error", new=_fake_resolve_any), \
+            patch.object(devices_module, "_apply_and_confirm", new=_fake_wait_apply):
+        first_batch_cancel = await batch_cancel_service.control_devices(["cover.x"], "open")
+        batch_cancel_token = str(first_batch_cancel.get("confirm_token") or "")
+        batch_cancel_task = asyncio.create_task(
+            batch_cancel_service.control_devices(["cover.x"], "open",
+                                                 confirm_token=batch_cancel_token))
+        for _ in range(100):
+            if batch_cancel_ha.called:
+                break
+            await asyncio.sleep(0.01)
+        batch_cancel_task.cancel()
+        try:
+            await batch_cancel_task
+        except asyncio.CancelledError:
+            pass
+        reused_batch_cancel = await batch_cancel_service.control_devices(
+            ["cover.x"], "open", confirm_token=batch_cancel_token)
+    check(reused_batch_cancel.get("code") == "invalid_confirm_token",
+          "批量控制取消后令牌必须失效")
+    replay = ReplayHA()
+    replay_service = DeviceService(lambda: replay)
+    with patch.object(devices_module, "_resolve_entity_or_error", new=_fake_resolve):
+        first = await replay_service.control_device("cover.x", "open")
+        replay_token = str(first.get("confirm_token") or "")
+        check(bool(replay_token), "危险操作首次返回确认令牌")
+        executed = await replay_service.control_device(
+            "cover.x", "open", confirm_token=replay_token)
+        check(replay.called is True and executed.get("code") != "invalid_confirm_token",
+              "有效令牌可执行一次危险操作")
+        reused = await replay_service.control_device(
+            "cover.x", "open", confirm_token=replay_token)
+    check(reused.get("code") == "invalid_confirm_token", "同一令牌不能重放执行第二次")
+    partial = PartialDangerHA()
+    partial_service = DeviceService(lambda: partial)
+    with patch.object(devices_module, "_resolve_entity_or_error", new=_fake_resolve_any):
+        partial_out = await partial_service.control_devices(["cover.a", "cover.b"], "open")
+    check(partial_out.get("code") == "confirmation_required",
+          "批量 late-danger 返回确认请求")
+    check(partial.called == 1, "批量 late-danger 前已执行的目标不被丢弃")
+    check("cover.a" in (partial_out.get("executed_entities") or []),
+          "部分结果列出已下发目标")
+    pending_ha = PartialDangerHA()
+
+    async def _fake_pending_apply(ha, st, *args, **kwargs):
+        if str(st.get("entity_id")) == "cover.a":
+            return {"ok": False, "entity_id": str(st.get("entity_id")),
+                    "status": "accepted_pending",
+                    "code": "pending_confirmation",
+                    "dispatch_state": "may_be_dispatched",
+                    "message": "模拟已下发待确认"}
+        return {"_danger_guard": {"ok": False, "code": "confirmation_required",
+                                  "message": "模拟 late danger"}}
+
+    pending_service = DeviceService(lambda: pending_ha)
+    with patch.object(devices_module, "_resolve_entity_or_error", new=_fake_resolve_any), \
+            patch.object(devices_module, "_apply_and_confirm", new=_fake_pending_apply):
+        pending_out = await pending_service.control_devices(["cover.a", "cover.b"], "open")
+    check("cover.a" in (pending_out.get("executed_entities") or []),
+          "late-danger 部分结果包含 accepted_pending 已下发目标")
     fail = RefreshFailHA()
     guarded = await _apply_and_confirm(
         fail, {"entity_id": "cover.garage", "state": "closed", "attributes": {}},

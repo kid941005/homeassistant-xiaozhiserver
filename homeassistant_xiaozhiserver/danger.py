@@ -40,7 +40,8 @@ def _danger_flags(entity_id: str, attributes: Optional[dict]) -> tuple:
         # 中文没有词边界，直接子串匹配。
         ascii_words = ("garage", "gate", "window", "door")
         if any(re.search(r"(?<![a-z])" + w + r"(?![a-z])", ident) for w in ascii_words) \
-                or any(k in ident for k in ("车库", "大门", "窗户", "前门", "后门", "侧门", "卷帘门")):
+                or any(k in ident for k in ("车库", "大门", "窗户", "前门", "后门", "侧门",
+                                                "卷帘门", "入户门", "庭院门", "电动门", "道闸", "闸机")):
             return True, "该 cover 设备（" + str(entity_id) + "）名称/标识疑似门窗或车库，按高风险处理"
     return False, None
 
