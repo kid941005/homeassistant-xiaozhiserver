@@ -42,7 +42,7 @@ def _danger_flags(entity_id: str, attributes: Optional[dict]) -> tuple:
         # 显式高危词覆盖不含“门/窗”的道闸、闸机、起落杆等物理通道设备（恢复 v1.15.8 语义）；
         # 先排除门铃/门磁/窗帘/窗纱/门帘/百叶窗/纱窗等并非门窗本体的设备，避免误报。
         cn_safe = ("门铃", "门磁", "窗帘", "窗纱", "门帘", "百叶窗", "纱窗")
-        cn_hot = ("道闸", "闸机", "起落杆", "闸杆", "卷闸")
+        cn_hot = ("道闸", "闸机", "起落杆", "闸杆", "卷闸", "车库")
         # 百叶窗/纱窗/窗帘等英文 entity_id 常含 window，安全词必须同时作用于英文分支，
         # 否则 friendly_name=百叶窗 但 entity_id=cover.living_room_window 仍会误报。
         name = str(attrs.get("friendly_name") or "").lower()
@@ -203,6 +203,12 @@ def _confirm_intent(service_domain: str, service: str, payload: dict) -> str:
 
 def _issue_confirm_token(entity_id: str, service_domain: str, service: str, payload: dict) -> str:
     _prune_confirm_tokens()
+    # 预留一个槽位再插入，避免“先裁到上限再插入”导致实际数量稳定在上限+1。
+    overflow = len(_CONFIRM_TOKENS) - (_MAX_CONFIRM_TOKENS - 1)
+    if overflow > 0:
+        oldest = sorted(_CONFIRM_TOKENS, key=lambda k: float(_CONFIRM_TOKENS[k].get("expires_at", 0)))
+        for tok in oldest[:overflow]:
+            _CONFIRM_TOKENS.pop(tok, None)
     token = secrets.token_urlsafe(12)
     _CONFIRM_TOKENS[token] = {
         "intent": _confirm_intent(service_domain, service, payload),

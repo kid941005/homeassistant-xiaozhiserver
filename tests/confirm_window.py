@@ -781,6 +781,15 @@ async def run() -> None:
         "cover", "open_cover", {"entity_id": "cover.x"}, pruned_token)
     check(bool(pruned_guard) and pruned_guard.get("code") == "confirm_token_expired",
           "被 prune 清理的过期令牌仍返回 expired 契约而非 invalid_confirm_token")
+    check(danger_module._danger_flags("cover.cheku", {"friendly_name": "车库"})[0],
+          "中文“车库”名称仍判高风险")
+    check(danger_module._danger_flags("cover.x", {"friendly_name": "百叶窗式车库"})[0],
+          "百叶窗式车库仍判高风险")
+    for _ in range(600):
+        danger_module._issue_confirm_token(
+            "cover.x", "cover", "open_cover", {"entity_id": "cover.x"})
+    check(len(danger_module._CONFIRM_TOKENS) <= danger_module._MAX_CONFIRM_TOKENS,
+          "活动确认令牌数量不超过硬上限")
     print("CONFIRM WINDOW OK")
 
 

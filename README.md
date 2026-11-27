@@ -2,7 +2,7 @@
 
 > 把 **Home Assistant** 的实体与服务封装成标准 **MCP（Model Context Protocol）** 工具，供 **小智（xiaozhi-server）** 通过 **MCP 接入点** 用自然语言查询和控制智能家居设备。
 
-**当前版本：v1.15.16** · Python 3.12 · 传输方式：**stdio MCP server + WebSocket bridge** · 单容器部署（MCP bridge + WebUI）
+**当前版本：v1.15.17** · Python 3.12 · 传输方式：**stdio MCP server + WebSocket bridge** · 单容器部署（MCP bridge + WebUI）
 
 ---
 
@@ -213,8 +213,8 @@ docker compose logs -f homeassistant-xiaozhiserver
 看到以下日志表示 bridge 已连上小智：
 
 ```text
-2026-01-01 12:00:00.123 INFO    v1.15.16 MCP_PIPE [-] MCP接入点连接成功
-2026-01-01 12:00:00.456 INFO    v1.15.16 MCP_PIPE [-] 已启动 MCP server：...
+2026-01-01 12:00:00.123 INFO    v1.15.17 MCP_PIPE [-] MCP接入点连接成功
+2026-01-01 12:00:00.456 INFO    v1.15.17 MCP_PIPE [-] 已启动 MCP server：...
 ```
 
 WebUI 地址：`http://<宿主机IP>:8099/`（端口由 `WEBUI_PORT` 决定），首次打开会跳转登录页，输入 `.env` 的 `WEBUI_TOKEN` 后才能进入。compose 使用 `network_mode: host`，因此没有 `ports` 映射；如需只允许本机访问，把 `.env` 的 `WEBUI_HOST` 设为 `127.0.0.1`。
@@ -759,6 +759,7 @@ bash tests/run_local_test.sh
 
 | 版本 | 主要变化 |
 |---|---|
+| v1.15.17 | 第九轮复核补丁：中文“车库”名称纳入危险识别（含百叶窗式车库）；活动确认令牌严格不超过 512 上限 |
 | v1.15.16 | 第八轮复核补丁：late-danger 部分结果 status=partial 与布尔 partial 同源；过期/被清理令牌返回 confirm_token_expired 契约（有界墓碑），避免误报 invalid_confirm_token |
 | v1.15.15 | 第七轮复核补丁：英文安全词支持复数与空格写法（Window Blinds/Curtains/Shades/Screens、Door Bell 不误判），混合强危险词仍判危 |
 | v1.15.14 | 第六轮复核补丁：英文安全名称识别覆盖 entity_id-only（window_blind 等不再误判，含 garage/door 仍判危）；单设备解析非 HAError 统一 state_unavailable/not_sent |
