@@ -247,6 +247,9 @@ def apply_service(domain, service, body):
     if service in ("silent", "noop"):
         # 模拟新版 HA 的 null 返回：调用被接受但不返回结果、也不产生变化
         return None
+    if service == "explode":
+        # 模拟 POST 途中连接中断：客户端无法确认指令是否已下发。
+        raise RuntimeError("simulated connection abort during POST")
     st = STATES[eid]
     a = st["attributes"]
     old_state = _snapshot_state(eid)

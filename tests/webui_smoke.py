@@ -76,6 +76,21 @@ check("超过失败阈值后返回 429 且带 Retry-After",
       r.status_code == 429 and int(r.headers.get("Retry-After", "0")) > 0,
       str(r.status_code) + " " + str(r.headers.get("Retry-After")))
 
+# 畸形/超大请求不应占用登录限速配额，避免攻击者用坏请求把 NAT 后的正常用户锁死。
+_saved_badform = dict(webui_mod._LOGIN_FAILURES)
+webui_mod._LOGIN_FAILURES.clear()
+try:
+    for _ in range(6):
+        rb = post("/login", content="not-a-form", headers={"Content-Type": "text/plain"})
+    check("畸形登录请求返回 415", rb.status_code == 415, str(rb.status_code))
+    check("畸形登录请求不占用限速配额", not webui_mod._LOGIN_FAILURES,
+          str(webui_mod._LOGIN_FAILURES))
+    rb2 = post("/login", data={"token": WEBUI_TOKEN})
+finally:
+    webui_mod._LOGIN_FAILURES.clear()
+    webui_mod._LOGIN_FAILURES.update(_saved_badform)
+check("畸形请求后正确令牌仍可登录", rb2.status_code in (200, 303), str(rb2.status_code))
+
 # 回归：登录失败来源表必须有硬上限，不能因持续新增来源而无限增长。
 _saved_cap_failures = dict(webui_mod._LOGIN_FAILURES)
 webui_mod._LOGIN_FAILURES.clear()
@@ -259,6 +274,11 @@ if os.environ.get("HA_URL") and os.environ.get("HA_TOKEN"):
         finally:
             mcp_server_mod.get_device_state = _real_get_device_state
         check("control_device 动作映射后仍判定脚本风险",
+              r.status_code == 403 and r.json().get("code") == "dangerous_operation_blocked",
+              str(r.status_code) + " " + r.text[:200])
+
+        r = post("/api/tool/call_service", json={"entity": "客厅灯", "service": "scene .turn_on"})
+        check("服务名内部空白不能绕过危险闸门",
               r.status_code == 403 and r.json().get("code") == "dangerous_operation_blocked",
               str(r.status_code) + " " + r.text[:200])
 

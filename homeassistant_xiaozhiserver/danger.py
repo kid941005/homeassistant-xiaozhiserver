@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import secrets
 import time
 from typing import Optional
@@ -35,26 +36,43 @@ def _danger_flags(entity_id: str, attributes: Optional[dict]) -> tuple:
             return True, "该 cover 设备类型（" + dc + "）属于高风险（门窗/车库等）"
         # 很多集成不填 device_class，只能靠实体 id / 名称兜底识别车库门/大门/窗。
         ident = (str(entity_id or "") + " " + str(attrs.get("friendly_name") or "")).lower()
-        keywords = ("garage", "gate", "window", "door", "车库", "大门", "窗户")
-        if any(k in ident for k in keywords):
+        # 英文关键词按词边界匹配，避免 doorbell 被 door 命中而把门铃误判为高风险；
+        # 中文没有词边界，直接子串匹配。
+        ascii_words = ("garage", "gate", "window", "door")
+        if any(re.search(r"(?<![a-z])" + w + r"(?![a-z])", ident) for w in ascii_words) \
+                or any(k in ident for k in ("车库", "大门", "窗户")):
             return True, "该 cover 设备（" + str(entity_id) + "）名称/标识疑似门窗或车库，按高风险处理"
     return False, None
 
 
-def _service_is_dangerous(service_domain: str, service: str) -> tuple:
-    """服务本身是否高风险：脚本/系统命令/系统级动作即使目标实体普通也要确认。"""
+def _service_is_dangerous(service_domain: str, service: str,
+                          target_domain: str = "") -> tuple:
+    """服务本身是否高风险：脚本/系统命令/系统级动作、场景即使目标实体普通也要确认。"""
     dom = str(service_domain or "").strip().lower()
     svc = str(service or "").strip().lower()
+    target = str(target_domain or "").strip().lower()
     if dom in DANGEROUS_SERVICE_DOMAINS:
         return True, "服务类型（" + dom + "." + svc + "）属于高风险"
+    if dom == "scene" and svc in ("turn_on", "toggle"):
+        # 场景可能包含门锁/车库等动作，无法静态确认；按高风险处理，要求用户明确确认。
+        return True, "场景服务（scene." + svc + "）可能包含高风险设备动作"
+    if (dom == "homeassistant" and svc in ("turn_on", "turn_off", "toggle")
+            and target == "scene"):
+        return True, "通过 homeassistant." + svc + " 控制场景，可能包含高风险设备动作"
+    if (dom == "homeassistant" and svc in ("turn_on", "turn_off", "toggle")
+            and target in DANGEROUS_SERVICE_DOMAINS):
+        # homeassistant.turn_on(entity=script.x) 等价于执行脚本；不能只按 homeassistant
+        # 这个通用 domain 放过，必须按目标实体域判定。
+        return True, "通过 homeassistant." + svc + " 控制高风险类型（" + target + "）"
     if dom == "homeassistant" and svc in _DANGEROUS_HOMEASSISTANT_SERVICES:
         return True, "系统级服务（homeassistant." + svc + "）属于高风险"
     return False, None
 
 
-def service_is_dangerous(service_domain: str, service: str) -> tuple:
+def service_is_dangerous(service_domain: str, service: str,
+                         target_domain: str = "") -> tuple:
     """公开封装：供 WebUI 等调用方判断服务本身是否高风险。"""
-    return _service_is_dangerous(service_domain, service)
+    return _service_is_dangerous(service_domain, service, target_domain)
 
 
 def _danger_info(entity_id: str, attributes: Optional[dict]) -> dict:
@@ -127,8 +145,14 @@ def _issue_confirm_token(entity_id: str, service_domain: str, service: str, payl
 
 
 def _danger_block(st: dict, service_domain: str, service: str,
-                  payload: dict, confirm_token: Optional[str]) -> Optional[dict]:
-    """危险设备二次确认闸门：返回拦截结果；非危险或确认通过返回 None。"""
+                  payload: dict, confirm_token: Optional[str],
+                  intent_domain: Optional[str] = None,
+                  intent_service: Optional[str] = None) -> Optional[dict]:
+    """危险设备二次确认闸门：返回拦截结果；非危险或确认通过返回 None。
+
+    intent_domain/intent_service 用于批量确认：令牌 intent 必须只取决于规范化后的
+    整批内容，不能随“第一个危险项”在输入中的顺序变化，否则同一批操作换顺序就失效。
+    """
     if not DANGER_CONFIRM_ENABLED:
         return None
     _prune_confirm_tokens()
@@ -136,19 +160,21 @@ def _danger_block(st: dict, service_domain: str, service: str,
     entity_dangerous, reason = _danger_flags(eid, st.get("attributes") or {})
     dangerous = entity_dangerous
     if not dangerous:
-        dangerous, reason = _service_is_dangerous(service_domain, service)
+        dangerous, reason = _service_is_dangerous(service_domain, service, _domain_of(eid))
     if not dangerous:
         return None
     name = _friendly_name(st)
     svc_str = str(service_domain) + "." + str(service)
-    expected_intent = _confirm_intent(service_domain, service, payload)
+    intent_sd = str(intent_domain or service_domain)
+    intent_svc = str(intent_service or service)
+    expected_intent = _confirm_intent(intent_sd, intent_svc, payload)
     ttl = max(1, int(round(DANGER_CONFIRM_TTL)))
     base = {"ok": False, "dangerous": True, "requires_confirmation": True,
             "entity_id": eid, "name": name, "service": svc_str,
             "risk_reason": reason}
     token = (confirm_token or "").strip()
     if not token:
-        new_token = _issue_confirm_token(eid, service_domain, service, payload)
+        new_token = _issue_confirm_token(eid, intent_sd, intent_svc, payload)
         log.warning("danger confirmation required entity=%s service=%s reason=%s", eid, svc_str, reason)
         subject = "是危险设备" if entity_dangerous else "的本次操作是高风险操作"
         return {**base, "code": "confirmation_required",
@@ -163,7 +189,7 @@ def _danger_block(st: dict, service_domain: str, service: str,
                 "message": "确认令牌无效或已使用。请重新发起原操作获取新的 confirm_token，并在用户确认后使用。"}
     if float(rec.get("expires_at", 0)) <= time.monotonic():
         _CONFIRM_TOKENS.pop(token, None)
-        new_token = _issue_confirm_token(eid, service_domain, service, payload)
+        new_token = _issue_confirm_token(eid, intent_sd, intent_svc, payload)
         log.warning("danger confirmation rejected entity=%s service=%s code=confirm_token_expired", eid, svc_str)
         return {**base, "code": "confirm_token_expired", "confirm_token": new_token,
                 "expires_in": ttl,

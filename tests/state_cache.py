@@ -66,6 +66,25 @@ async def run() -> None:
     await ha.get_states(force=True)
     check(calls["states"] == 2, "get_states(force=True) 绕过缓存")
 
+    # 在途 REST 全量快照不能覆盖期间到达的更新事件
+    async def slow_states(method: str, path: str, **kwargs):
+        if path == "/api/states":
+            await asyncio.sleep(0.05)
+            return [{"entity_id": "light.a", "state": "off", "attributes": {}}]
+        raise AssertionError("unexpected path " + path)
+
+    ha._request = slow_states  # type: ignore[method-assign]
+    task = asyncio.create_task(ha.get_states(force=True))
+    await asyncio.sleep(0.01)
+    ha._state_entities = {"light.a": {"entity_id": "light.a", "state": "on", "attributes": {}}}
+    ha._state_entity_ts = {"light.a": time.monotonic()}
+    ha._states_dirty = True
+    ha._states_generation += 1
+    raced = await task
+    check(any(s.get("entity_id") == "light.a" and s.get("state") == "on" for s in raced),
+          "在途 REST 快照不覆盖期间的事件更新")
+    ha._request = fake_request  # type: ignore[method-assign]
+
     resolved, candidates, returned_states = await ha.resolve_entity("light.a", states=first)
     check(isinstance(resolved, dict) and resolved.get("entity_id") == "light.a" and not candidates
           and returned_states is first, "resolve_entity 可复用预加载状态")
@@ -113,6 +132,12 @@ async def run() -> None:
     before = calls["states"]
     cached = await ha.get_states()
     check(len(cached) == 1 and calls["states"] == before, "事件流就绪时 get_states 走内存缓存")
+    # 事件流看似就绪但全量快照已过期（事件流静默死亡）时必须回源 REST，不能用旧快照。
+    ha._states_ts = time.monotonic() - 60
+    await ha.get_states()
+    check(calls["states"] == before + 1, "事件流快照过期时 get_states 回源 REST")
+    # 回源 REST 会用远端初始状态覆盖内存，重新放回本用例期望的 on 状态。
+    ha._store_states([{"entity_id": "light.a", "state": "on", "attributes": {}}])
 
     no_rest_before = calls["state_one"]
     one = await ha.get_state("light.a")
@@ -130,7 +155,7 @@ async def run() -> None:
     await ha.get_states()
     check(calls["states"] == before + 1, "invalidate_states 后事件流缓存不再直接命中")
     ha.state_cache_ttl = 0.0
-    ha._state_entity_ts["light.a"] = time.time() - 10
+    ha._state_entity_ts["light.a"] = time.monotonic() - 10
     stale_before = calls["state_one"]
     one = await ha.get_state("light.a")
     check(one and calls["state_one"] == stale_before + 1, "事件流缓存过期时 get_state 回源 REST 刷新")

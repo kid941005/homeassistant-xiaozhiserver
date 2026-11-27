@@ -23,6 +23,7 @@ from .danger import _danger_block, _danger_flags, _service_is_dangerous
 from .service import (
     DIRECT_RESPONSE_SERVICES,
     DOMAIN_ACTIONS,
+    _accepts_force,
     _apply_and_confirm,
     _domain_of,
     _field_brief,
@@ -49,6 +50,14 @@ class _BatchNotDispatched(Exception):
     """批量总时限耗尽，指令尚未下发（不能按“已发送待确认”播报）。"""
 
 
+class _BatchTimeout(Exception):
+    """批量总时限在 POST/回读期间耗尽；dispatched 记录是否已经真正下发。"""
+
+    def __init__(self, dispatched: bool):
+        super().__init__("batch timeout")
+        self.dispatched = bool(dispatched)
+
+
 def _result_ok(result: dict) -> bool:
     """只有 confirmed、accepted 或 verified 的 no_change 才算真正成功；
     no_change 但 verified=false 说明服务已接受但没看到预期变化，不能报成功。"""
@@ -67,7 +76,7 @@ def _failure_code(result: dict) -> str:
         return "not_verified"
     return "pending_confirmation"
 _TARGET_SELECTOR_KEYS = frozenset({
-    "entity_id", "target", "device_id", "area_id", "floor_id", "label_id",
+    "entity_id", "entities", "target", "device_id", "area_id", "floor_id", "label_id",
 })
 _COMPACT_ENTITY_KEYS = ("entity_id", "name", "domain", "state", "controllable",
                         "device_id", "device_name", "area_id", "area_name")
@@ -123,7 +132,12 @@ async def _excluded_entity_error(ha: HAClient, st: dict,
     if not registry_loaded:
         try:
             reg = await ha.get_registries()
-            maps = _registry_maps(reg)[:2]
+            if reg is None:
+                # 事件流不可用等情况下 get_registries 会返回 None；这不是“没有注册表”，
+                # 而是读不到。继续按空映射会漏掉设备名排除规则，必须失败关闭。
+                registry_error = HAError("registry_unavailable", "暂时无法读取设备注册表。")
+            else:
+                maps = _registry_maps(reg)[:2]
         except HAError as exc:
             registry_error = exc
             maps = None
@@ -341,6 +355,9 @@ class DeviceService:
                     return {"ok": False, "code": "registry_unavailable",
                             "message": "无法读取设备注册表，无法校验设备名排除规则，为避免泄露隐藏设备已拒绝返回列表。请稍后重试或关闭 EXCLUDED_DEVICE_KEYWORDS。"}
                 reg = None
+            if reg is None and EXCLUDED_DEVICE_KEYWORDS:
+                return {"ok": False, "code": "registry_unavailable",
+                        "message": "暂时无法读取设备注册表，无法校验设备名排除规则，为避免泄露隐藏设备已拒绝返回列表。"}
             if area and reg is None:
                 return {"ok": False, "code": "registry_unavailable",
                         "message": "无法读取设备/区域注册表，无法按 area 过滤。请稍后重试，或改用 keyword/domain 过滤。"}
@@ -541,7 +558,12 @@ class DeviceService:
             guard = _danger_block(st, sd, svc, payload, confirm_token)
             if guard is not None:
                 return guard
-            result = await _apply_and_confirm(ha, st, sd, svc, payload, action_name)
+            precheck = None if confirm_token else (
+                lambda fresh: _danger_block(fresh, sd, svc, payload, None))
+            result = await _apply_and_confirm(ha, st, sd, svc, payload, action_name,
+                                              precheck=precheck)
+            if "_danger_guard" in result:
+                return result["_danger_guard"]
             result["ok"] = _result_ok(result)
             if not result["ok"]:
                 result["code"] = _failure_code(result)
@@ -558,6 +580,11 @@ class DeviceService:
                 result.pop("response", None)
             return result
         except HAError as e:
+            if e.code == "post_timeout":
+                return {"ok": False, "status": "accepted_pending", "code": "pending_confirmation",
+                        "dispatch_state": "may_be_dispatched",
+                        "message": "调用已发出但超时或网络中断，无法确认是否执行。",
+                        "hint": "请稍后用 get_device_state 核对设备状态，避免直接重试 toggle。"}
             return {"ok": False, **e.to_dict(), "hint": "可先用 list_devices / get_device_state 确认设备与能力后重试。"}
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "code": "internal_error", "message": "控制设备失败：" + str(e)}
@@ -596,7 +623,10 @@ class DeviceService:
                 batch_states = None
             try:
                 reg = await ha.get_registries()
-                batch_maps = _registry_maps(reg)[:2]
+                if reg is None:
+                    batch_registry_error = HAError("registry_unavailable", "暂时无法读取设备注册表。")
+                else:
+                    batch_maps = _registry_maps(reg)[:2]
             except HAError as exc:
                 batch_registry_error = exc
             batch_registry_loaded = True
@@ -615,7 +645,9 @@ class DeviceService:
                                    "message": "『" + ref + "』解析失败：" + exc.message})
                     continue
                 if error is not None:
-                    errors.append({"entity": ref, "error": error})
+                    # 统一为扁平结构，避免 errors 里同时出现 {entity,error:{...}} 和 {entity,code,...}
+                    # 两种形状，调用方无法稳定解析失败原因。
+                    errors.append({"entity": ref, **error})
                     continue
                 eid = str(st.get("entity_id"))
                 if not eid:
@@ -653,37 +685,80 @@ class DeviceService:
                 return {"ok": False, "code": "no_valid_entities",
                         "message": "没有可执行的目标设备。", "errors": errors or None}
 
-            rep = None
+            # 批量总时限必须覆盖阶段一刷新，否则大量目标时预检可以无限拖长。
+            deadline = time.monotonic() + CONTROL_BATCH_TIMEOUT
+            # 阶段一：先把所有目标刷新到最新状态并重新校验参数/危险属性，全部通过后
+            # 才进入阶段二统一下发。否则可能出现部分设备已执行、另一台才发现需要确认，
+            # 此时已产生的副作用无法回滚，结果也会被误当成整批确认请求丢掉。
+            for op in resolved:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return {"ok": False, "status": "not_sent", "code": "batch_timeout",
+                            "entity_id": op["entity_id"],
+                            "message": "批量控制超时，指令未下发。"}
+                try:
+                    if _accepts_force(ha.get_state):
+                        fresh = await asyncio.wait_for(
+                            ha.get_state(op["entity_id"], force=True), timeout=remaining)
+                    else:
+                        fresh = await asyncio.wait_for(
+                            ha.get_state(op["entity_id"]), timeout=remaining)
+                except asyncio.TimeoutError:
+                    return {"ok": False, "status": "not_sent", "code": "batch_timeout",
+                            "entity_id": op["entity_id"],
+                            "message": "批量控制超时，指令未下发。"}
+                except HAError:
+                    fresh = None
+                if not isinstance(fresh, dict) or str(fresh.get("entity_id") or "") != op["entity_id"]:
+                    return {"ok": False, "code": "state_unavailable",
+                            "entity_id": op["entity_id"],
+                            "message": "无法刷新目标设备最新状态，无法确认是否属于危险设备，已取消整批操作。"}
+                op["st"] = fresh
+                try:
+                    validate_action_attributes(op["domain"], op["extra"], fresh.get("attributes"))
+                except HAError as exc:
+                    return {"ok": False, "code": exc.code, "entity_id": op["entity_id"],
+                            "message": "『" + _friendly_name(fresh) + "』刷新后动作参数无效：" + exc.message}
+            dangerous_ops = []
             for op in resolved:
                 dangerous, _reason = _danger_flags(op["entity_id"], op["st"].get("attributes") or {})
                 if not dangerous:
-                    dangerous, _reason = _service_is_dangerous(op["service_domain"], op["service"])
+                    dangerous, _reason = _service_is_dangerous(
+                        op["service_domain"], op["service"], op["domain"])
                 if dangerous:
-                    rep = op
-                    break
-            if rep is not None:
+                    dangerous_ops.append(op)
+            if dangerous_ops:
                 combined = [{"entity_id": op["entity_id"],
                              "service": op["service_domain"] + "." + op["service"],
                              "data": op["extra"]} for op in resolved]
                 guard_payload = {"entity_id": [op["entity_id"] for op in resolved], "batch": combined}
-                guard = _danger_block(rep["st"], rep["service_domain"], rep["service"],
-                                      guard_payload, confirm_token)
+                first = dangerous_ops[0]
+                guard = _danger_block(first["st"], first["service_domain"], first["service"],
+                                      guard_payload, confirm_token,
+                                      intent_domain="batch", intent_service="control_devices")
                 if guard is not None:
                     guard["entities"] = [op["entity_id"] for op in resolved]
                     return guard
 
             sem = asyncio.Semaphore(CONTROL_CONCURRENCY)
-            deadline = time.monotonic() + CONTROL_BATCH_TIMEOUT
 
             async def _run_one(op):
                 async with sem:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise _BatchNotDispatched()
-                    return await asyncio.wait_for(
-                        _apply_and_confirm(ha, op["st"], op["service_domain"],
-                                           op["service"], op["payload"], action_name),
-                        timeout=remaining)
+                    dispatch_state: dict = {"dispatched": False}
+                    # 危险属性已在阶段一用 force 刷新并整批确认；这里不再做锁内二次拦截，
+                    # 否则单台 late guard 会在其他设备已下发后丢弃整批结果。
+                    precheck = None
+                    try:
+                        return await asyncio.wait_for(
+                            _apply_and_confirm(ha, op["st"], op["service_domain"],
+                                               op["service"], op["payload"], action_name,
+                                               precheck=precheck, dispatch_state=dispatch_state),
+                            timeout=remaining)
+                    except asyncio.TimeoutError as exc:
+                        raise _BatchTimeout(dispatch_state.get("dispatched", False)) from exc
 
             tasks = [_run_one(op) for op in resolved]
             raw_results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -702,6 +777,20 @@ class DeviceService:
                     failed.append(op["entity_id"])
                     failed_names.append(_friendly_name(op["st"]))
                     continue
+                if isinstance(result, _BatchTimeout):
+                    if result.dispatched:
+                        per.append({"ok": False, "entity_id": op["entity_id"],
+                                    "status": "accepted_pending", "code": "pending_confirmation",
+                                    "device_action": action_name,
+                                    "message": "批量控制超时，指令可能已下发但未在时限内确认。"})
+                    else:
+                        per.append({"ok": False, "entity_id": op["entity_id"],
+                                    "status": "not_sent", "code": "batch_timeout",
+                                    "device_action": action_name,
+                                    "message": "批量控制超时，指令未下发。"})
+                    failed.append(op["entity_id"])
+                    failed_names.append(_friendly_name(op["st"]))
+                    continue
                 if isinstance(result, asyncio.TimeoutError):
                     per.append({"ok": False, "entity_id": op["entity_id"],
                                 "status": "accepted_pending", "code": "pending_confirmation",
@@ -710,10 +799,22 @@ class DeviceService:
                     failed.append(op["entity_id"])
                     failed_names.append(_friendly_name(op["st"]))
                     continue
+                if isinstance(result, dict) and "_danger_guard" in result:
+                    # 锁内 force 刷新后才发现是危险设备：整批未下发该项，返回确认请求。
+                    guard = result["_danger_guard"]
+                    guard["entities"] = [op2["entity_id"] for op2 in resolved]
+                    return guard
                 if isinstance(result, BaseException):
                     if isinstance(result, HAError):
-                        per.append({"ok": False, "entity_id": op["entity_id"],
-                                    "device_action": action_name, **result.to_dict()})
+                        if result.code == "post_timeout":
+                            per.append({"ok": False, "entity_id": op["entity_id"],
+                                        "status": "accepted_pending", "code": "pending_confirmation",
+                                        "dispatch_state": "may_be_dispatched",
+                                        "device_action": action_name,
+                                        "message": "调用已发出但超时或网络中断，无法确认是否执行。"})
+                        else:
+                            per.append({"ok": False, "entity_id": op["entity_id"],
+                                        "device_action": action_name, **result.to_dict()})
                     else:
                         per.append({"ok": False, "entity_id": op["entity_id"], "code": "internal_error",
                                     "device_action": action_name, "message": str(result)})
@@ -918,7 +1019,12 @@ class DeviceService:
             guard = _danger_block(st, service_domain, svc, payload, confirm_token)
             if guard is not None:
                 return guard
-            result = await _apply_and_confirm(ha, st, service_domain, svc, payload, spec)
+            precheck = None if confirm_token else (
+                lambda fresh: _danger_block(fresh, service_domain, svc, payload, None))
+            result = await _apply_and_confirm(ha, st, service_domain, svc, payload, spec,
+                                              precheck=precheck)
+            if "_danger_guard" in result:
+                return result["_danger_guard"]
             result["ok"] = _result_ok(result)
             if not result["ok"]:
                 result["code"] = _failure_code(result)
@@ -936,7 +1042,11 @@ class DeviceService:
             return result
         except HAError as e:
             out = {"ok": False, **e.to_dict()}
-            if e.code in ("not_found", "http_error", "upstream_error", "invalid_data", "invalid_value"):
+            if e.code == "post_timeout":
+                out["status"] = "accepted_pending"
+                out["code"] = "pending_confirmation"
+                out["dispatch_state"] = "may_be_dispatched"
+            elif e.code in ("not_found", "http_error", "upstream_error", "invalid_data", "invalid_value"):
                 out["hint"] = ("该服务可能不存在或参数不匹配。可先用 list_services(domain=…) 查询支持的服"
                                "务与字段，再核对 data 参数名。")
             else:
@@ -964,6 +1074,9 @@ class DeviceService:
                     return {"ok": False, "code": "registry_unavailable",
                             "message": "无法读取设备注册表，无法校验设备名排除规则，已拒绝返回设备类型列表。"}
                 reg = None
+            if reg is None and EXCLUDED_DEVICE_KEYWORDS:
+                return {"ok": False, "code": "registry_unavailable",
+                        "message": "暂时无法读取设备注册表，无法校验设备名排除规则，已拒绝返回设备类型列表。"}
             devices_map, ents_map, _ = _registry_maps(reg)
             states = [s for s in states if not is_excluded_entity(s, devices_map, ents_map)]
             states, hidden_switches, _ = _drop_redundant_switches(states, devices_map, ents_map)

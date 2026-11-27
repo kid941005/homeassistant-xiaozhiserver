@@ -87,6 +87,9 @@ class HAClient:
         self._states_stale: bool = False
         # 事件只标脏，读取时再一次性生成 list，避免每条 state_changed 都重建全量列表。
         self._states_dirty: bool = True
+        # 每次事件更新或失效都自增；在途 REST 全量快照必须比对 generation，
+        # 否则较旧的快照会覆盖 WS 已收到的新状态或刚设置的失效标记。
+        self._states_generation: int = 0
         self._services_cache: list[dict] | None = None
         self._services_ts: float = 0.0
         # 单飞锁：TTL 到期时只允许一个请求回源，避免并发重复拉全量/打开 WebSocket。
@@ -241,7 +244,7 @@ class HAClient:
         return data
 
     def _store_states(self, states: list[dict]) -> None:
-        now = time.time()
+        now = time.monotonic()
         self._state_entities = {
             str(s.get("entity_id")): s
             for s in states
@@ -251,6 +254,7 @@ class HAClient:
         self._states_dirty = True
         self._states_ts = now
         self._states_stale = False
+        self._states_generation += 1
 
     def _states_snapshot(self) -> list[dict]:
         """按需生成全量 list：只在事件更新/失效后重建一次。"""
@@ -264,6 +268,7 @@ class HAClient:
         self._states_ts = 0.0
         self._states_dirty = True
         self._states_stale = True
+        self._states_generation += 1
         if not self._state_ws_ready.is_set():
             self._states_cache = None
             self._state_entities = {}
@@ -310,7 +315,7 @@ class HAClient:
         self._state_waiters.setdefault(eid, []).append((fut, pred))
         current = self._state_entities.get(eid)
         # 只接受足够新鲜的缓存：服务调用会删除目标实体时间戳，避免旧缓存直接满足回读。
-        age = time.time() - self._state_entity_ts.get(eid, 0.0)
+        age = time.monotonic() - self._state_entity_ts.get(eid, 0.0)
         if isinstance(current, dict) and age <= self.state_cache_ttl:
             try:
                 if pred(current):
@@ -418,7 +423,8 @@ class HAClient:
                 eid = (new_state or {}).get("entity_id") or (old_state or {}).get("entity_id")
                 if not eid:
                     continue
-                now = time.time()
+                now = time.monotonic()
+                self._states_generation += 1
                 if isinstance(new_state, dict):
                     self._state_entities[eid] = new_state
                     self._state_entity_ts[eid] = now
@@ -434,20 +440,29 @@ class HAClient:
     async def get_states(self, force: bool = False) -> list:
         """返回全量实体状态；事件流就绪时直接读内存，否则按短 TTL 缓存，避免重复拉全量。"""
         self._ensure_state_stream()
-        if self._state_ws_ready.is_set() and not force and not self._states_stale:
+        now = time.monotonic()
+        if (self._state_ws_ready.is_set() and not force and not self._states_stale
+                and now - self._states_ts < self.state_cache_ttl):
             return list(self._states_snapshot())
-        now = time.time()
         if (not force and self._states_cache is not None
                 and now - self._states_ts < self.state_cache_ttl):
             return list(self._states_snapshot())
         async with self._states_lock:
-            if self._state_ws_ready.is_set() and not force and not self._states_stale:
+            now = time.monotonic()
+            if (self._state_ws_ready.is_set() and not force and not self._states_stale
+                    and now - self._states_ts < self.state_cache_ttl):
                 return list(self._states_snapshot())
-            now = time.time()
             if (not force and self._states_cache is not None
                     and now - self._states_ts < self.state_cache_ttl):
                 return list(self._states_snapshot())
-            self._store_states(await self._fetch_states_rest())
+            # 拉取全量期间可能收到事件或失效（invalidate 会清空实体字典）。快照必须与
+            # generation 对齐；发生竞争时丢弃旧快照并返回当前内存快照（可能为空），
+            # 避免把失效后已下发的控制又用旧状态填回缓存，也避免用旧快照覆盖事件更新。
+            generation = self._states_generation
+            fetched = await self._fetch_states_rest()
+            if generation != self._states_generation:
+                return list(self._states_snapshot())
+            self._store_states(fetched)
             return list(self._states_snapshot())
 
     async def get_services(self, force: bool = False) -> list:
@@ -475,7 +490,7 @@ class HAClient:
         self._ensure_state_stream()
         if self._state_ws_ready.is_set() and not force:
             cached = self._state_entities.get(eid)
-            age = time.time() - self._state_entity_ts.get(eid, 0.0)
+            age = time.monotonic() - self._state_entity_ts.get(eid, 0.0)
             if isinstance(cached, dict) and age <= self.state_cache_ttl:
                 return cached
         try:
@@ -487,10 +502,12 @@ class HAClient:
         if not isinstance(data, dict):
             raise HAError("invalid_response", "Home Assistant 返回的实体状态不是 JSON 对象。")
         self._state_entities[eid] = data
-        self._state_entity_ts[eid] = time.time()
+        self._state_entity_ts[eid] = time.monotonic()
+        # 单实体写入也让在途全量快照失效，避免较旧全量数据覆盖这条新状态。
+        self._states_generation += 1
         if self._states_cache is not None:
             self._states_dirty = True
-            self._states_ts = time.time()
+            self._states_ts = time.monotonic()
         return data
 
     async def call_service(self, domain: str, service: str, data: dict) -> Any:

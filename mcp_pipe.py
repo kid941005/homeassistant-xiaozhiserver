@@ -148,11 +148,13 @@ async def pipe_process_to_websocket(process, websocket, target: str) -> None:
     """server stdout -> WebSocket。"""
     try:
         while True:
-            line = await asyncio.to_thread(process.stdout.readline)
+            # 给 readline 一个上限，避免单行无界增长先撑爆内存；再按 UTF-8 字节数
+            # 做最终校验——len(str) 是字符数，多字节字符会低估实际传输字节。
+            line = await asyncio.to_thread(process.stdout.readline, 16 * 1024 * 1024 + 1)
             if not line:
                 logger.info("[%s] MCP server stdout 已结束", target)
                 return
-            if len(line) > 16 * 1024 * 1024:
+            if len(line.encode("utf-8")) > 16 * 1024 * 1024:
                 # 单条 JSON-RPC 消息异常巨大时断开重连，避免无上限转发拖垮内存/带宽。
                 raise MCPPipeClosed("[%s] MCP server 单行输出超过 16MiB，已断开重连" % target)
             await websocket.send(line)

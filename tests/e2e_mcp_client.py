@@ -63,6 +63,7 @@ def verify_case(index, name, args, r, expected):
         "entity_area_name", "first_area_name", "first_domain", "entity_dangerous",
         "after_state", "after_brightness", "after_volume", "dangerous_domains_contains",
         "domains_not_contains", "dangerous_entities_contains", "attributes_truncated",
+        "dispatch_state",
     }
     unknown = sorted(set(expected) - known_keys)
     check(not unknown, label + " 存在未知期望键", unknown)
@@ -80,7 +81,7 @@ def verify_case(index, name, args, r, expected):
               applied_limit)
     for key in ("status", "code", "total", "count", "grouped_by", "domain",
                 "domain_count", "service_count", "limit", "has_more", "next_offset",
-                "deduplicated_switch_count"):
+                "deduplicated_switch_count", "dispatch_state"):
         if key in expected:
             check(d.get(key) == expected[key], label + " " + key, d.get(key))
     if "suggested_entity_id" in expected:
@@ -314,6 +315,9 @@ async def main():
               "response_contains": "本来就是关着"}),
             ("call_service", {"entity": "switch.fan", "service": "silent"},
              {"ok": False, "status": "accepted_pending", "code": "pending_confirmation"}),
+            ("call_service", {"entity": "switch.fan", "service": "switch.explode"},
+             {"ok": False, "status": "accepted_pending", "code": "pending_confirmation",
+              "dispatch_state": "may_be_dispatched"}),
             ("call_service", {"entity": "不存在设备", "service": "turn_on"},
              {"ok": False, "code": "not_found"}),
             ("call_service", {"entity": "客厅灯", "service": "light.turn_on",
@@ -325,6 +329,10 @@ async def main():
              {"ok": False, "code": "invalid_data"}),
             ("call_service", {"entity": "客厅灯", "service": "light.turn_on",
                               "data": {"device_id": "dev_lock"}},
+             {"ok": False, "code": "invalid_data"}),
+            # 目标选择器清单必须包含 entities，否则可绕过 20 条上限与主实体危险判定
+            ("call_service", {"entity": "客厅灯", "service": "light.turn_on",
+                              "data": {"entities": ["lock.front_door"]}},
              {"ok": False, "code": "invalid_data"}),
             ("call_service", {"entity": "客厅灯", "service": "light.turn_on",
                               "data": {"rgb_color": [300, 0, 0]}},
@@ -401,6 +409,24 @@ async def main():
         d7 = script["data"] if isinstance(script["data"], dict) else {}
         check(d7.get("code") == "confirmation_required",
               "P3 普通实体上的脚本服务也需确认", d7.get("code"))
+        # 场景可能包含门锁/车库动作，MCP 侧也必须二次确认（不再只靠 WebUI 拦截）
+        scene = await call(session, "call_service", {"entity": "客厅灯", "service": "scene.turn_on"})
+        d8 = scene["data"] if isinstance(scene["data"], dict) else {}
+        check(d8.get("code") == "confirmation_required",
+              "P3 场景服务也需二次确认", d8.get("code"))
+        # 批量危险预检：必须在任何设备下发之前整批申请确认，不能先执行普通设备再报确认
+        b1 = await call(session, "control_devices", {"entities": ["大门门锁"], "action": "unlock"})
+        bd1 = b1["data"] if isinstance(b1["data"], dict) else {}
+        btok = bd1.get("confirm_token")
+        check(bd1.get("code") == "confirmation_required", "批量危险动作整批先确认", bd1.get("code"))
+        check("results" not in bd1, "批量确认分支不带已执行结果", bd1.get("results"))
+        check(bool(btok), "批量确认返回 token", btok)
+        b2 = await call(session, "control_devices", {"entities": ["大门门锁"], "action": "unlock",
+                                                    "confirm_token": btok})
+        bd2 = b2["data"] if isinstance(b2["data"], dict) else {}
+        bstatus = (bd2.get("results") or [{}])[0].get("status")
+        check(bd2.get("ok") is True and bstatus in ("confirmed", "no_change"),
+              "批量带 token 后执行成功", bd2)
 
     if failures:
         print("\n===== FAILED " + str(len(failures)) + " 项 =====")

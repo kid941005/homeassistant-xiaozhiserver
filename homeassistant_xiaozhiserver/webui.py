@@ -171,6 +171,17 @@ def _login_guard(ip: str) -> int:
     return 0
 
 
+def _login_retry_after(ip: str) -> int:
+    """只查询是否需要限速，不占用配额；用于在解析表单前拒绝已锁定的来源。"""
+    now = time.time()
+    with _LOGIN_LOCK:
+        _prune_login_failures(now)
+        recent = _LOGIN_FAILURES.get(ip, [])
+        if len(recent) >= _LOGIN_MAX_FAILURES:
+            return max(1, int(_LOGIN_WINDOW - (now - recent[0])))
+    return 0
+
+
 def _record_login_failure(ip: str) -> None:
     """记录一次失败（兼容旧调用与测试）；生产登录路径已由 _login_guard 原子预留。"""
     now = time.time()
@@ -738,7 +749,8 @@ def create_app() -> FastAPI:
     async def login(request: Request):
         nonce = request.state.csp_nonce
         ip = _client_ip(request)
-        retry_after = _login_guard(ip)
+        # 已锁定来源直接拒绝，避免畸形/超大请求也在解析前消耗 CPU。
+        retry_after = _login_retry_after(ip)
         if retry_after > 0:
             log.warning("webui login rate limited ip=%s retry_after=%ss", ip, retry_after)
             return HTMLResponse(
@@ -752,6 +764,16 @@ def create_app() -> FastAPI:
             return HTMLResponse(_login_html(message, nonce), status_code=form_status)
         token = str((form.get("token") or [""])[0])
         if not _token_ok(token):
+            # 只有表单成功解析且令牌确实错误才占用一次限速配额；415/413/400
+            # 等畸形请求不再计入，避免 NAT 后的用户被畸形请求锁死。
+            retry_after = _login_guard(ip)
+            if retry_after > 0:
+                log.warning("webui login rate limited ip=%s retry_after=%ss", ip, retry_after)
+                return HTMLResponse(
+                    _login_html("登录失败次数过多，请稍后再试。", nonce),
+                    status_code=429,
+                    headers={"Retry-After": str(retry_after)},
+                )
             log.warning("webui login failed ip=%s", ip)
             return HTMLResponse(_login_html("访问令牌不正确，请重试。", nonce), status_code=401)
         _clear_login_failures(ip)
@@ -864,7 +886,7 @@ def create_app() -> FastAPI:
         if (service_domain == "homeassistant" and service_value in ("turn_on", "toggle")
                 and target_domain == "scene"):
             return "通过 homeassistant 控制场景，可能包含门锁等高风险动作"
-        dangerous, reason = service_is_dangerous(service_domain, service_value)
+        dangerous, reason = service_is_dangerous(service_domain, service_value, target_domain)
         return reason if dangerous else ""
 
     async def _webui_danger_block(name: str, params: dict) -> dict | None:
@@ -877,6 +899,10 @@ def create_app() -> FastAPI:
         explicit_domain = ""
         if "." in service_raw:
             explicit_domain, service_name = service_raw.split(".", 1)
+            # 后端 devices.call_service 会分别 strip domain/service；这里必须同样规范化，
+            # 否则 "scene. turn_on" 在 WebUI 判定为非危险、到后端却变成 scene.turn_on。
+            explicit_domain = explicit_domain.strip()
+            service_name = service_name.strip()
             reason = _dangerous_service_reason(explicit_domain, service_name)
             if reason:
                 return {"ok": False, "code": "dangerous_operation_blocked",
@@ -1006,8 +1032,7 @@ def create_app() -> FastAPI:
             return {"ok": False, "code": "internal_error", "message": "工具调用失败，详见服务端日志。"}, 500
         # WebUI 使用独立登录令牌，不复用 MCP 的危险设备确认令牌，避免两次请求即可绕过确认。
         if isinstance(result, dict) and result.get("requires_confirmation"):
-            metrics.record_tool(name, False, time.perf_counter() - started,
-                                "dangerous_operation_blocked")
+            # fn 已经由 server._log_tool 记录过一次确认要求，这里不能再记一次指标。
             return {"ok": False, "code": "dangerous_operation_blocked",
                     "message": "WebUI 不执行危险设备操作；请通过小智语音确认后再操作。"}, 403
         return result, 200

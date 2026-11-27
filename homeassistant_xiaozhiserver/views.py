@@ -92,12 +92,21 @@ def _filter_actions(domain: str, actions: list, attributes: dict) -> list:
             out = [a for a in out if not (a in mapping and not (features & mapping[a]))]
     elif domain == "climate":
         if features is not None:
-            # HA ClimateEntityFeature：TARGET_TEMPERATURE=1, TARGET_TEMPERATURE_RANGE=2。
-            # 只支持区间目标（仅位 2）的空调不能接受单一 temperature，避免调用必失败。
-            if "set_temperature" in out and not (features & 1) and (features & 2):
+            # HA ClimateEntityFeature：TARGET_TEMPERATURE=1, TARGET_TEMPERATURE_RANGE=2,
+            # FAN_MODE=8, TURN_ON=128, TURN_OFF=256。
+            # 内置 set_temperature 只发送单个 temperature；仅支持区间目标（仅有位 2）
+            # 的空调不能接受单值，必须移除，避免调用必失败。
+            if "set_temperature" in out and not (features & 1):
                 out.remove("set_temperature")
             if "set_fan_mode" in out and not (features & 8) and not attrs.get("fan_modes"):
                 out.remove("set_fan_mode")
+            if "turn_on" in out and not (features & 128):
+                out.remove("turn_on")
+            if "turn_off" in out and not (features & 256):
+                out.remove("turn_off")
+        hvac_modes = attrs.get("hvac_modes")
+        if "set_hvac_mode" in out and isinstance(hvac_modes, list) and not hvac_modes:
+            out.remove("set_hvac_mode")
     elif domain == "media_player":
         if features is not None:
             mapping = {"play": 16384, "pause": 1, "stop": 4096, "set_volume": 4,

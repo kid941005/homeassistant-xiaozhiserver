@@ -48,6 +48,27 @@ class SlowHA:
         return False
 
 
+class RefreshFailHA:
+    """模拟实体锁内 force 刷新失败：危险复查拿不到最新状态时必须拒绝下发。"""
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self.called = False
+
+    def entity_lock(self, entity_id: str) -> asyncio.Lock:
+        return self._lock
+
+    async def call_service(self, domain: str, service: str, payload: dict):
+        self.called = True
+        return None
+
+    async def get_state(self, entity_id: str, force: bool = False):
+        raise HAError("timeout", "刷新超时")
+
+    def state_stream_ready(self) -> bool:
+        return False
+
+
 class StaticHA:
     """模拟即发即忘服务：调用返回 null，实体状态始终不变。"""
 
@@ -116,6 +137,12 @@ def check_filter_actions() -> None:
     full_vacuum = _filter_actions("vacuum", ["turn_on", "turn_off", "stop", "pause", "continue", "resume"],
                                   {"supported_features": 15})
     check(full_vacuum == ["turn_off", "stop", "pause"], "扫地机按能力位保留停止/暂停动作")
+    range_only = _filter_actions("climate", ["turn_on", "turn_off", "set_temperature", "set_hvac_mode"],
+                                 {"supported_features": 2, "hvac_modes": ["heat", "off"]})
+    check("set_temperature" not in range_only, "仅支持温度区间的空调不暴露单值 set_temperature")
+    full_climate = _filter_actions("climate", ["turn_on", "turn_off", "set_temperature"],
+                                   {"supported_features": 1})
+    check("set_temperature" in full_climate, "支持单值目标温度时保留 set_temperature")
 
 
 def check_invalid_number(value, action: str, label: str) -> None:
@@ -148,6 +175,14 @@ async def run() -> None:
         "cover", "stop_cover", {"entity_id": "cover.c"}, "停止")
     check(accepted.get("status") == "accepted", "即发即忘服务返回 accepted 而非失败")
     check(static.reads <= 6, "即发即忘服务不会等满回读超时")
+    fail = RefreshFailHA()
+    guarded = await _apply_and_confirm(
+        fail, {"entity_id": "cover.garage", "state": "closed", "attributes": {}},
+        "cover", "open_cover", {"entity_id": "cover.garage"}, "打开",
+        precheck=lambda fresh: {"ok": False, "code": "danger"})
+    check((guarded.get("_danger_guard") or {}).get("code") == "state_unavailable",
+          "锁内刷新失败且需要危险复查时返回 state_unavailable")
+    check(fail.called is False, "刷新失败时不调用 call_service")
     print("CONFIRM WINDOW OK")
 
 

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import math
 import time
@@ -20,6 +21,14 @@ from .config import (
 from .client import HAError, HAClient
 
 log = logging.getLogger("homeassistant_xiaozhiserver.service")
+
+def _accepts_force(get_state: Any) -> bool:
+    """判断客户端 get_state 是否显式接受 force 参数，避免用宽泛 TypeError 兜底掩盖真实故障。"""
+    try:
+        return "force" in inspect.signature(get_state).parameters
+    except (TypeError, ValueError):
+        return True
+
 
 SUPPORTED_ACTIONS = [
     "turn_on", "turn_off", "toggle", "open", "close", "stop", "pause", "continue", "resume", "play",
@@ -269,7 +278,25 @@ def _expected_state(service: str, before_state: Optional[str],
             return "open" if svc == "turn_on" else "closed"
         if dom in _BINARY_TURN_DOMAINS:
             return "on" if svc == "turn_on" else "off"
+        if dom == "climate":
+            # climate 的 turn_off 状态是 off；turn_on 时若已经处于某个制热/制冷模式，
+            # 幂等调用不会改变状态，按当前模式回读即可，避免误判 accepted_pending。
+            if svc == "turn_off":
+                return "off"
+            if before_state not in (None, "off", "unavailable", "unknown"):
+                return str(before_state)
+        if dom == "vacuum":
+            # 仅覆盖“本来已是目标状态”的幂等场景；不臆造自定义集成状态名。
+            if svc == "turn_on" and before_state == "cleaning":
+                return "cleaning"
+            if svc == "turn_off" and before_state == "docked":
+                return "docked"
         return None
+    if dom == "vacuum":
+        if svc == "pause" and before_state == "paused":
+            return "paused"
+        if svc == "stop" and before_state == "docked":
+            return "docked"
     return _EXPECTED_STATE.get(svc)
 
 
@@ -291,9 +318,11 @@ def _field_brief(fname: str, fdef: dict) -> dict:
 
 def _num(value: Any) -> Optional[float]:
     try:
-        return float(value)
+        number = float(value)
     except (TypeError, ValueError):
         return None
+    # NaN/Infinity 无法用于范围比较（所有比较都为 False），必须在入口拒绝。
+    return number if math.isfinite(number) else None
 
 
 def _value_matches(actual: Any, expected: Any, tolerance: float = 0.0) -> bool:
@@ -318,11 +347,12 @@ def _rgb_components(value: Any, code: str = "invalid_value", label: str = "颜�
     if not isinstance(value, (list, tuple)) or len(value) != 3:
         raise HAError(code, label + " 必须是 [r,g,b] 三个 0-255 整数，收到：" + str(value))
     try:
-        # 显式拒绝浮点分量：int(1.5) 会静默截断成 1，造成颜色与用户输入不一致。
-        if any(isinstance(x, bool) or not isinstance(x, (int, float)) or float(x) != int(x) for x in value):
+        # 契约要求整数分量：bool 不是整数，任何 float（包括 255.0）也拒绝，避免
+        # int(1.5) 静默截断或等值浮点让调用方误以为接口接受浮点。
+        if any(isinstance(x, bool) or not isinstance(x, int) for x in value):
             raise ValueError("non-integer")
         rgb = [int(x) for x in value]
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise HAError(code, label + " 必须是 [r,g,b] 三个 0-255 整数，收到：" + str(value)) from exc
     if any(c < 0 or c > 255 for c in rgb):
         raise HAError(code, label + " 每个分量必须在 0-255，收到：" + str(value))
@@ -340,26 +370,34 @@ def validate_action_attributes(domain: str, extra: dict, attributes: Any) -> Non
                              "percentage": (0, 100), "tilt_position": (0, 100)}.items():
         if key in extra:
             val = _num(extra.get(key))
-            if val is not None and (val < low or val > high):
+            if val is None:
+                raise HAError("invalid_value", key + " 必须是有限数值，收到：" + str(extra.get(key)))
+            if val < low or val > high:
                 raise HAError("invalid_value", key + " 必须在 " + str(low) + "-" + str(high)
                               + " 之间，收到：" + str(extra.get(key)))
     if "temperature" in extra:
         value = _num(extra.get("temperature"))
         low, high = _num(attrs.get("min_temp")), _num(attrs.get("max_temp"))
-        if value is not None and ((low is not None and value < low) or (high is not None and value > high)):
+        if value is None:
+            raise HAError("invalid_value", "temperature 必须是有限数值，收到：" + str(extra.get("temperature")))
+        if (low is not None and value < low) or (high is not None and value > high):
             raise HAError("invalid_value", "温度 " + str(value) + " 超出设备允许范围 "
                           + str(low if low is not None else "?") + "-"
                           + str(high if high is not None else "?") + "。")
         # 华氏设备若收到典型摄氏度值（26），静默按华氏执行会严重偏差；明确提示改用设备单位。
         unit = str(attrs.get("temperature_unit") or "")
+        # 仅在设备未提供完整温度范围时才用启发式；已有 min/max 时以范围为准，
+        # 避免把合法的 45°F 当成摄氏度拒绝。
         if (value is not None and "f" in unit.lower()
-                and high is not None and high > 50 and value < 50):
+                and (low is None or high is None) and value <= 45):
             raise HAError("invalid_value", "该设备温度单位为华氏度（" + unit + "），"
                           + str(value) + " 可能是摄氏度；请使用华氏温度或 call_service 明确指定。")
     if "color_temp_kelvin" in extra:
         value = _num(extra.get("color_temp_kelvin"))
         low, high = _num(attrs.get("min_color_temp_kelvin")), _num(attrs.get("max_color_temp_kelvin"))
-        if value is not None and ((low is not None and value < low) or (high is not None and value > high)):
+        if value is None:
+            raise HAError("invalid_value", "color_temp_kelvin 必须是有限数值，收到：" + str(extra.get("color_temp_kelvin")))
+        if (low is not None and value < low) or (high is not None and value > high):
             raise HAError("invalid_value", "色温 " + str(value) + "K 超出设备允许范围 "
                           + str(low if low is not None else "?") + "-"
                           + str(high if high is not None else "?") + "K。")
@@ -444,36 +482,47 @@ def _check_after(after: Optional[dict], expected_state: Optional[str],
 
 
 async def _apply_and_confirm(ha: "HAClient", st: dict, service_domain: str,
-                             service: str, payload: dict, action_label: str) -> dict:
-    """同一实体的控制串行执行，避免并发下发与回读互相覆盖。"""
+                             service: str, payload: dict, action_label: str,
+                             precheck=None, dispatch_state: Optional[dict] = None) -> dict:
+    """同一实体的控制串行执行，避免并发下发与回读互相覆盖。
+
+    precheck 在锁内 force 刷新后的最新状态上再次执行危险确认；dispatch_state
+    用于标记 POST 是否真正开始，便于批量超时区分“未下发/已下发待确认”。
+    """
     eid = str(st.get("entity_id"))
     lock_factory = getattr(ha, "entity_lock", None)
     if not callable(lock_factory):
         return await _apply_and_confirm_unlocked(
-            ha, st, service_domain, service, payload, action_label
+            ha, st, service_domain, service, payload, action_label,
+            precheck=precheck, dispatch_state=dispatch_state
         )
     async with lock_factory(eid):
         # 初始状态也必须在实体锁内读取：否则两个并发 toggle 都基于旧状态计算预期，
         # 第二个可能把正确的最终状态误判为 mismatch。强制回源一次，锁内串行。
         try:
-            fresh = await ha.get_state(eid, force=True)
-        except TypeError:
-            # 兼容未实现 force 参数的测试/自定义客户端。
-            try:
+            if _accepts_force(ha.get_state):
+                fresh = await ha.get_state(eid, force=True)
+            else:
                 fresh = await ha.get_state(eid)
-            except HAError:
-                fresh = None
         except HAError:
             fresh = None
         if isinstance(fresh, dict) and str(fresh.get("entity_id") or "") == eid:
             st = fresh
+        else:
+            # 取得实体锁后必须拿到最新状态：刷新失败一律失败关闭，避免线路抖动时
+            # 用旧缓存下发门锁/车库门等危险动作；带 confirm_token 也不能降级。
+            return {"_danger_guard": {
+                "ok": False, "code": "state_unavailable",
+                "message": "无法刷新设备最新状态，无法确认是否属于危险设备，已拒绝执行。"}}
         return await _apply_and_confirm_unlocked(
-            ha, st, service_domain, service, payload, action_label
+            ha, st, service_domain, service, payload, action_label,
+            precheck=precheck, dispatch_state=dispatch_state
         )
 
 
 async def _apply_and_confirm_unlocked(ha: "HAClient", st: dict, service_domain: str,
-                                      service: str, payload: dict, action_label: str) -> dict:
+                                      service: str, payload: dict, action_label: str,
+                                      precheck=None, dispatch_state: Optional[dict] = None) -> dict:
     """执行 HA 服务调用，并在超时窗口内轮询回读，校验「状态 + 属性」是否达到预期。
 
     不再只判断「有没有变化」，而是按服务语义推导预期：
@@ -489,6 +538,12 @@ async def _apply_and_confirm_unlocked(ha: "HAClient", st: dict, service_domain: 
       accepted_pending HA 返回 null（新版 HA 常见），回读窗口内仍未完全匹配预期
     """
     eid = str(st.get("entity_id"))
+    # 危险判断必须基于实体锁内 force 刷新后的最新状态：缓存里的 attributes 可能缺少
+    # device_class，刷新后才发现是车库门时不能再下发。先复查，命中则直接返回拦截结果。
+    if precheck is not None:
+        blocked = precheck(st)
+        if blocked is not None:
+            return {"_danger_guard": blocked}
     before = snapshot(st)
     before_state = st.get("state") if st else None
     expected = _expected_state(service, before_state, _domain_of(eid))
@@ -498,8 +553,21 @@ async def _apply_and_confirm_unlocked(ha: "HAClient", st: dict, service_domain: 
     attr_expect = _expected_attributes(payload)
     has_expectation = expected is not None or bool(attr_expect)
 
+    request_started = time.monotonic()
+    if dispatch_state is not None:
+        dispatch_state["dispatched"] = True
+    try:
+        resp = await ha.call_service(service_domain, service, payload)
+    except asyncio.TimeoutError as exc:
+        raise HAError("post_timeout", "调用 Home Assistant 服务超时，无法确认指令是否已下发。") from exc
+    except HAError as exc:
+        # httpx 的 TimeoutException/网络中断在 HAClient 内会变成 HAError("timeout" /
+        # "network_error" / "upstream_error")；请求可能已经到达 HA，不能当作确定未下发。
+        if exc.code in ("timeout", "network_error", "upstream_error"):
+            raise HAError("post_timeout", "调用 Home Assistant 服务超时或网络中断，无法确认指令是否已下发。") from exc
+        raise
+    # 确认窗口从 POST 返回后开始计时：慢 POST 不应耗尽回读预算而制造假失败。
     started = time.monotonic()
-    resp = await ha.call_service(service_domain, service, payload)
     resp_kind = _classify_service_response(resp)
 
     # 硬截止时间：SERVICE_CONFIRM_TIMEOUT 是上限，不允许 interval=30 把单设备拖到约 120s。
@@ -605,11 +673,11 @@ async def _apply_and_confirm_unlocked(ha: "HAClient", st: dict, service_domain: 
         # 场景/脚本/停止等即发即忘服务：HA 已接受调用即可，不能因无状态变化判失败。
         status = "accepted"
         verified = False
-    elif (service_domain == "cover"
-          and service in ("open_cover", "close_cover")
-          and isinstance(after, dict)
-          and str(after.get("state")) in ("opening", "closing")):
-        # 慢速卷帘/车库门在超时窗口内仍处于过渡态，不能判失败。
+    elif (service_domain == "cover" and isinstance(after, dict)
+          and ((service == "open_cover" and str(after.get("state")) == "opening")
+               or (service == "close_cover" and str(after.get("state")) == "closing"))):
+        # 慢速卷帘/车库门在超时窗口内仍处于过渡态，不能判失败；按方向判断，
+        # 反向过渡说明没有朝目标动作，不能当作成功。
         status = "accepted_pending"
         verified = False
     elif changed:
@@ -640,7 +708,7 @@ async def _apply_and_confirm_unlocked(ha: "HAClient", st: dict, service_domain: 
     verification = {
         "verified": verified,
         "attempts": attempts,
-        "elapsed_ms": int(round((time.monotonic() - started) * 1000)),
+        "elapsed_ms": int(round((time.monotonic() - request_started) * 1000)),
         "expectations": {"state": expected, "attributes": attr_expect},
         "checks": check["checks"],
         "mismatches": check["mismatches"],

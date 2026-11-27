@@ -8,6 +8,32 @@
 
 暂无计划中的变更。
 
+## [1.15.6] - 2026-11-27
+
+对抗性复核问题修复版本。
+
+### 修复
+
+- 注册表读取返回 None（事件流禁用等）时不再按空映射放行，配置设备名排除关键字时 list_devices/list_domains 与实体解析均失败关闭。
+- 实体锁内 force 刷新初始状态后重新执行危险判定，避免缓存缺少 device_class 时放行车库门等设备；刷新失败且需要危险复查时返回 state_unavailable，不再沿用旧状态下发。
+- 批量控制改为两阶段：先对所有目标 force 刷新并整批完成危险判定，全部通过后才统一下发；带 confirm_token 时也先整批校验完整危险列表，避免部分设备已执行、另一台才要求确认而丢弃结果。
+- HTTP POST 超时或网络中断（HAClient 的 timeout/network_error/upstream_error）统一映射为 post_timeout，批量与单设备返回 accepted_pending/dispatch_state=may_be_dispatched，不再误报为确定失败。
+- 状态缓存 WS 快路径校验全量快照年龄，事件流静默失效后回源 REST，避免长期使用旧快照；在途 REST 全量快照带 generation 比对，不覆盖期间到达的事件更新；状态缓存时间统一使用 monotonic，避免系统时钟回拨导致缓存判定异常。
+- cover 过渡态按动作方向判断：open_cover 仅接受 opening、close_cover 仅接受 closing，反向过渡不再当成功。
+- climate 按能力位过滤 turn_on/turn_off/set_temperature/set_hvac_mode，避免暴露不支持动作。
+- 批量超时通过 dispatch_state 区分 not_sent/batch_timeout 与可能已下发 accepted_pending/pending_confirmation。
+- 数值参数显式拒绝 NaN/Infinity；华氏设备仅在缺少温度范围且值疑似摄氏度时拒绝；RGB 分量拒绝浮点与非有限值。
+- 危险 cover 的英文关键词改为词边界匹配，doorbell 不再被 door 误判为高风险。
+- WebUI 服务名内部空白分别规范化，scene. turn_on 不再能绕过危险闸门。
+- call_service 的 data 目标选择器新增 entities，防止绕过 20 条上限与主实体危险判定。
+- 登录限速改为表单解析成功且令牌确实错误时才占用配额，畸形/超大请求不再锁死同源用户。
+- 删除 requires_confirmation 分支的重复工具指标；mcp_pipe 单行输出按 UTF-8 字节限制 16MiB。
+
+### 安全
+
+- MCP 主入口的 scene.turn_on/toggle、homeassistant.turn_on/toggle 指向 scene 也纳入共享危险确认，不再只依赖 WebUI 拦截。
+- homeassistant.turn_on/turn_off/toggle 指向 script、lock、shell_command 等高风险目标域时同样判定为危险操作，不能借通用 domain 绕过脚本/门锁确认。
+
 ## [1.15.5] - 2026-11-27
 
 安全边界、状态一致性与能力过滤修复版本。
