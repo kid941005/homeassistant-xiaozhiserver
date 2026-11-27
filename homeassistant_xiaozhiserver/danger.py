@@ -39,9 +39,11 @@ def _danger_flags(entity_id: str, attributes: Optional[dict]) -> tuple:
         # 英文关键词按词边界匹配，避免 doorbell 被 door 命中而把门铃误判为高风险；
         # 中文没有词边界，直接子串匹配。
         ascii_words = ("garage", "gate", "window", "door")
-        if any(re.search(r"(?<![a-z])" + w + r"(?![a-z])", ident) for w in ascii_words) \
-                or any(k in ident for k in ("车库", "大门", "窗户", "前门", "后门", "侧门",
-                                                "卷帘门", "入户门", "庭院门", "电动门", "道闸", "闸机")):
+        # 中文没有词边界：用“门/窗”词根兜底，覆盖主卧窗、厨房门、阳台门等常见命名；
+        # 先排除门铃/门磁/窗帘/窗纱/门帘等并非门窗本体的设备，避免误报。
+        cn_safe = ("门铃", "门磁", "窗帘", "窗纱", "门帘")
+        cn_hit = any(k in ident for k in ("门", "窗")) and not any(k in ident for k in cn_safe)
+        if any(re.search(r"(?<![a-z])" + w + r"(?![a-z])", ident) for w in ascii_words) or cn_hit:
             return True, "该 cover 设备（" + str(entity_id) + "）名称/标识疑似门窗或车库，按高风险处理"
     return False, None
 
@@ -145,11 +147,17 @@ def _issue_confirm_token(entity_id: str, service_domain: str, service: str, payl
     return token
 
 
-def _consume_confirm_token(token: Optional[str]) -> None:
-    """批量确认：整批最终检查全部通过后统一消费令牌，避免被单台目标提前消费后其余目标失效。"""
+def _consume_confirm_token(token: Optional[str], expected_intent: Optional[str] = None) -> None:
+    """消费一次性确认令牌；可选 expected_intent 防止跨操作误删其他令牌。"""
     tok = (token or "").strip()
-    if tok:
-        _CONFIRM_TOKENS.pop(tok, None)
+    if not tok:
+        return
+    rec = _CONFIRM_TOKENS.get(tok)
+    if rec is None:
+        return
+    if expected_intent is not None and str(rec.get("intent")) != str(expected_intent):
+        return
+    _CONFIRM_TOKENS.pop(tok, None)
 
 
 def _danger_block(st: dict, service_domain: str, service: str,

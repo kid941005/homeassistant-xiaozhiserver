@@ -2,7 +2,7 @@
 
 > 把 **Home Assistant** 的实体与服务封装成标准 **MCP（Model Context Protocol）** 工具，供 **小智（xiaozhi-server）** 通过 **MCP 接入点** 用自然语言查询和控制智能家居设备。
 
-**当前版本：v1.15.8** · Python 3.12 · 传输方式：**stdio MCP server + WebSocket bridge** · 单容器部署（MCP bridge + WebUI）
+**当前版本：v1.15.9** · Python 3.12 · 传输方式：**stdio MCP server + WebSocket bridge** · 单容器部署（MCP bridge + WebUI）
 
 ---
 
@@ -213,8 +213,8 @@ docker compose logs -f homeassistant-xiaozhiserver
 看到以下日志表示 bridge 已连上小智：
 
 ```text
-2026-01-01 12:00:00.123 INFO    v1.15.8 MCP_PIPE [-] MCP接入点连接成功
-2026-01-01 12:00:00.456 INFO    v1.15.8 MCP_PIPE [-] 已启动 MCP server：...
+2026-01-01 12:00:00.123 INFO    v1.15.9 MCP_PIPE [-] MCP接入点连接成功
+2026-01-01 12:00:00.456 INFO    v1.15.9 MCP_PIPE [-] 已启动 MCP server：...
 ```
 
 WebUI 地址：`http://<宿主机IP>:8099/`（端口由 `WEBUI_PORT` 决定），首次打开会跳转登录页，输入 `.env` 的 `WEBUI_TOKEN` 后才能进入。compose 使用 `network_mode: host`，因此没有 `ports` 映射；如需只允许本机访问，把 `.env` 的 `WEBUI_HOST` 设为 `127.0.0.1`。
@@ -759,6 +759,7 @@ bash tests/run_local_test.sh
 
 | 版本 | 主要变化 |
 |---|---|
+| v1.15.9 | 第三轮对抗复核修复：late-danger 有已执行目标时不再返回可授权整批的令牌并消费自动令牌，重试整批不会重复执行；control_device/call_service 仅在实际 POST 边界消费令牌，锁等待取消与参数校验失败保留令牌；_consume_confirm_token 按 intent 校验避免普通操作误消费危险令牌；批量第二次 get_states 非 HAError 统一 state_unavailable，阶段一 state_unavailable 带 not_sent；deadline 过期不再发起 0.01s 操作；late-danger 部分结果保留 errors/deduplicated |
 | v1.15.8 | 二轮最终复核修复：通用 call_service 的非空令牌不再跳过锁内 fresh 危险复查，令牌在实际下发边界统一消费以防重放；批量阶段二 late-danger 返回已执行目标的部分结果，不再丢弃副作用；批量第二次 get_states 也受总时限约束；阶段一非 HAError 刷新失败统一 state_unavailable；无实体锁后备路径同样 force fresh 后预检；危险 cover 中文关键词补充 入户门/庭院门/电动门/道闸/闸机；批量 POST 后 invalid_response 与取消场景均消费令牌 |
 | v1.15.7 | 最终对抗复核修复：危险确认令牌必须经过锁内 fresh 复查（初始缓存安全也不会放过 late-danger）；批量阶段二逐目标复查并在整批通过后统一消费令牌；批量 intent 稳定、总时限覆盖预检；force GET 不覆盖较新 WS 事件；锁内刷新失败统一 state_unavailable；危险 cover 中文关键词扩展；批量超时补 dispatch_state |
 | v1.15.6 | 对抗性复核修复：注册表 None 失败关闭；实体锁内 force 刷新后重新危险判定，刷新失败返回 state_unavailable；批量危险改两阶段预检，全部目标刷新并整批确认后才统一下发；POST 超时/网络中断映射 post_timeout 与 accepted_pending；状态缓存 generation 防止在途全量快照覆盖事件、时间统一 monotonic；cover 过渡态按开关方向判断；climate turn_on/turn_off/set_temperature/set_hvac_mode 能力位过滤；批量超时通过 dispatch_state 区分 not_sent/batch_timeout 与可能已下发 accepted_pending；华氏/NaN/Infinity/RGB 非有限值校验；危险 cover 关键词按词边界；WebUI 服务名内部空白规范化；MCP scene.turn_on/toggle、homeassistant 指向 scene 或 script/lock 等高风险目标也需确认；call_service 禁止 data.entities 目标选择器；登录限速只在令牌错误时占配额；mcp_pipe 按 UTF-8 字节限制 16MiB |

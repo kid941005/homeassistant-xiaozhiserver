@@ -8,6 +8,26 @@
 
 暂无计划中的变更。
 
+## [1.15.9] - 2026-11-27
+
+第三轮对抗复核问题修复版本。
+
+### 修复
+
+- 批量阶段二 late-danger 且已有目标执行时，不再返回绑定整批的自动 confirm_token；该令牌立即消费并从响应中移除，消息改为提示仅对未执行目标重新发起确认，避免用旧令牌重试整批导致已执行目标重复执行。
+- control_device/call_service 令牌只在 dispatch_state.dispatched 为真（真实开始 POST）时消费；锁等待取消、POST 前参数校验失败等尚未下发的路径保留令牌，符合全部 not_sent 语义。
+- _consume_confirm_token 增加 expected_intent 校验，普通成功操作不再误消费其他危险操作遗留的令牌。
+- 批量首次 get_states 与 _redundant_switch_context 第二次 get_states 的非 HAError 异常统一按 state_unavailable/not_sent 失败关闭，不再冒泡 internal_error。
+- 批量阶段一刷新失败返回的 state_unavailable 补充 status=not_sent。
+- 批量总时限在各阶段入口判定，deadline 已过期时不再用 max(0.01,..) 发起新操作。
+- late-danger 部分结果保留 errors 与 deduplicated，避免部分失败信息丢失。
+- 同一 confirm_token 的 control_device/call_service/control_devices 入口增加按令牌串行锁：并发请求只有一个能通过复核并执行，另一个因令牌已消费返回 invalid_confirm_token，避免一次性令牌被并发重放两次。
+- 危险 cover 中文识别改为“门/窗”词根匹配并排除门铃/门磁/窗帘/窗纱/门帘，覆盖主卧窗、厨房门、阳台门等不写 device_class 的常见命名。
+
+### 测试
+
+- confirm_window 新增/加强：late-danger 部分结果不得返回可授权整批的令牌、重试整批不重复执行已执行目标；锁等待取消后令牌保留并可执行一次；invalid_response 与批量取消改用真实 call_service 边界而非伪造 dispatch_state；同一令牌并发批量只执行一次；中文门窗词根与门铃/窗帘等排除项；阶段一 RuntimeError 返回 state_unavailable/not_sent。
+
 ## [1.15.8] - 2026-11-27
 
 第二轮最终对抗复核问题修复版本。
